@@ -1,0 +1,40 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+.venv/
+venv/
+env/
+
+# Local secrets & runtime config
+config.json
+config.local.json
+mail_credentials.txt
+grok2api_tokens.json
+
+# Generated accounts / batch outputs
+accounts_*.txt
+accounts_cli.txt
+*.txt
+!requirements.txt
+
+# CPA / exports (tokens, OAuth files)
+cpa_auths/
+sub2api_exports/
+autoPortData/
+DrissionPage/
+
+# Logs, screenshots, IDE
+*.log
+.DS_Store
+.idea/
+.vscode/
+*.png
+!assets/banner.png
+
+# Local notes / machine-specific
+RUN_LOCAL.md
+Typora_Hook_Log.txt
+_batch*
