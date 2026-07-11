@@ -565,13 +565,13 @@ mise run check
 ```
 
 - 未配置 Ruff / Black / mypy / pytest 为必需项
-- `optimization_checks.py`、`verify_config_safe.py` 可能访问外部服务，不宜当作离线 CI
+- `scripts/optimization_checks.py`、`scripts/verify_config_safe.py` 可能访问外部服务；后者默认只打印脱敏配置，`--probe-mail` / `--probe-remote` 才会打真实网络，不宜当作离线 CI
 - 不要为验证普通改动而跑真实注册 / mint / 云上传
 
 新增配置键时，请同步更新：**代码默认值**、`config.example.json`、本 README。
 
 ## License 与致谢
 
-- License：[MIT](LICENSE)
+- License：[MIT](LICENSE)（保留上游 AaronL725 版权，并标注本仓 van7517 修改）
 - 上游原版：[AaronL725/grok-register](https://github.com/AaronL725/grok-register) — 本项目在其基础上二次开发
 - 社区讨论：[linux.do](https://linux.do)
