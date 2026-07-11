@@ -1,5 +1,6 @@
-﻿param()
-Set-Location -LiteralPath $PSScriptRoot
+param()
+$Root = Split-Path -Parent $PSScriptRoot
+Set-Location -LiteralPath $Root
 $env:PYTHONIOENCODING = "utf-8:replace"
 try { [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false) } catch {}
 if (Test-Path -LiteralPath ".\.venv\Scripts\python.exe") {

@@ -109,7 +109,7 @@ def convert_cpa_file(cpa_path: str | Path, out_dir: str | Path | None = None) ->
     cpa = json.loads(cpa_path.read_text(encoding="utf-8-sig"))
     account = cpa_xai_to_sub2api_account(cpa, source="cpa_xai")
     doc = build_sub2api_document([account])
-    out_dir = Path(out_dir or cpa_path.parent.parent / "sub2api_exports").expanduser().resolve()
+    out_dir = Path(out_dir or cpa_path.parent.parent / "output" / "sub2api_exports").expanduser().resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
     out_file = out_dir / f"sub2api-{cpa_path.stem}.json"
     out_file.write_text(json.dumps(doc, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
@@ -140,11 +140,11 @@ def export_after_cpa_result(result: dict[str, Any], config: dict[str, Any] | Non
     if not cpa_path:
         return {"ok": False, "error": "missing cpa path"}
     reg_dir = Path(__file__).resolve().parent
-    out_dir = Path(cfg.get("sub2api_export_dir") or (reg_dir / "sub2api_exports"))
+    out_dir = Path(cfg.get("sub2api_export_dir") or (reg_dir / "output" / "sub2api_exports"))
     if not out_dir.is_absolute():
         out_dir = (reg_dir / out_dir).resolve()
     single_path, _doc = convert_cpa_file(cpa_path, out_dir=out_dir)
-    cpa_dir = Path(cfg.get("cpa_auth_dir") or (reg_dir / "cpa_auths"))
+    cpa_dir = Path(cfg.get("cpa_auth_dir") or (reg_dir / "output" / "cpa_auths"))
     if not cpa_dir.is_absolute():
         cpa_dir = (reg_dir / cpa_dir).resolve()
     combined_path = Path(cfg.get("sub2api_combined_file") or (out_dir / "sub2api-accounts.json"))

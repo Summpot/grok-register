@@ -11,16 +11,17 @@ env/
 # Local secrets & runtime config
 config.json
 config.local.json
+
+# All generated runtime output (accounts, CPA auths, tokens, logs, exports)
+output/
 mail_credentials.txt
 grok2api_tokens.json
-
-# Generated accounts / batch outputs
 accounts_*.txt
 accounts_cli.txt
 *.txt
 !requirements.txt
 
-# CPA / exports (tokens, OAuth files)
+# Legacy output locations (pre-output/ layout)
 cpa_auths/
 sub2api_exports/
 autoPortData/
@@ -35,6 +36,7 @@ DrissionPage/
 !assets/banner.png
 
 # Local notes / machine-specific
-RUN_LOCAL.md
+docs/RUN_LOCAL.md
 Typora_Hook_Log.txt
 _batch*
+_tmp_*.py

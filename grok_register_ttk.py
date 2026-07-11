@@ -131,7 +131,7 @@ DEFAULT_CONFIG = {
     "thread_start_interval": 0.8,
     "cpa_export_enabled": True,
     "api_reverse_tools": "",
-    "cpa_auth_dir": "./cpa_auths",
+    "cpa_auth_dir": "./output/cpa_auths",
     "cpa_copy_to_hotload": False,
     "cpa_hotload_dir": "",
     "cpa_base_url": "https://cli-chat-proxy.grok.com/v1",
@@ -146,8 +146,8 @@ DEFAULT_CONFIG = {
     "cpa_mint_browser_reuse": True,
     "cpa_mint_browser_recycle_every": 15,
     "sub2api_export_enabled": True,
-    "sub2api_export_dir": "./sub2api_exports",
-    "sub2api_combined_file": "./sub2api_exports/sub2api-accounts.json",
+    "sub2api_export_dir": "./output/sub2api_exports",
+    "sub2api_combined_file": "./output/sub2api_exports/sub2api-accounts.json",
     "cpa_cloud_upload_enabled": False,
     "cpa_cloud_api_base": "",
     "cpa_cloud_management_key": "",
@@ -3403,9 +3403,9 @@ class GrokRegisterGUI:
         self.fail_count = 0
         self.results = []
         now = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-        self.accounts_output_file = os.path.join(
-            os.path.dirname(__file__), f"accounts_{now}.txt"
-        )
+        out_dir = os.path.join(os.path.dirname(__file__), "output")
+        os.makedirs(out_dir, exist_ok=True)
+        self.accounts_output_file = os.path.join(out_dir, f"accounts_{now}.txt")
         self.update_stats()
         self._set_running_ui(True)
         self.log(f"[*] 配置已保存，开始执行。目标数量: {count}")
@@ -3469,8 +3469,9 @@ class GrokRegisterGUI:
                         self.log(f"[*] 邮箱: {email}")
                         self.log(f"[Debug] 邮箱credential(jwt): {dev_token}")
                         try:
+                            os.makedirs(os.path.join(os.path.dirname(__file__), "output"), exist_ok=True)
                             with open(
-                                os.path.join(os.path.dirname(__file__), "mail_credentials.txt"),
+                                os.path.join(os.path.dirname(__file__), "output", "mail_credentials.txt"),
                                 "a",
                                 encoding="utf-8",
                             ) as f:
@@ -3748,8 +3749,10 @@ def run_registration_cli(count):
     fail_count = 0
     retry_count_for_slot = 0
     max_slot_retry = 3
+    out_dir = os.path.join(os.path.dirname(__file__), "output")
+    os.makedirs(out_dir, exist_ok=True)
     accounts_output_file = os.path.join(
-        os.path.dirname(__file__),
+        out_dir,
         f"accounts_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.txt",
     )
     cli_log(f"[*] 终端模式启动，目标数量: {count}")
@@ -3788,8 +3791,10 @@ def run_registration_cli(count):
                     cli_log(f"[*] 邮箱: {email}")
                     cli_log(f"[Debug] 邮箱credential(jwt): {dev_token}")
                     try:
+                        os.makedirs(os.path.join(os.path.dirname(__file__), "output"), exist_ok=True)
+                        os.makedirs(os.path.join(os.path.dirname(__file__), "output"), exist_ok=True)
                         with open(
-                            os.path.join(os.path.dirname(__file__), "mail_credentials.txt"),
+                            os.path.join(os.path.dirname(__file__), "output", "mail_credentials.txt"),
                             "a",
                             encoding="utf-8",
                         ) as f:

@@ -29,7 +29,7 @@
 | 定位 | 注册自动化（GUI / CLI） | 注册 + **异步 CPA mint 流水线** |
 | 推荐入口 | `grok_register_ttk.py` | **`register_cli.py`** |
 | Python | 文档曾写 3.9+ | **3.13**（`>=3.13,<3.14`） |
-| CPA / Grok Build | 无完整 mint 流水线 | OAuth mint → `cpa_auths/xai-*.json` |
+| CPA / Grok Build | 无完整 mint 流水线 | OAuth mint → `output/cpa_auths/xai-*.json` |
 | 并发模型 | 偏单机/配置线程 | 注册线程 R + mint workers M，峰值浏览器约 **R + M** |
 | 云端 | 可选 grok2api | grok2api + 可选 **CPA Manager Plus** 批量上传 |
 
@@ -60,13 +60,28 @@
 - [开发与检查](#开发与检查)
 - [License 与致谢](#license-与致谢)
 
+
+## 目录布局
+
+为避免运行产物和工具脚本堆在根目录，本仓库约定：
+
+| 位置 | 内容 |
+| --- | --- |
+| 根目录 | 入口脚本、`config.json`、核心模块、`turnstilePatch/` |
+| `output/` | 账号、CPA 认证、token 池、导出、日志类运行产物 |
+| `scripts/` | 回填、配置校验、GUI/CLI 辅助启动、一次性补丁 |
+| `docs/` | 本机/打包类说明（主文档仍是 `README.md`） |
+| `tests/` | 单元测试 |
+
+默认 `cpa_auth_dir`、`accounts` 输出等均指向 `output/`。旧版根目录下的 `cpa_auths/`、`accounts_*.txt` 已被 gitignore，新跑任务请用新路径。
+
 ## 功能
 
 - GUI（Tkinter）与 CLI 两种运行方式
 - Cloudflare / DuckMail / YYDS 临时邮箱
 - Chrome / Chromium 真实浏览器注册流程（含 Turnstile 扩展 `turnstilePatch/`）
 - **多线程批量注册 + 异步 CPA / Grok Build OAuth mint**
-- 成功账号实时写入 `accounts_*.txt` / `accounts_cli.txt`
+- 成功账号实时写入 `output/accounts_*.txt` / `output/accounts_cli.txt`
 - 可选写入本地 / 远端 grok2api token 池
 - 可选批量上传 CPA 认证到 CPA Manager Plus（CPAMP）
 - 可选 sub2api 格式导出、本地热加载目录复制
@@ -188,7 +203,7 @@ uv run python cf_mail_debug.py `
 ```json
 {
   "cpa_export_enabled": true,
-  "cpa_auth_dir": "./cpa_auths",
+  "cpa_auth_dir": "./output/cpa_auths",
   "cpa_base_url": "https://cli-chat-proxy.grok.com/v1",
   "cpa_force_standalone": true,
   "cpa_mint_timeout_sec": 300,
@@ -201,7 +216,7 @@ uv run python cf_mail_debug.py `
 
 | 字段 | 必须性 | 说明 |
 | --- | --- | --- |
-| `cpa_export_enabled` | 必填（若要 CPA） | `true` 才 mint OAuth 并写 `cpa_auths/xai-*.json` |
+| `cpa_export_enabled` | 必填（若要 CPA） | `true` 才 mint OAuth 并写 `output/cpa_auths/xai-*.json` |
 | `cpa_auth_dir` | 必填（若要 CPA） | 本地 CPA 认证文件输出目录 |
 | `cpa_base_url` | 必填（若要 CPA） | 必须是 `https://cli-chat-proxy.grok.com/v1`（Free Build） |
 | `cpa_mint_required` | 可选 | `true` 时 mint 失败更严格；默认 `false` 不阻断注册结果 |
@@ -211,7 +226,7 @@ uv run python cf_mail_debug.py `
 ```json
 {
   "grok2api_auto_add_local": true,
-  "grok2api_local_token_file": "./grok2api_tokens.json",
+  "grok2api_local_token_file": "./output/grok2api_tokens.json",
   "grok2api_pool_name": "ssoBasic",
   "grok2api_auto_add_remote": true,
   "grok2api_remote_base": "http://你的服务器:5003",
@@ -234,7 +249,7 @@ uv run python cf_mail_debug.py `
 }
 ```
 
-关闭时只会把认证文件写到本地 `cpa_auths/`。
+关闭时只会把认证文件写到本地 `output/cpa_auths/`。
 
 ### 6. 代理（按网络情况）
 
@@ -276,10 +291,10 @@ uv run python cf_mail_debug.py `
   "register_count": 10,
   "code_poll_timeout": 90,
   "cpa_export_enabled": true,
-  "cpa_auth_dir": "./cpa_auths",
+  "cpa_auth_dir": "./output/cpa_auths",
   "cpa_base_url": "https://cli-chat-proxy.grok.com/v1",
   "grok2api_auto_add_local": true,
-  "grok2api_local_token_file": "./grok2api_tokens.json",
+  "grok2api_local_token_file": "./output/grok2api_tokens.json",
   "grok2api_auto_add_remote": false,
   "cpa_cloud_upload_enabled": false
 }
@@ -360,7 +375,7 @@ uv run python -u register_cli.py `
   --count 100 `
   --threads 2 `
   --mint-workers 2 `
-  --accounts-file ".\accounts_batch100.txt" `
+  --accounts-file ".\output\accounts_batch100.txt" `
   --fast
 ```
 
@@ -371,7 +386,7 @@ uv run python -u register_cli.py `
   --extra 50 `
   --threads 2 `
   --mint-workers 2 `
-  --accounts-file ".\accounts_batch100.txt" `
+  --accounts-file ".\output\accounts_batch100.txt" `
   --fast
 ```
 
@@ -386,7 +401,7 @@ uv run python -u register_cli.py `
 | `--threads N` | `1` | 注册并发线程（1–10） |
 | `--mint-workers N` | `-1` | CPA mint 并发：`-1` 自动；`0` 内联；`1–10` 固定 |
 | `--mint-queue-max N` | `-1` | mint 队列背压；`-1` 自动（约 `2 × mint_workers`） |
-| `--accounts-file PATH` | `accounts_cli.txt` | 账号输出文件 |
+| `--accounts-file PATH` | `output/accounts_cli.txt` | 账号输出文件 |
 | `--fast` | 默认开 | 压缩等待、减少调试 IO |
 | `--no-fast` | 关 | 关闭快速模式 |
 | `--no-browser-reuse` | 关 | 每号强制关闭浏览器 |
@@ -411,7 +426,7 @@ uv run python -u register_cli.py `
 
 mint 线程 (M)
   → Grok Build OAuth device flow
-  → 写出 cpa_auths/xai-邮箱.json
+  → 写出 output/cpa_auths/xai-邮箱.json
   → （可选）批量上传到 CPA Manager Plus
 ```
 
@@ -430,12 +445,12 @@ mint 线程 (M)
 
 | 文件/目录 | 内容 |
 | --- | --- |
-| `accounts_*.txt` / `accounts_cli.txt` | `邮箱----密码----ssoToken` |
-| `cpa_auths/xai-*.json` | CPA / Grok Build OAuth 认证文件 |
-| `grok2api_tokens.json` | 本地 grok2api token 池（若开启） |
-| `mail_credentials.txt` | 临时邮箱凭证 |
+| `output/accounts_*.txt` / `output/accounts_cli.txt` | `邮箱----密码----ssoToken` |
+| `output/cpa_auths/xai-*.json` | CPA / Grok Build OAuth 认证文件 |
+| `output/grok2api_tokens.json` | 本地 grok2api token 池（若开启） |
+| `output/mail_credentials.txt` | 临时邮箱凭证 |
 | `batch*_run_*.log` | 批量运行日志 |
-| `sub2api_exports/` | sub2api 导出（若开启） |
+| `output/sub2api_exports/` | sub2api 导出（若开启） |
 
 这些文件含敏感信息，默认已被 `.gitignore` 忽略。
 
@@ -498,14 +513,21 @@ mint 线程 (M)
 ├── register_cli.py          # 推荐：多线程注册 + 异步 CPA mint
 ├── grok_register_ttk.py     # 核心逻辑 / GUI / 兼容 CLI
 ├── tab_pool.py              # 浏览器 / 标签页复用
-├── cpa_xai/                 # Grok Build OAuth mint
 ├── cpa_export.py            # CPA 导出
 ├── cpa_to_sub2api.py        # sub2api 格式转换
 ├── cf_mail_debug.py         # Cloudflare 邮箱调试
+├── cpa_xai/                 # Grok Build OAuth mint
 ├── turnstilePatch/          # Chromium 扩展（勿删除）
+├── output/                  # 运行产物（gitignore）
+│   ├── accounts_*.txt
+│   ├── accounts_cli.txt
+│   ├── cpa_auths/           # xai-*.json
+│   ├── sub2api_exports/
+│   └── grok2api_tokens.json
+├── scripts/                 # 回填 / 校验 / 启动辅助
+├── docs/                    # 本地说明（非主文档）
 ├── tests/                   # unittest
-├── scripts/                 # 历史回填 / 一次性工具
-├── cpa_auths/               # 输出的 xai-*.json（运行时）
+├── assets/                  # banner 等
 ├── config.example.json      # 配置模板
 ├── config.json              # 本地私有配置（勿提交）
 ├── pyproject.toml
@@ -517,7 +539,7 @@ mint 线程 (M)
 
 ## 安全提示
 
-- 不要提交或泄露：`config.json`、API Key、JWT、Cookie、密码、SSO Token、代理凭据、账号文件、`cpa_auths/`、管理密钥
+- 不要提交或泄露：`config.json`、API Key、JWT、Cookie、密码、SSO Token、代理凭据、账号文件、`output/cpa_auths/`、管理密钥
 - 管理后台（CPAMP / grok2api）不要长期裸奔公网；建议本机端口或 Tunnel / 反代
 - 遵守目标站点条款与当地法律
 

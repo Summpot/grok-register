@@ -4,7 +4,7 @@
 Usage (from grok_reg project root):
   uv run python scripts/export_cpa_xai_from_grok_auth.py \\
     --auth-json ~/.grok/auth.json \\
-    --out-dir ./cpa_auths
+    --out-dir ./output/cpa_auths
 
 Then any agent can use CPA:
   POST http://127.0.0.1:8317/v1/chat/completions  model=grok-4.5
@@ -48,7 +48,7 @@ def main() -> int:
     )
     ap.add_argument(
         "--out-dir",
-        default=str(_ROOT / "cpa_auths"),
+        default=str(_ROOT / "output" / "cpa_auths"),
         help="Output dir for xai-*.json (register cpa_auths or CPA auth-dir)",
     )
     ap.add_argument(

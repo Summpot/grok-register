@@ -323,6 +323,7 @@ def register_one(
         )
         password = profile.get("password", "") or ""
         line = f"{email}----{password}----{sso}\n"
+        os.makedirs(os.path.dirname(os.path.abspath(accounts_file)) or ".", exist_ok=True)
         with open(accounts_file, "a", encoding="utf-8") as f:
             f.write(line)
         log(worker_id, f"+ 注册成功: {email}")
@@ -558,7 +559,7 @@ def main() -> int:
         default=-1,
         help="mint 队列背压上限：-1=用 config/auto(2×workers)；0=不限制",
     )
-    parser.add_argument("--accounts-file", default=os.path.join(os.path.dirname(__file__), "accounts_cli.txt"))
+    parser.add_argument("--accounts-file", default=os.path.join(os.path.dirname(__file__), "output", "accounts_cli.txt"))
     parser.add_argument("--fast", action="store_true", default=True, help="快速模式（默认开）：压缩 sleep、关截图")
     parser.add_argument("--no-fast", action="store_true", help="关闭快速模式")
     parser.add_argument("--no-browser-reuse", action="store_true", help="每号强制 quit 浏览器")

@@ -31,11 +31,11 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument(
         "--accounts",
-        default=str(_ROOT / "accounts_cli.txt"),
+        default=str(_ROOT / "output" / "accounts_cli.txt"),
     )
     ap.add_argument(
         "--out-dir",
-        default=str(_ROOT / "cpa_auths"),
+        default=str(_ROOT / "output" / "cpa_auths"),
         help="Primary output under register machine",
     )
     ap.add_argument(
@@ -77,7 +77,7 @@ def main() -> int:
     ap.add_argument("--sleep", type=float, default=3.0, help="Sleep between accounts")
     ap.add_argument(
         "--fail-log",
-        default=str(_ROOT / "cpa_auths" / "backfill_failed.jsonl"),
+        default=str(_ROOT / "output" / "cpa_auths" / "backfill_failed.jsonl"),
         help="Append failures JSONL",
     )
     ap.add_argument(

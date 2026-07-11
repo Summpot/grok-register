@@ -2,10 +2,10 @@
 
 This package intentionally excludes local/private runtime data:
 - config.json and config backups
-- accounts_*.txt
-- mail_credentials.txt
-- cpa_auths/
-- sub2api_exports/
+- output/accounts_*.txt
+- output/mail_credentials.txt
+- output/cpa_auths/
+- output/sub2api_exports/
 - .venv/
 - __pycache__/
 - gui_crash.log

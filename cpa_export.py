@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 _REG_DIR = Path(__file__).resolve().parent
-_DEFAULT_OUT = _REG_DIR / "cpa_auths"
+_DEFAULT_OUT = _REG_DIR / "output" / "cpa_auths"
 _DEFAULT_CPA = Path("")  # empty = do not assume a machine-local CPA path
 
 
