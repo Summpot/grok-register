@@ -1,8 +1,8 @@
 import unittest
 from unittest.mock import patch
 
-import cf_mail_debug
-import grok_register_ttk as app
+from grok_register import app
+from grok_register import cf_mail_debug
 
 
 class DummyResponse:

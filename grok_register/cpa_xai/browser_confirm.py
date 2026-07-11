@@ -56,26 +56,17 @@ def _build_mint_browser_options(
     from DrissionPage import ChromiumOptions
 
     opts = None
-    _pkg_root = Path(__file__).resolve().parents[1]
+    _pkg_root = Path(__file__).resolve().parents[2]  # project root
     try:
-        reg_file = _pkg_root / "grok_register_ttk.py"
-        if reg_file.is_file():
-            reg_dir = str(_pkg_root)
-            if reg_dir not in sys.path:
-                sys.path.insert(0, reg_dir)
-            try:
-                from grok_register_ttk import create_browser_options  # type: ignore
+        from grok_register.app import create_browser_options  # type: ignore
 
-                try:
-                    opts = create_browser_options(unique_profile=True, profile_tag="cpa")
-                except TypeError:
-                    opts = create_browser_options()
-                log("using register create_browser_options (turnstilePatch, isolated profile)")
-            except Exception as e:  # noqa: BLE001
-                log(f"register browser options unavailable: {e}")
-                opts = None
+        try:
+            opts = create_browser_options(unique_profile=True, profile_tag="cpa")
+        except TypeError:
+            opts = create_browser_options()
+        log("using register create_browser_options (turnstilePatch, isolated profile)")
     except Exception as e:  # noqa: BLE001
-        log(f"register options probe failed: {e}")
+        log(f"register browser options unavailable: {e}")
         opts = None
 
     if opts is None:

@@ -14,19 +14,29 @@ import time
 from pathlib import Path
 from typing import Any, Callable
 
-_REG_DIR = Path(__file__).resolve().parent
-_DEFAULT_OUT = _REG_DIR / "output" / "cpa_auths"
+from grok_register.paths import PROJECT_ROOT, OUTPUT_DIR
+_REG_DIR = PROJECT_ROOT
+_DEFAULT_OUT = OUTPUT_DIR / "cpa_auths"
 _DEFAULT_CPA = Path("")  # empty = do not assume a machine-local CPA path
 
 
 def _ensure_cpa_xai_on_path(tools_dir: str | Path | None = None) -> Path:
-    """Put the parent of `cpa_xai` on sys.path. Default: this project root."""
+    """Ensure cpa_xai is importable.
+
+    Default uses the in-package `grok_register.cpa_xai`. Override via
+    config `api_reverse_tools` / env `API_REVERSE_TOOLS` pointing at a
+    directory that contains a `cpa_xai` package.
+    """
     if tools_dir:
         tools = Path(tools_dir).expanduser().resolve()
     else:
         env = (os.environ.get("API_REVERSE_TOOLS") or "").strip()
-        tools = Path(env).expanduser().resolve() if env else _REG_DIR
-    # If user pointed at .../cpa_xai itself, use its parent
+        tools = Path(env).expanduser().resolve() if env else None
+    if tools is None:
+        # In-package import needs project root on path only when run as scripts
+        if str(_REG_DIR) not in sys.path:
+            sys.path.insert(0, str(_REG_DIR))
+        return _REG_DIR
     if tools.name == "cpa_xai" and (tools / "__init__.py").is_file():
         tools = tools.parent
     if str(tools) not in sys.path:
@@ -86,7 +96,7 @@ def export_cpa_xai_for_account(
     _ensure_cpa_xai_on_path(tools_dir)
 
     try:
-        from cpa_xai import mint_and_export  # type: ignore
+        from grok_register.cpa_xai import mint_and_export  # type: ignore
     except Exception as e:  # noqa: BLE001
         log(f"[cpa] import cpa_xai failed: {e}")
         return {"ok": False, "error": f"import: {e}"}
@@ -198,7 +208,7 @@ def export_cpa_xai_for_account(
             raise RuntimeError(f"CPA mint required but failed: {result.get('error')}")
     elif result.get("path") and cfg.get("sub2api_export_enabled", True):
         try:
-            import cpa_to_sub2api
+            from grok_register import cpa_to_sub2api
 
             sub_res = cpa_to_sub2api.export_after_cpa_result(
                 result,

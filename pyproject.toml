@@ -1,7 +1,7 @@
 [project]
-name = "grok-registrar-orig"
+name = "grok-register-mint"
 version = "1.0.0"
-description = "Grok 注册机原版（Chrome + DrissionPage + turnstilePatch 扩展）"
+description = "Grok Register Mint — 注册 + Grok Build CPA mint（基于上游二次开发）"
 requires-python = ">=3.13,<3.14"
 dependencies = [
     "DrissionPage>=4.1",   # Chrome 自动化（含 turnstilePatch 扩展加载）

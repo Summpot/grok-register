@@ -63,17 +63,28 @@
 
 ## 目录布局
 
-为避免运行产物和工具脚本堆在根目录，本仓库约定：
-
 | 位置 | 内容 |
 | --- | --- |
-| 根目录 | 入口脚本、`config.json`、核心模块、`turnstilePatch/` |
-| `output/` | 账号、CPA 认证、token 池、导出、日志类运行产物 |
-| `scripts/` | 回填、配置校验、GUI/CLI 辅助启动、一次性补丁 |
-| `docs/` | 本机/打包类说明（主文档仍是 `README.md`） |
-| `tests/` | 单元测试 |
+| 根目录 | 薄启动入口、`config.json`、依赖清单、`turnstilePatch/`、文档 |
+| `grok_register/` | **核心 Python 包**（GUI/CLI/CPA/邮箱/浏览器池） |
+| `output/` | 运行产物：账号、CPA 认证、token、导出（gitignore） |
+| `scripts/` | 回填、校验、辅助启动 |
+| `docs/` | 本机/打包说明（主文档仍是 `README.md`） |
+| `tests/` | unittest |
 
-默认 `cpa_auth_dir`、`accounts` 输出等均指向 `output/`。旧版根目录下的 `cpa_auths/`、`accounts_*.txt` 已被 gitignore，新跑任务请用新路径。
+默认输出指向 `output/`。旧路径 `cpa_auths/`、根目录 `accounts_*.txt` 仍被 gitignore。
+
+### 启动方式（兼容旧命令）
+
+```powershell
+# 推荐（根目录兼容入口，内部转到包）
+uv run python -u register_cli.py --count 1 --threads 1
+uv run python grok_register_ttk.py
+
+# 等价包入口
+uv run python -m grok_register.cli --count 1 --threads 1
+uv run python -m grok_register.app
+```
 
 ## 功能
 
@@ -510,31 +521,30 @@ mint 线程 (M)
 
 ```text
 .
-├── register_cli.py          # 推荐：多线程注册 + 异步 CPA mint
-├── grok_register_ttk.py     # 核心逻辑 / GUI / 兼容 CLI
-├── tab_pool.py              # 浏览器 / 标签页复用
-├── cpa_export.py            # CPA 导出
-├── cpa_to_sub2api.py        # sub2api 格式转换
-├── cf_mail_debug.py         # Cloudflare 邮箱调试
-├── cpa_xai/                 # Grok Build OAuth mint
+├── register_cli.py          # 薄入口 → grok_register.cli
+├── grok_register_ttk.py     # 薄入口 → grok_register.app (GUI/旧 CLI)
+├── cf_mail_debug.py         # 薄入口 → grok_register.cf_mail_debug
+├── grok_register/           # 核心包
+│   ├── app.py               # GUI + 注册主逻辑
+│   ├── cli.py               # 多线程注册 + 异步 mint
+│   ├── tab_pool.py
+│   ├── cpa_export.py
+│   ├── cpa_to_sub2api.py
+│   ├── cf_mail_debug.py
+│   ├── paths.py             # 项目根 / output / config 路径
+│   └── cpa_xai/             # Grok Build OAuth
 ├── turnstilePatch/          # Chromium 扩展（勿删除）
 ├── output/                  # 运行产物（gitignore）
-│   ├── accounts_*.txt
-│   ├── accounts_cli.txt
-│   ├── cpa_auths/           # xai-*.json
-│   ├── sub2api_exports/
-│   └── grok2api_tokens.json
-├── scripts/                 # 回填 / 校验 / 启动辅助
-├── docs/                    # 本地说明（非主文档）
-├── tests/                   # unittest
-├── assets/                  # banner 等
-├── config.example.json      # 配置模板
-├── config.json              # 本地私有配置（勿提交）
+├── scripts/
+├── docs/
+├── tests/
+├── config.example.json
+├── config.json              # 本地私有（勿提交）
 ├── pyproject.toml
 ├── uv.lock
 ├── mise.toml
 ├── requirements.txt
-└── README.md                # 本说明（完整中文）
+└── README.md
 ```
 
 ## 安全提示
@@ -549,7 +559,7 @@ mint 线程 (M)
 
 ```powershell
 uv run python -m unittest discover -s tests -v
-uv run python -m py_compile grok_register_ttk.py register_cli.py cf_mail_debug.py
+uv run python -m py_compile register_cli.py grok_register_ttk.py cf_mail_debug.py grok_register/app.py grok_register/cli.py
 # 或
 mise run check
 ```

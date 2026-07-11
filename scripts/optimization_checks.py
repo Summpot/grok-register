@@ -50,7 +50,7 @@ def check_proxy() -> bool:
 @check("chromium-slim-flags")
 def check_chromium_slim() -> bool:
     """create_browser_options 含瘦身 flag 列表"""
-    src = _source("grok_register_ttk.py")
+    src = _source("grok_register/app.py")
     slim_flags = ["--disable-gpu", "--disable-software-rasterizer",
                   "--disable-dev-shm-usage", "--disable-background-networking"]
     return all(f in src for f in slim_flags)
@@ -61,10 +61,10 @@ def check_chromium_slim() -> bool:
 @check("single-browser-multi-tab")
 def check_single_browser() -> bool:
     """存在 TabPool 模块 或 全局单例 browser 模式"""
-    tab_pool = ROOT / "tab_pool.py"
+    tab_pool = ROOT / "grok_register" / "tab_pool.py"
     if tab_pool.is_file():
         return True
-    src = _source("grok_register_ttk.py")
+    src = _source("grok_register/app.py")
     return "_browser_singleton" in src or "TabPool" in src
 
 
@@ -73,7 +73,7 @@ def check_single_browser() -> bool:
 @check("new-context-isolation")
 def check_new_context() -> bool:
     """TabPool 使用 threading.local 实现 per-thread tab 隔离"""
-    src = _source("tab_pool.py") if (ROOT / "tab_pool.py").is_file() else ""
+    src = _source("grok_register/tab_pool.py") if (ROOT / "grok_register" / "tab_pool.py").is_file() else ""
     return "threading.local" in src or "_thread_local" in src
 
 
@@ -82,7 +82,7 @@ def check_new_context() -> bool:
 @check("multi-thread-worker")
 def check_multi_thread() -> bool:
     """register_cli.py 含多线程 worker pool"""
-    src = _source("register_cli.py")
+    src = _source("grok_register/cli.py")
     has_threading = "ThreadPoolExecutor" in src or "threading.Thread" in src
     has_queue = "task_queue" in src or "Queue" in src
     return has_threading and has_queue
@@ -93,7 +93,7 @@ def check_multi_thread() -> bool:
 @check("nsfw-enabled")
 def check_nsfw() -> bool:
     """grok2api 调用含 auto_nsfw=true + NSFW 函数定义存在"""
-    gtk = _source("grok_register_ttk.py")
+    gtk = _source("grok_register/app.py")
     nsfw_defs = "set_tos_accepted" in gtk and "set_birth_date" in gtk
     has_auto_nsfw = "auto_nsfw" in gtk
     return nsfw_defs and has_auto_nsfw
@@ -104,7 +104,7 @@ def check_nsfw() -> bool:
 @check("gc-tab-restart")
 def check_gc_tab() -> bool:
     """每200账号 browser 重启（_gc_counter + _maybe_gc_restart）"""
-    cli = _source("register_cli.py")
+    cli = _source("grok_register/cli.py")
     return "_gc_counter" in cli and "_maybe_gc_restart" in cli
 
 
@@ -121,7 +121,7 @@ def check_fingerprint() -> bool:
 @check("human-sleep")
 def check_human_sleep() -> bool:
     """human_sleep 函数定义 + time.sleep 替换"""
-    src = _source("grok_register_ttk.py")
+    src = _source("grok_register/app.py")
     has_func = "def human_sleep" in src or "human_sleep(" in src
     has_gauss = "gauss" in src or "random" in src
     return has_func and has_gauss
@@ -132,7 +132,7 @@ def check_human_sleep() -> bool:
 @check("cloudmail-short-poll")
 def check_short_poll() -> bool:
     """cloudmail 轮询含 0.3s 间隔"""
-    src = _source("grok_register_ttk.py")
+    src = _source("grok_register/app.py")
     return "0.3" in src  # short poll interval
 
 
@@ -141,7 +141,7 @@ def check_short_poll() -> bool:
 @check("resume-checkpoint")
 def check_resume() -> bool:
     """accounts_cli.txt 断点续跑（done_count 跳过已完成）"""
-    src = _source("register_cli.py")
+    src = _source("grok_register/cli.py")
     return "done_count" in src
 
 
@@ -150,7 +150,7 @@ def check_resume() -> bool:
 @check("error-isolation")
 def check_error_isolation() -> bool:
     """账号级重试（retry loop + inc_fail 统计）"""
-    src = _source("register_cli.py")
+    src = _source("grok_register/cli.py")
     has_retry = "retry" in src.lower()
     has_fail_track = "inc_fail" in src
     return has_retry and has_fail_track
