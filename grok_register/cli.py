@@ -648,6 +648,18 @@ def _run_mint_job(worker_id: int | str, job: dict[str, Any], config: dict) -> di
                     worker_id,
                     f"[cloud-cpa] queued for batch upload: {Path(str(cloud_path)).name}",
                 )
+            # Optional: chenyme grok2api v3 Grok Build OAuth import (CPA xai-*.json)
+            if cloud_path and config.get("grok2api_auto_add_build", False):
+                try:
+                    from grok_register import app as reg_app
+
+                    reg_app.config.update(config)
+                    reg_app.add_cpa_auth_to_grok2api_v3_build(
+                        str(cloud_path),
+                        log_callback=lambda m: log(worker_id, m),
+                    )
+                except Exception as g2a_exc:
+                    log(worker_id, f"[Debug] grok2api Build 导入失败: {g2a_exc}")
             return last_result
         if last_result.get("skipped"):
             _inc("mint_skip")

@@ -237,13 +237,13 @@ uv run python cf_mail_debug.py `
 
 ### 4. 远端 grok2api（可选，**默认关闭**）
 
-本地池与远端上传默认均为 **关闭**（`grok2api_auto_add_local` / `grok2api_auto_add_remote` = `false`）。需要时再打开。
+本地 Web 池与远端上传默认均为 **关闭**（`grok2api_auto_add_local` / `grok2api_auto_add_remote` / `grok2api_auto_add_build` = `false`）。需要时再打开。
 
 支持两种远端：
 
 | mode | 目标 | 认证 | 接口 |
 | --- | --- | --- | --- |
-| `v3` | [chenyme/grok2api](https://github.com/chenyme/grok2api) Go v3 | 管理员用户名/密码登录拿 Bearer | `POST /api/admin/v1/accounts/web/import`（multipart SSO JSON） |
+| `v3` | [chenyme/grok2api](https://github.com/chenyme/grok2api) Go v3 | 管理员用户名/密码登录拿 Bearer | Web: `POST /api/admin/v1/accounts/web/import`；**Build**: `POST /api/admin/v1/accounts/import`（CPA OAuth JSON） |
 | `legacy` | 旧版 Python / jiujiu 池 | `app_key` 查询参数 | `/tokens/add`、`/admin/api/tokens/add` 等 |
 | `auto`（默认） | 先 v3，失败再 legacy | 两种都配齐时可用 | 自动降级 |
 
@@ -253,6 +253,7 @@ uv run python cf_mail_debug.py `
   "grok2api_local_token_file": "./output/grok2api_tokens.json",
   "grok2api_pool_name": "ssoBasic",
   "grok2api_auto_add_remote": false,
+  "grok2api_auto_add_build": false,
   "grok2api_remote_base": "http://你的服务器:5003",
   "grok2api_remote_mode": "auto",
   "grok2api_remote_username": "admin",
@@ -264,7 +265,9 @@ uv run python cf_mail_debug.py `
 
 说明：
 
-- **v3**：注册成功后的 SSO JWT 作为 Grok Web 账号导入；`ssoBasic`→tier `basic`，`ssoSuper`→`super`，也可用 `grok2api_v3_web_tier` 覆盖。
+- **v3 Web**：注册成功后的 SSO JWT 作为 Grok Web 账号导入（`grok2api_auto_add_remote`）。
+- **v3 Build**：CPA mint 后的 `output/cpa_auths/xai-*.json` 作为 Grok Build OAuth 导入（`grok2api_auto_add_build`，仅 v3/auto）。
+- Web tier：`ssoBasic`→`basic`，`ssoSuper`→`super`，可用 `grok2api_v3_web_tier` 覆盖。
 - **legacy**：`grok2api_remote_base` 可填站点根或 `/admin/api`；优先 `/tokens/add`。
 - 打开远端：设 `grok2api_auto_add_remote: true`，并填 `remote_base` +（v3 密码 **或** legacy `app_key`）。
 

@@ -23,6 +23,7 @@
     "grok2api_local_token_file": "./output/grok2api_tokens.json",
     "grok2api_pool_name": "ssoBasic",
     "grok2api_auto_add_remote": false,
+    "grok2api_auto_add_build": false,
     "grok2api_remote_base": "",
     "grok2api_remote_app_key": "",
     "grok2api_remote_mode": "auto",

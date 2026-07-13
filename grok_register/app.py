@@ -20,6 +20,7 @@ import random
 import re
 import string
 import json
+from pathlib import Path
 import traceback
 
 os.environ.setdefault("TK_SILENCE_DEPRECATION", "1")
@@ -120,6 +121,8 @@ DEFAULT_CONFIG = {
     "grok2api_local_token_file": "",
     "grok2api_pool_name": "ssoBasic",
     "grok2api_auto_add_remote": False,
+    # v3 only: upload CPA OAuth (Grok Build) after mint. Default off.
+    "grok2api_auto_add_build": False,
     "grok2api_remote_base": "",
     "grok2api_remote_app_key": "",
     # legacy | v3 | auto  (auto: prefer chenyme v3 admin API, fall back to legacy /tokens)
@@ -696,58 +699,48 @@ def _parse_v3_sse_complete(text):
     return last_complete
 
 
-def add_token_to_grok2api_remote_pool_v3(raw_token, email="", log_callback=None):
-    """Upload one SSO token to chenyme grok2api v3 Grok Web pool.
-
-    API:
-      POST {root}/api/admin/v1/auth/login
-      POST {root}/api/admin/v1/accounts/web/import  (multipart files/file)
-    """
-    token = _normalize_sso_token(raw_token)
-    if not token:
-        return False
+def _grok2api_v3_credentials():
+    """Return (root, username, password) for v3 admin API."""
     base = str(config.get("grok2api_remote_base", "") or "").strip()
     root = get_grok2api_v3_root(base)
     username = str(config.get("grok2api_remote_username", "admin") or "admin").strip() or "admin"
     password = str(config.get("grok2api_remote_password", "") or "").strip()
+    if not password:
+        password = str(config.get("grok2api_remote_app_key", "") or "").strip()
+    return root, username, password
+
+
+def _grok2api_v3_multipart_import(
+    *,
+    endpoint: str,
+    file_bytes: bytes,
+    filename: str,
+    log_callback=None,
+    label: str = "import",
+):
+    """Login + multipart POST to a v3 admin import endpoint.
+
+    Returns complete payload dict, True on success without body, or False if skipped.
+    """
+    root, username, password = _grok2api_v3_credentials()
     if not root:
         if log_callback:
             log_callback("[Debug] grok2api v3 未配置 remote_base，跳过")
         return False
-    if not password:
-        # allow reusing remote_app_key field as password for convenience
-        password = str(config.get("grok2api_remote_app_key", "") or "").strip()
     if not password:
         if log_callback:
             log_callback("[Debug] grok2api v3 未配置 remote_password（或 app_key 作密码），跳过")
         return False
 
     access = _grok2api_v3_login(root, username, password, log_callback=log_callback)
-    tier = _map_pool_to_v3_web_tier()
-    name = (email or "").strip() or f"auto-{token[:8]}"
-    document = {
-        "provider": "grok_web",
-        "accounts": [
-            {
-                "name": name,
-                "sso_token": token,
-                "tier": tier,
-            }
-        ],
-    }
-    file_bytes = (json.dumps(document, ensure_ascii=False) + "\n").encode("utf-8")
-    filename = f"web-{name.replace('@', '_').replace('/', '_')[:48]}.json"
-    endpoint = f"{root}/api/admin/v1/accounts/web/import"
 
     def _post_import(bearer: str):
         headers = {
             "Authorization": f"Bearer {bearer}",
             "Accept": "text/event-stream, application/json",
         }
-        # Prefer std requests for multipart upload: curl_cffi needs CurlMime, not dict.
-        files = {
-            "file": (filename, file_bytes, "application/json"),
-        }
+        files = {"file": (filename, file_bytes, "application/json")}
+        # std requests for multipart; curl_cffi needs CurlMime objects
         return std_requests.post(
             endpoint,
             headers=headers,
@@ -782,18 +775,58 @@ def add_token_to_grok2api_remote_pool_v3(raw_token, email="", log_callback=None)
             body_text = ""
 
     if status >= 400:
-        raise RuntimeError(f"v3 web import HTTP {status}: {body_text[:240]}")
+        raise RuntimeError(f"v3 {label} HTTP {status}: {body_text[:240]}")
 
     complete = _parse_v3_sse_complete(body_text)
     if complete is None:
-        # non-SSE JSON envelope fallback
         try:
             payload = resp.json()
             if isinstance(payload, dict):
                 complete = payload.get("data") if "data" in payload else payload
         except Exception:
             complete = None
+    return complete if complete is not None else True
 
+
+def add_token_to_grok2api_remote_pool_v3(raw_token, email="", log_callback=None):
+    """Upload one SSO token to chenyme grok2api v3 Grok Web pool.
+
+    API:
+      POST {root}/api/admin/v1/auth/login
+      POST {root}/api/admin/v1/accounts/web/import  (multipart files/file)
+    """
+    token = _normalize_sso_token(raw_token)
+    if not token:
+        return False
+    root, _user, _pw = _grok2api_v3_credentials()
+    if not root:
+        if log_callback:
+            log_callback("[Debug] grok2api v3 未配置 remote_base，跳过")
+        return False
+    tier = _map_pool_to_v3_web_tier()
+    name = (email or "").strip() or f"auto-{token[:8]}"
+    document = {
+        "provider": "grok_web",
+        "accounts": [
+            {
+                "name": name,
+                "sso_token": token,
+                "tier": tier,
+            }
+        ],
+    }
+    file_bytes = (json.dumps(document, ensure_ascii=False) + "\n").encode("utf-8")
+    filename = f"web-{name.replace('@', '_').replace('/', '_')[:48]}.json"
+    endpoint = f"{root}/api/admin/v1/accounts/web/import"
+    complete = _grok2api_v3_multipart_import(
+        endpoint=endpoint,
+        file_bytes=file_bytes,
+        filename=filename,
+        log_callback=log_callback,
+        label="web import",
+    )
+    if complete is False:
+        return False
     if isinstance(complete, dict):
         created = complete.get("created", "?")
         updated = complete.get("updated", "?")
@@ -808,6 +841,110 @@ def add_token_to_grok2api_remote_pool_v3(raw_token, email="", log_callback=None)
             log_callback(f"[+] 已写入 grok2api v3 Web 池: {name} ({endpoint})")
     return True
 
+
+def cpa_xai_auth_to_v3_build_entry(auth: dict) -> dict:
+    """Convert local CPA xai-*.json object to chenyme v3 grok_build import entry."""
+    if not isinstance(auth, dict):
+        raise ValueError("auth must be a dict")
+    access = str(auth.get("access_token") or "").strip()
+    refresh = str(auth.get("refresh_token") or "").strip()
+    if not access and not refresh:
+        raise ValueError("access_token/refresh_token missing")
+    email = str(auth.get("email") or "").strip()
+    sub = str(auth.get("sub") or "").strip()
+    name = email or (f"build-{sub[:8]}" if sub else "grok-build")
+    expires_at = str(auth.get("expires_at") or auth.get("expired") or "").strip()
+    entry = {
+        "provider": "grok_build",
+        "name": name,
+        "client_id": str(auth.get("client_id") or "b1a00492-073a-47ea-816f-4c329264a828").strip(),
+        "access_token": access,
+        "refresh_token": refresh,
+        "token_type": str(auth.get("token_type") or "Bearer").strip() or "Bearer",
+        "email": email,
+        "user_id": sub,
+        "principal_id": sub,
+    }
+    if expires_at:
+        entry["expires_at"] = expires_at
+    if auth.get("expires_in") is not None:
+        try:
+            entry["expires_in"] = int(auth.get("expires_in"))
+        except Exception:
+            pass
+    id_token = str(auth.get("id_token") or "").strip()
+    if id_token:
+        entry["id_token"] = id_token
+    team_id = str(auth.get("team_id") or "").strip()
+    if team_id:
+        entry["team_id"] = team_id
+    return entry
+
+
+def load_cpa_xai_auth_file(path: str) -> dict:
+    p = Path(path)
+    data = json.loads(p.read_text(encoding="utf-8"))
+    if not isinstance(data, dict):
+        raise ValueError("CPA auth JSON must be an object")
+    return data
+
+
+def add_cpa_auth_to_grok2api_v3_build(auth_or_path, log_callback=None):
+    """Upload one CPA OAuth auth (Grok Build) to chenyme grok2api v3.
+
+    API:
+      POST {root}/api/admin/v1/accounts/import  (multipart OAuth JSON)
+    Accepts a path to xai-*.json or an auth dict.
+    """
+    if isinstance(auth_or_path, (str, Path)):
+        auth = load_cpa_xai_auth_file(str(auth_or_path))
+        path_hint = str(auth_or_path)
+    elif isinstance(auth_or_path, dict):
+        auth = auth_or_path
+        path_hint = str(auth.get("email") or "inline")
+    else:
+        raise ValueError("auth_or_path must be path or dict")
+
+    mode = _grok2api_remote_mode()
+    if mode == "legacy":
+        if log_callback:
+            log_callback("[Debug] grok2api legacy 模式不支持 Grok Build 导入，跳过")
+        return False
+
+    root, _user, _pw = _grok2api_v3_credentials()
+    if not root:
+        if log_callback:
+            log_callback("[Debug] grok2api v3 Build 导入未配置 remote_base，跳过")
+        return False
+
+    entry = cpa_xai_auth_to_v3_build_entry(auth)
+    document = {"accounts": [entry]}
+    file_bytes = (json.dumps(document, ensure_ascii=False) + "\n").encode("utf-8")
+    safe_name = (entry.get("email") or entry.get("name") or "build").replace("@", "_").replace("/", "_")[:48]
+    filename = f"build-{safe_name}.json"
+    endpoint = f"{root}/api/admin/v1/accounts/import"
+    complete = _grok2api_v3_multipart_import(
+        endpoint=endpoint,
+        file_bytes=file_bytes,
+        filename=filename,
+        log_callback=log_callback,
+        label="build import",
+    )
+    if complete is False:
+        return False
+    if isinstance(complete, dict):
+        created = complete.get("created", "?")
+        updated = complete.get("updated", "?")
+        synced = complete.get("synced", complete.get("syncSucceeded", "?"))
+        if log_callback:
+            log_callback(
+                f"[+] 已写入 grok2api v3 Build 池: created={created} updated={updated} "
+                f"synced={synced} ({Path(path_hint).name if path_hint else filename})"
+            )
+    else:
+        if log_callback:
+            log_callback(f"[+] 已写入 grok2api v3 Build 池: {entry.get('email') or entry.get('name')}")
+    return True
 
 def add_token_to_grok2api_remote_pool_legacy(raw_token, email="", log_callback=None):
     """Legacy jiujiu/Python grok2api token pool upload (/tokens/add)."""
@@ -3733,10 +3870,14 @@ class GrokRegisterGUI:
         self.grok2api_local_file_entry = tk_entry(config_frame, textvariable=self.grok2api_local_file_var, width=72)
         add_field(self.grok2api_local_file_entry, 6, 1, columnspan=3)
 
-        add_label(7, 0, "grok2api 远端入池:")
+        add_label(7, 0, "grok2api 远端Web:")
         self.grok2api_remote_auto_var = tk.BooleanVar(value=bool(config.get("grok2api_auto_add_remote", False)))
         self.grok2api_remote_auto_check = tk_checkbutton(config_frame, variable=self.grok2api_remote_auto_var)
         add_field(self.grok2api_remote_auto_check, 7, 1, sticky=tk.W)
+        add_label(7, 2, "远端Build:")
+        self.grok2api_build_auto_var = tk.BooleanVar(value=bool(config.get("grok2api_auto_add_build", False)))
+        self.grok2api_build_auto_check = tk_checkbutton(config_frame, variable=self.grok2api_build_auto_var)
+        add_field(self.grok2api_build_auto_check, 7, 3, sticky=tk.W)
 
         add_label(8, 0, "grok2api 远端 Base:")
         self.grok2api_remote_base_var = tk.StringVar(value=str(config.get("grok2api_remote_base", "")))
@@ -4034,6 +4175,7 @@ class GrokRegisterGUI:
         config["grok2api_local_token_file"] = self.grok2api_local_file_var.get().strip()
         config["grok2api_pool_name"] = self.grok2api_pool_name_var.get().strip() or "ssoBasic"
         config["grok2api_auto_add_remote"] = bool(self.grok2api_remote_auto_var.get())
+        config["grok2api_auto_add_build"] = bool(self.grok2api_build_auto_var.get())
         config["grok2api_remote_base"] = self.grok2api_remote_base_var.get().strip()
         config["grok2api_remote_mode"] = (self.grok2api_remote_mode_var.get() or "auto").strip() or "auto"
         config["grok2api_remote_username"] = (self.grok2api_remote_user_var.get() or "admin").strip() or "admin"
