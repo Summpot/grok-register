@@ -31,7 +31,7 @@
 | Python | 文档曾写 3.9+ | **3.13**（`>=3.13,<3.14`） |
 | CPA / Grok Build | 无完整 mint 流水线 | OAuth mint → `output/cpa_auths/xai-*.json` |
 | 并发模型 | 偏单机/配置线程 | 注册线程 R + mint workers M，峰值浏览器约 **R + M** |
-| 云端 | 可选 grok2api | grok2api + 可选 **CPA Manager Plus** 批量上传 |
+| 云端 | 可选 grok2api | grok2api（v3/legacy，默认关）+ 可选 **CPA Manager Plus** 批量上传 |
 
 上游项目与社区讨论仍见 [AaronL725/grok-register](https://github.com/AaronL725/grok-register) 与 [linux.do](https://linux.do)。本 README 只描述 **本仓库当前行为**。
 
@@ -93,7 +93,7 @@ uv run python -m grok_register.app
 - Chrome / Chromium 真实浏览器注册流程（含 Turnstile 扩展 `turnstilePatch/`）
 - **多线程批量注册 + 异步 CPA / Grok Build OAuth mint**
 - 成功账号实时写入 `output/accounts_*.txt` / `output/accounts_cli.txt`
-- 可选写入本地 / 远端 grok2api token 池
+- 可选写入本地 / 远端 grok2api 池（**默认关闭**；支持 chenyme v3 Web 导入与旧版 token 池）
 - 可选批量上传 CPA 认证到 CPA Manager Plus（CPAMP）
 - 可选 sub2api 格式导出、本地热加载目录复制
 - 页面卡住检测、邮箱重试、浏览器复用与回收
@@ -206,6 +206,9 @@ uv run python cf_mail_debug.py `
 | --- | --- | --- |
 | `register_count` | 建议 | 默认目标数量；CLI 可用 `--count` 覆盖 |
 | `register_threads` | 建议 | GUI/部分逻辑读取；**CLI 真正并发以 `--threads` 为准** |
+| `register_browser_background` | 可选 | 默认 `true`：注册 Chrome 屏外放置，不抢前台（非 headless） |
+| `register_browser_window_position` | 可选 | 默认 `-2400,100`（屏外坐标） |
+| `register_browser_window_size` | 可选 | 默认 `1000,800` |
 | `code_poll_timeout` | 建议 | 等验证码超时秒数，批量建议 60–90 |
 | `code_poll_interval` | 可选 | 轮询间隔秒数 |
 
@@ -232,21 +235,38 @@ uv run python cf_mail_debug.py `
 | `cpa_base_url` | 必填（若要 CPA） | 必须是 `https://cli-chat-proxy.grok.com/v1`（Free Build） |
 | `cpa_mint_required` | 可选 | `true` 时 mint 失败更严格；默认 `false` 不阻断注册结果 |
 
-### 4. 远端 grok2api（可选）
+### 4. 远端 grok2api（可选，**默认关闭**）
+
+本地池与远端上传默认均为 **关闭**（`grok2api_auto_add_local` / `grok2api_auto_add_remote` = `false`）。需要时再打开。
+
+支持两种远端：
+
+| mode | 目标 | 认证 | 接口 |
+| --- | --- | --- | --- |
+| `v3` | [chenyme/grok2api](https://github.com/chenyme/grok2api) Go v3 | 管理员用户名/密码登录拿 Bearer | `POST /api/admin/v1/accounts/web/import`（multipart SSO JSON） |
+| `legacy` | 旧版 Python / jiujiu 池 | `app_key` 查询参数 | `/tokens/add`、`/admin/api/tokens/add` 等 |
+| `auto`（默认） | 先 v3，失败再 legacy | 两种都配齐时可用 | 自动降级 |
 
 ```json
 {
-  "grok2api_auto_add_local": true,
+  "grok2api_auto_add_local": false,
   "grok2api_local_token_file": "./output/grok2api_tokens.json",
   "grok2api_pool_name": "ssoBasic",
-  "grok2api_auto_add_remote": true,
+  "grok2api_auto_add_remote": false,
   "grok2api_remote_base": "http://你的服务器:5003",
-  "grok2api_remote_app_key": "你的管理密钥"
+  "grok2api_remote_mode": "auto",
+  "grok2api_remote_username": "admin",
+  "grok2api_remote_password": "v3管理密码",
+  "grok2api_remote_app_key": "legacy app_key（仅旧版）",
+  "grok2api_v3_web_tier": "auto"
 }
 ```
 
-`grok2api_remote_base` 可填站点根（`http://IP:5003`）或管理 API（`http://IP:5003/admin/api`）。  
-程序会优先尝试 `/tokens/add`，并兼容 `/admin/api/tokens/add` 等旧路径。
+说明：
+
+- **v3**：注册成功后的 SSO JWT 作为 Grok Web 账号导入；`ssoBasic`→tier `basic`，`ssoSuper`→`super`，也可用 `grok2api_v3_web_tier` 覆盖。
+- **legacy**：`grok2api_remote_base` 可填站点根或 `/admin/api`；优先 `/tokens/add`。
+- 打开远端：设 `grok2api_auto_add_remote: true`，并填 `remote_base` +（v3 密码 **或** legacy `app_key`）。
 
 ### 5. 上传到 CPA Manager Plus（可选）
 
@@ -256,11 +276,16 @@ uv run python cf_mail_debug.py `
   "cpa_cloud_api_base": "http://你的服务器:50001",
   "cpa_cloud_management_key": "你的 CPAMP 管理密钥",
   "cpa_cloud_upload_timeout": 30,
-  "cpa_cloud_upload_retries": 3
+  "cpa_cloud_upload_retries": 3,
+  "cpa_cloud_upload_require_chat": true,
+  "cpa_cloud_upload_chat_timeout": 45,
+  "cpa_cloud_upload_chat_rounds": 3
 }
 ```
 
 关闭时只会把认证文件写到本地 `output/cpa_auths/`。
+
+`cpa_cloud_upload_require_chat`（默认 `true`）：**整批 mint 结束后**再统一做 chat 门禁。按 **账号轮询**（第 1 轮对所有待测号各测 1 次，第 2 轮只测仍失败的号…），默认 `cpa_cloud_upload_chat_rounds=3`。**任一轮通过即可上传**；全部轮次都失败才跳过。不是「同一账号连测 N 次」。
 
 ### 6. 代理（按网络情况）
 
@@ -273,6 +298,21 @@ uv run python cf_mail_debug.py `
 
 - `proxy`：注册浏览器 / 邮箱请求代理
 - `cpa_proxy`：CPA mint 专用代理；空则跟随主流程
+
+### 代理池（可选）
+
+```json
+{
+  "proxy_pool_enabled": true,
+  "proxy_pool_file": "all_proxies.txt",
+  "proxy_pool_mode": "round_robin",
+  "proxy_pool_rotate_each_account": true
+}
+```
+
+- `all_proxies.txt`：每行一个代理，支持 `http://user:pass@host:port`
+- 启用后**每个账号**从池中取代理（注册 Chrome + mint HTTP 同绑）
+- 带账号密码的代理通过临时 Chrome 扩展注入认证（Chromium 本身不支持 URL 内嵌 user:pass）
 
 访问不了 `accounts.x.ai` 时必须配置可用代理。
 
@@ -304,7 +344,7 @@ uv run python cf_mail_debug.py `
   "cpa_export_enabled": true,
   "cpa_auth_dir": "./output/cpa_auths",
   "cpa_base_url": "https://cli-chat-proxy.grok.com/v1",
-  "grok2api_auto_add_local": true,
+  "grok2api_auto_add_local": false,
   "grok2api_local_token_file": "./output/grok2api_tokens.json",
   "grok2api_auto_add_remote": false,
   "cpa_cloud_upload_enabled": false
@@ -482,6 +522,8 @@ mint 线程 (M)
 ### 1. CLI 为什么还弹浏览器？
 
 注册页、Turnstile、SSO cookie、Grok Build device 授权都依赖真实 Chrome/Chromium。CLI 只是不启动 Tk 窗口。
+
+默认 `register_browser_background=true`：注册 Chrome **不会抢前台**（窗口放到屏外坐标），**不是 headless**。若要看见窗口，配置里设 `register_browser_background: false`。
 
 ### 2. 出了账号但没有 `xai-*.json`？
 

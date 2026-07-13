@@ -110,8 +110,17 @@ def export_cpa_xai_for_account(
     if cpa_dir and not cpa_dir.is_absolute():
         cpa_dir = (_REG_DIR / cpa_dir).resolve()
 
-    # Priority: cpa_proxy > proxy > env. Config must beat shell https_proxy.
-    proxy = (cfg.get("cpa_proxy") or cfg.get("proxy") or "").strip()
+    # Priority: cpa_proxy > thread pool pin > proxy > env.
+    proxy = (cfg.get("cpa_proxy") or "").strip()
+    if not proxy:
+        try:
+            from grok_register.cpa_xai.proxyutil import get_runtime_proxy
+
+            proxy = (get_runtime_proxy() or "").strip()
+        except Exception:
+            proxy = ""
+    if not proxy:
+        proxy = (cfg.get("proxy") or "").strip()
     if not proxy:
         proxy = (
             os.environ.get("https_proxy")
@@ -129,6 +138,12 @@ def export_cpa_xai_for_account(
     cookie_inject = bool(cfg.get("cpa_mint_cookie_inject", True))
     reuse_browser = bool(cfg.get("cpa_mint_browser_reuse", True))
     recycle_every = int(cfg.get("cpa_mint_browser_recycle_every", 15) or 0)
+    mint_backend = str(cfg.get("cpa_mint_backend") or "protocol").strip().lower() or "protocol"
+    yescaptcha_key = (
+        str(cfg.get("yescaptcha_api_key") or cfg.get("cpa_yescaptcha_api_key") or "").strip()
+        or (os.environ.get("YESCAPTCHA_API_KEY") or "").strip()
+    )
+    protocol_debug = bool(cfg.get("cpa_protocol_debug", False))
 
     # cookies: explicit arg > page export > none
     use_cookies = cookies
@@ -160,9 +175,10 @@ def export_cpa_xai_for_account(
 
     out_dir.mkdir(parents=True, exist_ok=True)
     log(
-        f"[cpa] mint OIDC for {email} -> {out_dir} proxy={proxy or '(none)'} "
+        f"[cpa] mint OIDC for {email} -> {out_dir} backend={mint_backend} "
+        f"proxy={proxy or '(none)'} "
         f"cookies={len(use_cookies) if isinstance(use_cookies, list) else (1 if use_cookies else 0)} "
-        f"reuse={reuse_browser}"
+        f"sso={'yes' if (sso or '').strip() else 'no'} reuse={reuse_browser}"
     )
 
     def _log(msg: str) -> None:
@@ -181,8 +197,12 @@ def export_cpa_xai_for_account(
         browser_timeout_sec=timeout,
         force_standalone=force_standalone,
         cookies=use_cookies,
+        sso=sso,
         reuse_browser=reuse_browser,
         recycle_every=recycle_every,
+        backend=mint_backend,
+        yescaptcha_key=yescaptcha_key,
+        protocol_debug=protocol_debug,
         log=_log,
     )
 

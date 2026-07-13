@@ -178,7 +178,7 @@ wheels = [
 ]
 
 [[package]]
-name = "grok-registrar-orig"
+name = "grok-register-mint"
 version = "1.0.0"
 source = { virtual = "." }
 dependencies = [

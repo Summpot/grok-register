@@ -31,11 +31,18 @@ from grok_register.paths import PROJECT_ROOT, OUTPUT_DIR, ensure_output_dir, TUR
 _orig_create_browser_options = reg.create_browser_options
 
 
-def _patched_create_browser_options():
-    # Prefer original factory (proxy + CHROMIUM_SLIM_FLAGS + extension)
+def _patched_create_browser_options(*args, **kwargs):
+    # Prefer original factory (proxy + CHROMIUM_SLIM_FLAGS + extension + background flags)
     try:
-        opts = _orig_create_browser_options()
+        opts = _orig_create_browser_options(*args, **kwargs)
+    except TypeError:
+        try:
+            opts = _orig_create_browser_options()
+        except Exception:
+            opts = None
     except Exception:
+        opts = None
+    if opts is None:
         from DrissionPage import ChromiumOptions
 
         opts = ChromiumOptions()
@@ -46,6 +53,12 @@ def _patched_create_browser_options():
                 opts.set_argument(flag)
             except Exception:
                 pass
+        try:
+            apply_bg = getattr(reg, "_apply_register_background_flags", None)
+            if callable(apply_bg):
+                apply_bg(opts)
+        except Exception:
+            pass
 
     try:
         opts.auto_port()
@@ -109,48 +122,115 @@ _stats = {
     "mint_skip": 0,
     "cloud_upload_success": 0,
     "cloud_upload_fail": 0,
+    "cloud_upload_skip": 0,
 }
 
-# CPA cloud upload is deferred until all mint jobs finish (batch once).
+# CPA cloud upload: queue during mint; flush every N accounts (and final drain).
 _pending_cloud_lock = threading.Lock()
 _pending_cloud_paths: list[str] = []
+_cloud_flush_lock = threading.Lock()
 
 
-def _queue_cloud_upload(path: str | None) -> None:
+def _queue_cloud_upload(path: str | None, config: dict | None = None) -> None:
+    """Queue a CPA file; when pending reaches batch_every, flush that chunk."""
     if not path:
         return
     pth = str(path)
+    to_flush: list[str] = []
     with _pending_cloud_lock:
         if pth not in _pending_cloud_paths:
             _pending_cloud_paths.append(pth)
+        cfg = config or {}
+        if cfg.get("cpa_cloud_upload_enabled", False):
+            try:
+                every = int(cfg.get("cpa_cloud_upload_batch_every", 10) or 10)
+            except Exception:
+                every = 10
+            every = max(0, min(every, 1000))
+            if every > 0 and len(_pending_cloud_paths) >= every:
+                to_flush = _pending_cloud_paths[:every]
+                del _pending_cloud_paths[:every]
+    if to_flush and config is not None:
+        log(0, f"[cloud-cpa] pending reached {len(to_flush)} — mid-batch upload")
+        _flush_cloud_uploads(config, paths=to_flush)
 
 
-def _flush_cloud_uploads(config: dict) -> dict:
-    """Upload all mint-produced CPA files once after the batch completes."""
+def _flush_cloud_uploads(config: dict, paths: list[str] | None = None) -> dict:
+    """Upload CPA files with account-round-robin chat gate.
+
+    - paths=None: drain all pending (final flush)
+    - paths=[...]: flush a pre-taken chunk (mid-batch every N)
+    """
     if not config.get("cpa_cloud_upload_enabled", False):
+        if paths is None:
+            with _pending_cloud_lock:
+                _pending_cloud_paths.clear()
         log(0, "[cloud-cpa] batch upload skipped: cpa_cloud_upload_enabled=false")
         return {"ok": True, "skipped": True, "count": 0}
-    with _pending_cloud_lock:
-        paths = list(_pending_cloud_paths)
-        _pending_cloud_paths.clear()
+    if paths is None:
+        with _pending_cloud_lock:
+            paths = list(_pending_cloud_paths)
+            _pending_cloud_paths.clear()
     if not paths:
         log(0, "[cloud-cpa] batch upload: no local CPA files to upload")
         return {"ok": True, "count": 0}
-    log(0, f"[cloud-cpa] batch upload start: {len(paths)} file(s)")
+
+    # Serialize mid-batch + final flushes so stats/logs stay coherent.
+    with _cloud_flush_lock:
+        return _flush_cloud_uploads_locked(config, paths)
+
+
+def _flush_cloud_uploads_locked(config: dict, paths: list[str]) -> dict:
+    upload_paths = list(paths)
+    skip = 0
+    if bool(config.get("cpa_cloud_upload_require_chat", True)):
+        log(
+            0,
+            f"[cloud-cpa] batch chat gate start: {len(paths)} account(s) "
+            f"(round-robin, not consecutive N probes per account)",
+        )
+        gate = reg.probe_cpa_auth_paths_round_robin(
+            paths,
+            cfg=config,
+            log_callback=lambda m: log(0, m),
+        )
+        upload_paths = list(gate.get("passed") or [])
+        failed = gate.get("failed") or {}
+        for fpath, fres in failed.items():
+            skip += 1
+            _inc("cloud_upload_skip")
+            st = fres.get("status")
+            reason = fres.get("reason") or "chat_not_usable"
+            log(
+                0,
+                f"[cloud-cpa] skipped {Path(fpath).name}: {reason}"
+                + (f" chat_status={st}" if st is not None else ""),
+            )
+        log(
+            0,
+            f"[cloud-cpa] batch chat gate result: pass={len(upload_paths)} "
+            f"skip={skip} rounds={gate.get('rounds')}",
+        )
+
+    log(0, f"[cloud-cpa] batch upload start: {len(upload_paths)} file(s) (of {len(paths)} minted)")
     ok = fail = 0
-    for path in paths:
+    for path in upload_paths:
         try:
             res = reg.upload_cpa_auth_file_to_cloud(
                 path,
                 config,
                 log_callback=lambda m: log(0, m),
+                skip_chat_gate=True,
             )
             if res.get("ok"):
                 ok += 1
                 _inc("cloud_upload_success")
                 log(0, f"[cloud-cpa] uploaded -> {Path(path).name}")
             elif res.get("skipped"):
-                log(0, f"[cloud-cpa] skipped {Path(path).name}: {res.get('reason') or res}")
+                skip += 1
+                _inc("cloud_upload_skip")
+                reason = res.get("reason") or "skipped"
+                log(0, f"[cloud-cpa] skipped {Path(path).name}: {reason}")
             else:
                 fail += 1
                 _inc("cloud_upload_fail")
@@ -159,8 +239,17 @@ def _flush_cloud_uploads(config: dict) -> dict:
             fail += 1
             _inc("cloud_upload_fail")
             log(0, f"[cloud-cpa] upload exception {Path(path).name}: {exc}")
-    log(0, f"[cloud-cpa] batch upload done: ok={ok} fail={fail} total={len(paths)}")
-    return {"ok": fail == 0, "count": len(paths), "success": ok, "fail": fail}
+    log(
+        0,
+        f"[cloud-cpa] batch upload done: ok={ok} skip={skip} fail={fail} total={len(paths)}",
+    )
+    return {
+        "ok": fail == 0,
+        "count": len(paths),
+        "success": ok,
+        "skip": skip,
+        "fail": fail,
+    }
 
 
 def _inc(key: str, n: int = 1) -> None:
@@ -265,6 +354,12 @@ def register_one(
     max_mail_retry = 3
     cancel = DummyStop()
 
+    # Pin a proxy for this account/thread before browser start.
+    try:
+        reg.assign_thread_proxy(lambda m: log(worker_id, m), force_new=True)
+    except Exception as exc:
+        log(worker_id, f"[proxy] assign failed: {exc}")
+
     try:
         _ensure_browser(worker_id, force_recycle=False)
     except Exception as exc:
@@ -292,6 +387,30 @@ def register_one(
             break
         except Exception as exc:
             msg = str(exc)
+            try:
+                from grok_register.cpa_xai.proxyutil import (
+                    disable_proxy,
+                    get_runtime_proxy,
+                    is_proxy_failure,
+                    proxy_log_label,
+                )
+                if is_proxy_failure(msg):
+                    cur = (get_runtime_proxy() or "").strip()
+                    if cur:
+                        disable_proxy(cur, reason=msg[:160])
+                        log(
+                            worker_id,
+                            f"[proxy] disabled {proxy_log_label(cur)} (email_stage)",
+                        )
+                        # force new proxy on browser restart
+                        try:
+                            reg.assign_thread_proxy(
+                                lambda m: log(worker_id, m), force_new=True
+                            )
+                        except Exception:
+                            pass
+            except Exception:
+                pass
             if ("未收到验证码" in msg or "验证码" in msg) and mail_try < max_mail_retry:
                 log(worker_id, f"! 本邮箱未取到验证码，换邮箱重试: {msg}")
                 try:
@@ -369,6 +488,12 @@ def register_one(
             except Exception:
                 pass
 
+        try:
+            from grok_register.cpa_xai.proxyutil import get_runtime_proxy
+
+            job_proxy = get_runtime_proxy() or ""
+        except Exception:
+            job_proxy = ""
         job = {
             "email": email,
             "password": password,
@@ -376,6 +501,7 @@ def register_one(
             "profile": profile,
             "idx": idx,
             "cookies": cookies,
+            "proxy": job_proxy,
         }
 
         if do_mint_inline:
@@ -395,6 +521,20 @@ def register_one(
         return job
     except Exception as exc:
         log(worker_id, f"! 注册失败: {exc}")
+        try:
+            from grok_register.cpa_xai.proxyutil import (
+                disable_proxy,
+                get_runtime_proxy,
+                is_proxy_failure,
+                proxy_log_label,
+            )
+            if is_proxy_failure(exc):
+                cur = (get_runtime_proxy() or "").strip()
+                if cur:
+                    disable_proxy(cur, reason=str(exc)[:160])
+                    log(worker_id, f"[proxy] disabled {proxy_log_label(cur)} (register_fail)")
+        except Exception:
+            pass
         reg.mark_error(email or "", reason=str(exc)[:120])
         traceback.print_exc()
         _inc("reg_fail")
@@ -406,7 +546,11 @@ def register_one(
 
 
 def _run_mint_job(worker_id: int | str, job: dict[str, Any], config: dict) -> dict:
-    """Standalone CPA mint (own Chromium). Never reuses register browser."""
+    """Standalone CPA mint (own Chromium). Never reuses register browser.
+
+    On mint failure, if proxy pool is enabled, rotate to a new random proxy and
+    retry up to cpa_mint_proxy_retries times (default 3).
+    """
     email = job.get("email") or ""
     password = job.get("password") or ""
     if not email or not password:
@@ -416,39 +560,145 @@ def _run_mint_job(worker_id: int | str, job: dict[str, Any], config: dict) -> di
         _inc("mint_skip")
         log(worker_id, f"[cpa] export disabled, skip {email}")
         return {"ok": False, "skipped": True, "email": email}
-    try:
-        from grok_register import cpa_export
 
-        # page=None always — force standalone path inside export
-        result = cpa_export.export_cpa_xai_for_account(
-            email,
-            password,
-            page=None,
-            cookies=job.get("cookies"),
-            sso=job.get("sso") or "",
-            config=config,
-            log_callback=lambda m: log(worker_id, m),
+    try:
+        from grok_register.cpa_xai.proxyutil import (
+            ensure_pool_from_config,
+            next_pool_proxy,
+            proxy_log_label,
+            set_runtime_proxy,
         )
-        if result.get("ok"):
-            log(worker_id, f"+ CPA auth: {result.get('path')}")
-            _inc("mint_success")
-            # Defer cloud upload until the whole batch finishes minting.
-            cloud_path = result.get("cpa_path") or result.get("path")
-            if cloud_path and config.get("cpa_cloud_upload_enabled", False):
-                _queue_cloud_upload(str(cloud_path))
-                log(worker_id, f"[cloud-cpa] queued for batch upload: {Path(str(cloud_path)).name}")
-        elif result.get("skipped"):
-            _inc("mint_skip")
-            log(worker_id, f"[cpa] skipped: {result.get('reason')}")
-        else:
-            _inc("mint_fail")
-            log(worker_id, f"! CPA auth 未成功: {result.get('error') or result}")
-        return result
+        from grok_register import cpa_export
     except Exception as exc:
         _inc("mint_fail")
-        log(worker_id, f"! CPA export 异常: {exc}")
-        traceback.print_exc()
+        log(worker_id, f"! CPA import failed: {exc}")
         return {"ok": False, "error": str(exc), "email": email}
+
+    pool_on = bool(config.get("proxy_pool_enabled", False))
+    mode = str(config.get("proxy_pool_mode") or "random").strip().lower() or "random"
+    try:
+        max_tries = int(config.get("cpa_mint_proxy_retries", 3) or 3)
+    except Exception:
+        max_tries = 3
+    max_tries = max(1, min(max_tries, 8))
+    if not pool_on:
+        max_tries = 1
+
+    if pool_on:
+        ensure_pool_from_config(config)
+
+    last_result: dict = {"ok": False, "error": "no attempt", "email": email}
+    for attempt in range(1, max_tries + 1):
+        # Proxy selection: first try job proxy (once), then always new pool proxy on retries.
+        try:
+            if attempt == 1 and str(job.get("proxy") or "").strip():
+                jp = str(job.get("proxy") or "").strip()
+                set_runtime_proxy(jp)
+                log(worker_id, f"[proxy] mint pin {proxy_log_label(jp)} (try {attempt}/{max_tries})")
+            elif pool_on:
+                from grok_register.cpa_xai.proxyutil import (
+                    is_pool_exhausted,
+                    note_pool_exhausted_message,
+                )
+
+                p = next_pool_proxy(mode)
+                if p:
+                    log(
+                        worker_id,
+                        f"[proxy] mint assigned {proxy_log_label(p)} (try {attempt}/{max_tries})",
+                    )
+                else:
+                    log(worker_id, note_pool_exhausted_message("mint"))
+                    try:
+                        config["proxy_pool_enabled"] = False
+                    except Exception:
+                        pass
+                    pool_on = False
+                    max_tries = attempt  # no more proxy rotations
+                    set_runtime_proxy(None)
+                    log(worker_id, "[proxy] mint continue direct (pool exhausted)")
+            else:
+                # single config proxy / none
+                pass
+        except Exception as exc:
+            log(worker_id, f"[proxy] mint assign skip: {exc}")
+
+        try:
+            result = cpa_export.export_cpa_xai_for_account(
+                email,
+                password,
+                page=None,
+                cookies=job.get("cookies"),
+                sso=job.get("sso") or "",
+                config=config,
+                log_callback=lambda m: log(worker_id, m),
+            )
+        except Exception as exc:
+            result = {"ok": False, "error": str(exc), "email": email}
+            log(worker_id, f"[cpa] mint exception (try {attempt}/{max_tries}): {exc}")
+
+        last_result = result if isinstance(result, dict) else {"ok": False, "error": str(result)}
+        if last_result.get("ok"):
+            log(worker_id, f"+ CPA auth: {last_result.get('path')}")
+            _inc("mint_success")
+            cloud_path = last_result.get("cpa_path") or last_result.get("path")
+            if cloud_path and config.get("cpa_cloud_upload_enabled", False):
+                _queue_cloud_upload(str(cloud_path), config)
+                log(
+                    worker_id,
+                    f"[cloud-cpa] queued for batch upload: {Path(str(cloud_path)).name}",
+                )
+            return last_result
+        if last_result.get("skipped"):
+            _inc("mint_skip")
+            log(worker_id, f"[cpa] skipped: {last_result.get('reason')}")
+            return last_result
+
+        err = last_result.get("error") or last_result
+        log(worker_id, f"! CPA auth 未成功 (try {attempt}/{max_tries}): {err}")
+        # Disable dead/overloaded proxies (429 / CONNECT fail / etc.)
+        try:
+            from grok_register.cpa_xai.proxyutil import (
+                disable_proxy,
+                get_runtime_proxy,
+                is_proxy_failure,
+                proxy_log_label,
+            )
+
+            if is_proxy_failure(err):
+                cur = (get_runtime_proxy() or "").strip()
+                if cur:
+                    disable_proxy(cur, reason=str(err)[:160])
+                    log(
+                        worker_id,
+                        f"[proxy] disabled {proxy_log_label(cur)} (reason=proxy_fail)",
+                    )
+        except Exception as _px:
+            log(worker_id, f"[proxy] disable skip: {_px}")
+        if attempt < max_tries and pool_on:
+            try:
+                from grok_register.cpa_xai.proxyutil import is_pool_exhausted, pool_size
+
+                if is_pool_exhausted() or pool_size() <= 0:
+                    log(worker_id, "[proxy] pool exhausted after disable — retry direct once")
+                    pool_on = False
+                    try:
+                        config["proxy_pool_enabled"] = False
+                    except Exception:
+                        pass
+                    set_runtime_proxy(None)
+                    time.sleep(min(0.5 * attempt, 2.0))
+                    continue
+            except Exception:
+                pass
+            log(worker_id, f"[proxy] mint fail → rotate proxy and retry")
+            time.sleep(min(0.5 * attempt, 2.0))
+            continue
+        break
+
+    _inc("mint_fail")
+    return last_result
+
 
 
 def _register_worker(
@@ -565,10 +815,22 @@ def main() -> int:
     parser.add_argument("--browser-recycle-every", type=int, default=25, help="复用 N 次后完整回收")
     parser.add_argument("--cookie-snapshot", action="store_true", help="注册成功写 cookie 快照（默认关，fast）")
     parser.add_argument("--inline-mint", action="store_true", help="强制注册线程内联 mint（调试用）")
+    parser.add_argument(
+        "--mint-backend",
+        choices=["protocol", "browser", "auto"],
+        default=None,
+        help="CPA mint 后端：protocol=无浏览器SSO协议；browser=Chrome设备码；auto=有SSO先协议",
+    )
     args = parser.parse_args()
 
     reg.load_config()
     cfg0 = getattr(reg, "config", {}) or {}
+    if args.mint_backend:
+        cfg0["cpa_mint_backend"] = args.mint_backend
+        try:
+            reg.config["cpa_mint_backend"] = args.mint_backend
+        except Exception:
+            pass
     threads = max(1, min(args.threads, 10))
     fast = bool(args.fast) and not bool(args.no_fast)
 
@@ -625,6 +887,21 @@ def main() -> int:
             flush=True,
         )
     print(f"[*] accounts_file = {args.accounts_file}", flush=True)
+    try:
+        from grok_register.cpa_xai.proxyutil import ensure_pool_from_config, proxy_log_label
+
+        cfg0 = getattr(reg, "config", {}) or {}
+        if cfg0.get("proxy_pool_enabled"):
+            n = ensure_pool_from_config(cfg0)
+            print(
+                f"[*] proxy_pool enabled file={cfg0.get('proxy_pool_file')} "
+                f"size={n} mode={cfg0.get('proxy_pool_mode', 'round_robin')}",
+                flush=True,
+            )
+        elif (cfg0.get("proxy") or "").strip():
+            print(f"[*] proxy={proxy_log_label(str(cfg0.get('proxy')))}", flush=True)
+    except Exception as exc:
+        print(f"[*] proxy pool init: {exc}", flush=True)
     if done_count > 0:
         print(f"[*] 断点续跑：已完成 {done_count}", flush=True)
     if remaining is not None and remaining <= 0:
@@ -736,7 +1013,9 @@ def main() -> int:
         f"=== 完成: 注册成功 {s.get('reg_success', 0)}, 注册失败 {s.get('reg_fail', 0)}, "
         f"CPA成功 {s.get('mint_success', 0)}, CPA失败 {s.get('mint_fail', 0)}, "
         f"CPA跳过 {s.get('mint_skip', 0)}, "
-        f"云上传成功 {s.get('cloud_upload_success', 0)}, 云上传失败 {s.get('cloud_upload_fail', 0)} ===",
+        f"云上传成功 {s.get('cloud_upload_success', 0)}, "
+        f"云上传跳过 {s.get('cloud_upload_skip', 0)}, "
+        f"云上传失败 {s.get('cloud_upload_fail', 0)} ===",
         flush=True,
     )
     return 0 if s.get("reg_success", 0) > 0 else 1

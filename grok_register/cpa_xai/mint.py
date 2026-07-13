@@ -32,27 +32,58 @@ def mint_and_export(
     browser_timeout_sec: float = 240.0,
     force_standalone: bool = True,
     cookies: Any | None = None,
+    sso: str | None = None,
     reuse_browser: bool = True,
     recycle_every: int = 15,
+    backend: str = "protocol",
+    yescaptcha_key: str = "",
+    protocol_debug: bool = False,
     log: LogFn | None = None,
     cancel: Callable[[], bool] | None = None,
 ) -> dict[str, Any]:
-    """Full pipeline: device-auth → write CPA file → optional probe.
+    """Mint OAuth tokens then write CPA file.
 
-    Returns dict with keys: ok, path, email, probe, error?
+    backend:
+      - protocol: SSO-first HTTP OAuth (no browser; YesCaptcha only if password login needed)
+      - browser: Chromium device-code flow
+      - auto: try protocol first when SSO present, else browser; on protocol fail fall back to browser
     """
     log = log or _noop
     email = (email or "").strip()
     if not email or not password:
         return {"ok": False, "email": email, "error": "missing email/password"}
 
-    # Config/explicit proxy wins over shell https_proxy (common 7890 trap).
-    # Thread-local pin — safe under concurrent mint workers.
     resolved = resolve_proxy(proxy)
     set_runtime_proxy(resolved or None)
-    log(f"mint start: {email} proxy={proxy_log_label(resolved) or '(none)'}")
-    try:
-        tokens = mint_with_browser(
+    backend_norm = (backend or "protocol").strip().lower()
+    if backend_norm not in {"protocol", "browser", "auto"}:
+        backend_norm = "protocol"
+
+    log(
+        f"mint start: {email} backend={backend_norm} "
+        f"proxy={proxy_log_label(resolved) or '(none)'}"
+    )
+
+    tokens: dict[str, Any] | None = None
+    used_backend = backend_norm
+    last_err: str | None = None
+
+    def _try_protocol() -> dict[str, Any]:
+        from .protocol_mint import mint_tokens_protocol
+
+        return mint_tokens_protocol(
+            email=email,
+            password=password,
+            sso=sso,
+            cookies=cookies,
+            proxy=resolved or None,
+            yescaptcha_key=yescaptcha_key,
+            debug=protocol_debug,
+            log=log,
+        )
+
+    def _try_browser() -> dict[str, Any]:
+        return mint_with_browser(
             email=email,
             password=password,
             page=None if force_standalone else page,
@@ -66,9 +97,46 @@ def mint_and_export(
             poll_log=log,
             cancel=cancel,
         )
+
+    sso_present = bool((sso or "").strip())
+    if not sso_present and isinstance(cookies, list):
+        for c in cookies:
+            if isinstance(c, dict) and c.get("name") in ("sso", "sso-rw") and c.get("value"):
+                sso_present = True
+                break
+
+    try:
+        if backend_norm == "browser":
+            used_backend = "browser"
+            tokens = _try_browser()
+        elif backend_norm == "protocol":
+            used_backend = "protocol"
+            tokens = _try_protocol()
+        else:  # auto
+            if sso_present:
+                try:
+                    used_backend = "protocol"
+                    tokens = _try_protocol()
+                except Exception as pe:  # noqa: BLE001
+                    last_err = str(pe)
+                    log(f"protocol mint failed, fallback browser: {pe}")
+                    used_backend = "browser"
+                    tokens = _try_browser()
+            else:
+                log("auto: no SSO, use browser mint")
+                used_backend = "browser"
+                tokens = _try_browser()
     except Exception as e:  # noqa: BLE001
         log(f"mint failed: {e}")
-        return {"ok": False, "email": email, "error": str(e)}
+        err = str(e)
+        if last_err:
+            err = f"{err} (prior protocol: {last_err})"
+        return {
+            "ok": False,
+            "email": email,
+            "error": err,
+            "backend": used_backend,
+        }
 
     payload = build_cpa_xai_auth(
         email=email,
@@ -79,7 +147,7 @@ def mint_and_export(
         base_url=base_url,
     )
     path = write_cpa_xai_auth(auth_dir, payload)
-    log(f"wrote {path}")
+    log(f"wrote {path} backend={used_backend}")
 
     result: dict[str, Any] = {
         "ok": True,
@@ -88,12 +156,16 @@ def mint_and_export(
         "user_code": tokens.get("user_code"),
         "base_url": base_url,
         "proxy": proxy_log_label(resolved),
+        "backend": used_backend,
     }
 
     if probe:
         pr = probe_models(tokens["access_token"], base_url=base_url, proxy=resolved or None)
         result["probe_models"] = pr
-        log(f"probe models: ok={pr.get('ok')} has_grok_45={pr.get('has_grok_45')} ids={pr.get('model_ids')}")
+        log(
+            f"probe models: ok={pr.get('ok')} has_grok_45={pr.get('has_grok_45')} "
+            f"ids={pr.get('model_ids')}"
+        )
         if not pr.get("has_grok_45"):
             result["ok"] = False
             result["error"] = "token ok but grok-4.5 not listed"
