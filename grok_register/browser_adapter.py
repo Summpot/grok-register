@@ -187,6 +187,21 @@ class ChromiumOptions:
             os.makedirs(profile_dir, exist_ok=True)
             kw["user_data_dir"] = profile_dir
 
+        # 已知的自动化特征参数列表 — 只过滤这些，不搞 blanket 过滤
+        _AUTOMATION_FLAGS = frozenset({
+            "--disable-gpu",
+            "--no-sandbox",
+            "--disable-dev-shm-usage",
+            "--mute-audio",
+            "--no-first-run",
+            "--no-default-browser-check",
+            "--disable-background-networking",
+            "--disable-background-timer-throttling",
+            "--disable-renderer-backgrounding",
+            "--disable-backgrounding-occluded-windows",
+            "--disable-features=Translate,MediaRouter",
+        })
+
         args: list[str] = []
 
         for flag in self._flags:
@@ -201,8 +216,10 @@ class ChromiumOptions:
                 continue
             if f.startswith("--user-data-dir="):
                 continue
-            # 过滤掉所有 --disable-* 和 --no-* 自动化特征参数
-            if f.startswith("--disable-") or f.startswith("--no-"):
+            # 只过滤已知的自动化特征参数，保留合法 --no-* / --disable-* 参数
+            eq_pos = f.find("=")
+            flag_name = f[:eq_pos] if eq_pos != -1 else f
+            if flag_name in _AUTOMATION_FLAGS:
                 continue
             args.append(f)
 
@@ -214,9 +231,6 @@ class ChromiumOptions:
 
         if self._proxy:
             kw["proxy"] = {"server": self._proxy}
-
-        # 注意: no_viewport 不设置 → Playwright 使用默认 viewport (1280x720)
-        # 不添加任何 --disable-* / --no-* 参数，避免自动化检测
 
         return kw
 

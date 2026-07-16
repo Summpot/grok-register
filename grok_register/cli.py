@@ -15,6 +15,7 @@ from __future__ import annotations
 import argparse
 import os
 import queue
+import signal
 import sys
 import threading
 import time
@@ -105,11 +106,14 @@ _log_queue: queue.Queue = queue.Queue()
 
 
 def _log_writer():
-    while True:
-        msg = _log_queue.get()
-        if msg is None:
-            break
-        print(msg, flush=True)
+    while not _cancel_event.is_set():
+        try:
+            msg = _log_queue.get(timeout=0.3)
+            if msg is None:
+                break
+            print(msg, flush=True)
+        except queue.Empty:
+            continue
 
 
 def log(worker_id: int | str, msg: str) -> None:
@@ -268,6 +272,25 @@ _next_idx = [1]
 
 # mint 队列结束哨兵
 _MINT_STOP = object()
+
+# Ctrl+C 取消事件 — 任何阻塞循环都应检查此事件
+_cancel_event = threading.Event()
+
+
+def _setup_signal_handler():
+    """注册 SIGINT 处理器，使 Ctrl+C 可靠地停止所有线程。"""
+    def _handler(sig_num, frame):
+        _cancel_event.set()
+        # 用 os.write 避免 print 在信号处理器中可能的死锁
+        try:
+            sys.stderr.write("\n[!] 正在停止...（再次按 Ctrl+C 强制结束）\n")
+            sys.stderr.flush()
+        except Exception:
+            pass
+    try:
+        signal.signal(signal.SIGINT, _handler)
+    except Exception:
+        pass
 
 
 def resolve_mint_workers(
@@ -727,7 +750,7 @@ def _register_worker(
     forever: bool,
     do_mint_inline: bool,
 ):
-    while True:
+    while not _cancel_event.is_set():
         try:
             idx = task_queue.get_nowait()
         except queue.Empty:
@@ -783,8 +806,11 @@ def _register_worker(
 
 
 def _mint_worker(worker_id: str, mint_queue: queue.Queue, config: dict):
-    while True:
-        job = mint_queue.get()
+    while not _cancel_event.is_set():
+        try:
+            job = mint_queue.get(timeout=0.5)
+        except queue.Empty:
+            continue
         try:
             if job is _MINT_STOP:
                 break
@@ -804,6 +830,7 @@ def _mint_worker(worker_id: str, mint_queue: queue.Queue, config: dict):
 
 def main() -> int:
     ensure_output_dir()
+    _setup_signal_handler()
     parser = argparse.ArgumentParser(description="CLI runner for grok_register_ttk (pipelined).")
     parser.add_argument("--count", type=int, default=1, help="账号总数目标（0=不限；含已有）")
     parser.add_argument(
@@ -976,14 +1003,21 @@ def main() -> int:
         t.start()
         reg_threads.append(t)
 
+    # 轮询等待注册线程完成，同时响应 Ctrl+C 取消
     try:
-        for t in reg_threads:
-            t.join()
+        while not _cancel_event.is_set():
+            alive = [t for t in reg_threads if t.is_alive()]
+            if not alive:
+                break
+            for t in alive:
+                t.join(timeout=0.3)
     except KeyboardInterrupt:
+        _cancel_event.set()
         print("\n[!] 用户中断", flush=True)
 
-    # drain mint queue
-    if mint_queue is not None:
+    if _cancel_event.is_set():
+        print("[!] 取消中，跳过 mint 队列...", flush=True)
+    elif mint_queue is not None:
         log(0, f"[cpa] 等待 mint 队列清空（qsize≈{mint_queue.qsize()}）...")
         mint_queue.join()
         for _ in mint_threads:

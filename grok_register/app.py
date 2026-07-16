@@ -1181,6 +1181,7 @@ def create_browser_options(*, unique_profile: bool = False, profile_tag: str = "
     options = ChromiumOptions()
     options.set_timeouts(base=2)
     # Outbound proxy (pool pin or config.proxy)
+    proxy: str = ""
     try:
         from grok_register.cpa_xai.proxyutil import (
             get_runtime_proxy,
@@ -1267,6 +1268,7 @@ def create_browser_options(*, unique_profile: bool = False, profile_tag: str = "
         options.set_channel("chrome")
     except Exception:
         _auto_detect_chrome_path(options)
+
     return options
 
 
