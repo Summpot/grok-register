@@ -2298,19 +2298,36 @@ def start_browser(log_callback=None):
             try:
                 if browser is not None:
                     browser.quit(del_data=True)
+                else:
+                    # Chromium() constructor may have spawned Chrome but failed
+                    # to connect — kill any orphans matching automation fingerprints
+                    try:
+                        kill_orphaned_automation_browsers(log_callback=log_callback)
+                    except Exception:
+                        pass
             except Exception:
                 pass
             browser = None
             page = None
             _sync_thread_browser_globals()
             time.sleep(min(1.5 * attempt, 4))
+    # Last resort: one final scour after all 4 retries exhausted
+    try:
+        kill_orphaned_automation_browsers(log_callback=log_callback)
+    except Exception:
+        pass
     raise Exception(f"浏览器启动失败，已重试4次: {last_exc}")
 
 
 def stop_browser():
     global browser, page
     _bind_thread_browser_globals()
+    _user_data_path = None
     if browser is not None:
+        try:
+            _user_data_path = getattr(browser, "user_data_path", None)
+        except Exception:
+            pass
         try:
             browser.quit(del_data=True)
         except TypeError:
@@ -2327,6 +2344,12 @@ def stop_browser():
     browser = None
     page = None
     _sync_thread_browser_globals()
+    # Force-kill any Chrome still alive on this profile / auto port after quit
+    if _user_data_path:
+        try:
+            _kill_chrome_by_profile(str(_user_data_path))
+        except Exception:
+            pass
 
 
 def restart_browser(log_callback=None):
@@ -2411,11 +2434,58 @@ def shutdown_browser():
         pass
 
 
-def kill_orphaned_automation_browsers(log_callback=None):
+def _kill_chrome_by_port(port: int) -> bool:
+    """Kill any Chrome.exe bound to the given debugging port using taskkill /F.
+
+    Lightweight helper for cleaning up orphans that DrissionPage spawned but
+    lost track of (e.g. Chromium() constructor failed after subprocess start).
+    Returns True if at least one process was killed.
+    """
+    if os.name != "nt":
+        return False
+    import subprocess
+    try:
+        out = subprocess.check_output(
+            [
+                "powershell", "-NoProfile", "-Command",
+                f'Get-CimInstance Win32_Process -Filter "name=\'chrome.exe\' and CommandLine like \'%--remote-debugging-port={port}%\'" '
+                f'| ForEach-Object {{ try {{ Stop-Process -Id $_.ProcessId -Force -ErrorAction Stop; $true }} catch {{ $false }} }}',
+            ],
+            text=True, stderr=subprocess.DEVNULL, timeout=10,
+        ).strip()
+        killed = sum(1 for line in out.splitlines() if line.strip().lower() == "true")
+        return killed > 0
+    except Exception:
+        return False
+
+
+def _kill_chrome_by_profile(profile_dir: str) -> bool:
+    """Kill Chrome processes using a specific user-data-dir."""
+    if os.name != "nt" or not profile_dir:
+        return False
+    import subprocess
+    safe_dir = profile_dir.replace("'", "''")
+    try:
+        out = subprocess.check_output(
+            [
+                "powershell", "-NoProfile", "-Command",
+                f'Get-CimInstance Win32_Process -Filter "name=\'chrome.exe\' and CommandLine like \'%--user-data-dir={safe_dir}%\'" '
+                f'| ForEach-Object {{ try {{ Stop-Process -Id $_.ProcessId -Force -ErrorAction Stop; $true }} catch {{ $false }} }}',
+            ],
+            text=True, stderr=subprocess.DEVNULL, timeout=10,
+        ).strip()
+        killed = sum(1 for line in out.splitlines() if line.strip().lower() == "true")
+        return killed > 0
+    except Exception:
+        return False
+
+
+def kill_orphaned_automation_browsers(log_callback=None, port: int | None = None):
     """Kill leftover Chrome processes started by DrissionPage / this project.
 
     Only matches automation fingerprints: autoPortData / grok_reg_chrome /
     DrissionPage temp profiles. Normal user Chrome is left alone.
+    When port is given, only kill Chrome with that --remote-debugging-port.
     """
     log = log_callback or (lambda m: None)
     try:
@@ -2435,12 +2505,15 @@ def kill_orphaned_automation_browsers(log_callback=None):
             pass
         return 0
 
+    _port_arg = f"--remote-debugging-port={port}" if port else ""
     ps_lines = [
         "$patterns = @('autoPortData','grok_reg_chrome','DrissionPage')",
+        "$portFilter = " + (f"'%{_port_arg}%'" if port else "$null"),
         "$killed = 0",
         "Get-CimInstance Win32_Process -Filter \"name='chrome.exe'\" | ForEach-Object {",
         "  $cmd = $_.CommandLine",
         "  if (-not $cmd) { return }",
+        "  if ($portFilter -and ($cmd -notlike $portFilter)) { return }",
         "  foreach ($pat in $patterns) {",
         "    if ($cmd -match $pat) {",
         "      try { Stop-Process -Id $_.ProcessId -Force -ErrorAction Stop; $killed++ } catch {}",

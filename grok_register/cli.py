@@ -333,6 +333,14 @@ def _ensure_browser(worker_id: int, force_recycle: bool = False):
         except Exception:
             browser = None
     if browser is None:
+        # Before spawning a new Chrome, clean any leftover orphans from prior
+        # failed attempts (e.g. Chromium() constructor spawned Chrome then crashed).
+        try:
+            reg.kill_orphaned_automation_browsers(
+                log_callback=lambda m: log(worker_id, m)
+            )
+        except Exception:
+            pass
         reg.start_browser(log_callback=lambda m: log(worker_id, m))
 
 
@@ -736,42 +744,58 @@ def _register_worker(
             continue
 
         retry = 0
-        while retry < 2:
-            try:
-                result = register_one(
-                    worker_id,
-                    idx,
-                    total,
-                    accounts_file,
-                    do_mint_inline=do_mint_inline,
-                    mint_queue=mint_queue,
-                )
-                if result:
-                    break
-                retry += 1
-                if retry < 2:
-                    log(worker_id, f"[retry] 账号 {idx} 失败，重试 {retry}/1")
-                    try:
-                        reg.restart_browser(log_callback=lambda m: log(worker_id, m))
-                    except Exception:
-                        pass
-            except Exception:
-                retry += 1
-                if retry < 2:
-                    log(worker_id, f"[retry] 账号 {idx} 异常，重试 {retry}/1")
-                    traceback.print_exc()
-                    try:
-                        reg.restart_browser(log_callback=lambda m: log(worker_id, m))
-                    except Exception:
-                        pass
+        try:
+            while retry < 2:
+                try:
+                    result = register_one(
+                        worker_id,
+                        idx,
+                        total,
+                        accounts_file,
+                        do_mint_inline=do_mint_inline,
+                        mint_queue=mint_queue,
+                    )
+                    if result:
+                        break
+                    retry += 1
+                    if retry < 2:
+                        log(worker_id, f"[retry] 账号 {idx} 失败，重试 {retry}/1")
+                        try:
+                            reg.restart_browser(log_callback=lambda m: log(worker_id, m))
+                        except Exception:
+                            pass
+                except Exception:
+                    retry += 1
+                    if retry < 2:
+                        log(worker_id, f"[retry] 账号 {idx} 异常，重试 {retry}/1")
+                        traceback.print_exc()
+                        try:
+                            reg.restart_browser(log_callback=lambda m: log(worker_id, m))
+                        except Exception:
+                            pass
 
-        if retry >= 2:
-            # register_one already counted fail on exception path; if both returned None, count once more only if needed
-            pass
+            if retry >= 2:
+                # register_one already counted fail on exception path
+                pass
+        finally:
+            # Clean orphan Chrome after each registration attempt (success, fail, or crash).
+            try:
+                reg.kill_orphaned_automation_browsers(
+                    log_callback=lambda m: log(worker_id, m)
+                )
+            except Exception:
+                pass
 
     # worker exit: free browser
     try:
         reg.stop_browser()
+    except Exception:
+        pass
+    # Final orphan sweep before thread terminates.
+    try:
+        reg.kill_orphaned_automation_browsers(
+            log_callback=lambda m: log(worker_id, m)
+        )
     except Exception:
         pass
     log(worker_id, "register worker exit")
