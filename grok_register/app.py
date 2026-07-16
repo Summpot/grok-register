@@ -3395,77 +3395,81 @@ def getTurnstileToken(log_callback=None, cancel_callback=None):
     if page is None:
         raise Exception("页面未就绪，无法执行 Turnstile")
 
+    # Patchright native Turnstile: use frame_locator + locator instead of
+    # shadow-DOM traversal.  Patchright already handles navigator.webdriver.
+    pw_page = page._p  # underlying Playwright Page
+
     try:
-        page.run_js(
+        pw_page.evaluate(
             "try { if (window.turnstile && typeof turnstile.reset === 'function') turnstile.reset(); } catch(e) {}"
         )
     except Exception:
         pass
 
-    for _ in range(0, 20):
+    for _ in range(0, 30):
         raise_if_cancelled(cancel_callback)
         try:
-            token = page.run_js(
-                """
-try {
-  const byInput = String((document.querySelector('input[name="cf-turnstile-response"]') || {}).value || '').trim();
-  if (byInput) return byInput;
-  if (window.turnstile && typeof turnstile.getResponse === 'function') {
-    return String(turnstile.getResponse() || '').trim();
-  }
-  return '';
-} catch(e) { return ''; }
-                """
+            # 1. Check if token already present
+            token = pw_page.evaluate(
+                """() => {
+                    var el = document.querySelector('input[name="cf-turnstile-response"]');
+                    return (el && el.value) || '';
+                }"""
             )
             token = str(token or "").strip()
             if len(token) >= 80:
                 if log_callback:
                     log_callback(f"[*] Turnstile 已通过，token长度={len(token)}")
                 return token
-
-            challenge_input = page.ele("@name=cf-turnstile-response")
-            if challenge_input:
-                wrapper = challenge_input.parent()
-                iframe = None
-                try:
-                    iframe = wrapper.shadow_root.ele("tag:iframe")
-                except Exception:
-                    iframe = None
-                if iframe:
-                    try:
-                        iframe.run_js(
-                            """
-window.dtp = 1;
-function getRandomInt(min, max) { return Math.floor(Math.random() * (max - min + 1)) + min; }
-let sx = getRandomInt(800, 1200);
-let sy = getRandomInt(400, 700);
-Object.defineProperty(MouseEvent.prototype, 'screenX', { value: sx });
-Object.defineProperty(MouseEvent.prototype, 'screenY', { value: sy });
-                            """
-                        )
-                    except Exception:
-                        pass
-                    try:
-                        body_sr = iframe.ele("tag:body").shadow_root
-                        btn = body_sr.ele("tag:input")
-                        if btn:
-                            btn.click()
-                    except Exception:
-                        pass
-            else:
-                # 兜底：尝试触发页面上可见的 Turnstile 容器
-                page.run_js(
-                    """
-const nodes = Array.from(document.querySelectorAll('div,span,iframe')).filter((n) => {
-  const txt = (n.className || '') + ' ' + (n.id || '') + ' ' + (n.getAttribute?.('src') || '');
-  return String(txt).toLowerCase().includes('turnstile');
-});
-if (nodes.length && typeof nodes[0].click === 'function') nodes[0].click();
-                    """
-                )
         except Exception:
             pass
-        sleep_with_cancel(0.45, cancel_callback)
+
+        # 2. Try to click the Turnstile checkbox via Patchright native locator
+        try:
+            frame = pw_page.frame_locator('iframe[src*="challenges.cloudflare.com"]')
+            if frame:
+                checkbox = frame.locator('#checkbox, input[type="checkbox"], .mark')
+                if checkbox.count() > 0:
+                    try:
+                        checkbox.first.click(timeout=3000)
+                    except Exception:
+                        # Fallback: JS click inside the frame
+                        try:
+                            pw_page.evaluate("""
+                                () => {
+                                    var frames = document.querySelectorAll('iframe[src*="challenges.cloudflare.com"]');
+                                    for (var f of frames) {
+                                        try {
+                                            var doc = f.contentDocument || f.contentWindow.document;
+                                            var cb = doc.querySelector('#checkbox, input[type="checkbox"], .mark');
+                                            if (cb) { cb.click(); return true; }
+                                        } catch(e) {}
+                                    }
+                                    return false;
+                                }
+                            """)
+                        except Exception:
+                            pass
+        except Exception:
+            pass
+
+        # 3. Fallback: JS click on any turnstile element
+        try:
+            pw_page.evaluate(
+                """() => {
+                    var nodes = document.querySelectorAll('div,span,iframe');
+                    for (var i=0; i<nodes.length; i++) {
+                        var txt = (nodes[i].className||'') + ' ' + (nodes[i].id||'') + ' ' + (nodes[i].getAttribute('src')||'');
+                        if (txt.toLowerCase().includes('turnstile')) {
+                            nodes[i].click(); break;
+                        }
+                    }
+                }"""
+            )
+        except Exception:
+            pass
+
+        sleep_with_cancel(0.5, cancel_callback)
 
     raise Exception("Turnstile 获取 token 失败")
 

@@ -597,67 +597,49 @@ def _click_exact(
 
 
 def _wait_turnstile(page: Any, log: LogFn, timeout: float = 45.0) -> bool:
-    """Wait/click Cloudflare Turnstile on the mint browser page."""
+    """Wait/click Cloudflare Turnstile using Patchright native locators."""
+    pw_page = page._p
     deadline = time.time() + timeout
     clicked = False
     while time.time() < deadline:
         try:
-            el = page.ele("css:input[name='cf-turnstile-response']", timeout=0.3)
-            if el is not None:
-                v = (el.attr("value") or "").strip()
-                if len(v) > 20:
-                    log(f"turnstile ready len={len(v)}")
-                    return True
-        except Exception:
-            pass
-
-        # Mimic register-machine: shadow-root checkbox click
-        try:
-            challenge_input = page.ele("@name=cf-turnstile-response", timeout=0.2)
-            if challenge_input is not None:
-                wrapper = challenge_input.parent()
-                iframe = None
-                try:
-                    iframe = wrapper.shadow_root.ele("tag:iframe")
-                except Exception:
-                    iframe = None
-                if iframe is not None:
-                    try:
-                        iframe.run_js(
-                            """
-window.dtp = 1;
-function getRandomInt(min, max) { return Math.floor(Math.random() * (max - min + 1)) + min; }
-let sx = getRandomInt(800, 1200);
-let sy = getRandomInt(400, 700);
-Object.defineProperty(MouseEvent.prototype, 'screenX', { value: sx });
-Object.defineProperty(MouseEvent.prototype, 'screenY', { value: sy });
-                            """
-                        )
-                    except Exception:
-                        pass
-                    try:
-                        body_sr = iframe.ele("tag:body").shadow_root
-                        btn = body_sr.ele("tag:input")
-                        if btn is not None:
-                            btn.click()
-                            if not clicked:
-                                log("clicked turnstile shadow checkbox")
-                                clicked = True
-                    except Exception:
-                        pass
+            val = pw_page.evaluate(
+                """() => {
+                    var el = document.querySelector('input[name="cf-turnstile-response"]');
+                    return (el && el.value) || '';
+                }"""
+            )
+            v = (val or "").strip()
+            if len(v) > 20:
+                log(f"turnstile ready len={len(v)}")
+                return True
         except Exception:
             pass
 
         if not clicked:
             try:
-                page.run_js(
-                    """
-const nodes = Array.from(document.querySelectorAll('div,span,iframe')).filter((n) => {
-  const txt = (n.className || '') + ' ' + (n.id || '') + ' ' + (n.getAttribute?.('src') || '');
-  return String(txt).toLowerCase().includes('turnstile');
-});
-if (nodes.length && typeof nodes[0].click === 'function') nodes[0].click();
-                    """
+                frame = pw_page.frame_locator('iframe[src*="challenges.cloudflare.com"]')
+                cb = frame.locator('#checkbox, input[type="checkbox"], .mark')
+                if cb.count() > 0:
+                    cb.first.click(timeout=3000)
+                    clicked = True
+                    log("clicked turnstile checkbox via Patchright")
+            except Exception:
+                pass
+
+        if not clicked:
+            try:
+                pw_page.evaluate(
+                    """() => {
+                        var nodes = document.querySelectorAll('div,span,iframe');
+                        for (var i=0; i<nodes.length; i++) {
+                            var txt = (nodes[i].className||'') + ' ' + (nodes[i].id||'') + ' ' + (nodes[i].getAttribute('src')||'');
+                            if (txt.toLowerCase().includes('turnstile')) {
+                                nodes[i].click(); return true;
+                            }
+                        }
+                        return false;
+                    }"""
                 )
                 clicked = True
                 log("clicked turnstile container via JS")

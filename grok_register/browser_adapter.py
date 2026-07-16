@@ -49,6 +49,34 @@ def _get_playwright():
         return _pw
 
 
+# ── Turnstile init script ─────────────────────────────────────────────
+_TURNSTILE_INIT_SCRIPT: str | None = None
+_TURNSTILE_INIT_LOCK = threading.Lock()
+
+
+def _find_turnstile_script() -> str | None:
+    """Locate turnstilePatch/content.js and return its content."""
+    global _TURNSTILE_INIT_SCRIPT
+    if _TURNSTILE_INIT_SCRIPT is not None:
+        return _TURNSTILE_INIT_SCRIPT or None
+    with _TURNSTILE_INIT_LOCK:
+        if _TURNSTILE_INIT_SCRIPT is not None:
+            return _TURNSTILE_INIT_SCRIPT or None
+        candidates = [
+            Path(__file__).resolve().parent.parent / "turnstilePatch" / "content.js",
+            Path.cwd() / "turnstilePatch" / "content.js",
+        ]
+        for cand in candidates:
+            if cand.is_file():
+                try:
+                    _TURNSTILE_INIT_SCRIPT = cand.read_text(encoding="utf-8")
+                    return _TURNSTILE_INIT_SCRIPT
+                except Exception:
+                    pass
+        _TURNSTILE_INIT_SCRIPT = ""
+        return None
+
+
 # ── Error compatibility ───────────────────────────────────────────────
 class PageDisconnectedError(Exception):
     pass
@@ -288,6 +316,32 @@ class PatchrightElement:
                 except Exception:
                     pass
             return None
+        # Iframe routing: query inside the iframe's content document
+        try:
+            tag = self._h.evaluate("el => el.tagName")
+            if tag and tag.upper() == "IFRAME":
+                frame = self._h.content_frame()
+                if frame:
+                    el = frame.locator(css).first
+                    try:
+                        if el:
+                            h = el.element_handle()
+                            if h:
+                                return PatchrightElement(h, self._page)
+                    except Exception:
+                        pass
+                    # fallback: evaluate in frame
+                    try:
+                        h = frame.evaluate_handle(f"() => document.querySelector({css!r})")
+                        if h:
+                            has_tag = h.evaluate("el => el ? el.tagName : null")
+                            if has_tag:
+                                return PatchrightElement(h, self._page)
+                    except Exception:
+                        pass
+                return None
+        except Exception:
+            pass
         try:
             child = self._h.query_selector(css)
             if child:
@@ -552,6 +606,20 @@ def Chromium(opts: ChromiumOptions) -> PatchrightBrowser:
                 **launch_options,
                 no_viewport=no_viewport,
             )
+            # Inject Turnstile anti-detection into every page (replaces extension).
+            # Must run in MAIN world so Object.defineProperty overrides take effect.
+            ts_script = _find_turnstile_script()
+            if ts_script:
+                escaped = json.dumps(ts_script)
+                context.add_init_script(
+                    f"""// Turnstile anti-detection (injected via <script> into MAIN world)
+(function () {{
+    var s = document.createElement('script');
+    s.textContent = {escaped};
+    (document.head || document.documentElement).appendChild(s);
+}})();
+"""
+                )
             browser = context.browser
             return PatchrightBrowser(browser, context, opts)
         except Exception as exc:

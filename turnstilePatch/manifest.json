@@ -1,5 +1,5 @@
 {
-    "manifest_version": 2,
+    "manifest_version": 3,
     "name": "Turnstile Patch",
     "version": "1.0.0",
     "description": "Patch browser automation detection for Turnstile",
@@ -8,8 +8,10 @@
             "matches": ["<all_urls>"],
             "js": ["content.js"],
             "run_at": "document_start",
-            "all_frames": true
+            "all_frames": true,
+            "world": "MAIN"
         }
     ],
-    "permissions": ["activeTab"]
+    "permissions": ["activeTab"],
+    "host_permissions": ["<all_urls>"]
 }
