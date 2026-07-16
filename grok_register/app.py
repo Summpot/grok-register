@@ -699,6 +699,98 @@ def _parse_v3_sse_complete(text):
     return last_complete
 
 
+def _parse_go_import_sse(text: str) -> dict | None:
+    """Parse Go backend SSE stream and return the last complete data payload.
+
+    Go backend emits lines like:
+      data: {"created":1,"synced":0,"updated":0}
+    Unlike v3 Python backend, Go backend does NOT emit event: complete markers.
+    We match any data: line containing 'created' or 'synced'.
+    """
+    if not text:
+        return None
+    last_complete: dict | None = None
+    for line in str(text).splitlines():
+        stripped = line.strip()
+        if stripped.startswith("data: "):
+            try:
+                parsed = json.loads(stripped[6:])
+                if isinstance(parsed, dict) and ("created" in parsed or "synced" in parsed):
+                    last_complete = parsed
+            except (json.JSONDecodeError, ValueError):
+                continue
+    return last_complete
+
+
+def _convert_web_to_build(root: str | None = None, log_callback=None) -> dict | None:
+    """Call Go backend API to convert imported web accounts to Build.
+
+    POST /api/admin/v1/accounts/web/convert-to-build
+    Payload: {"all": True, "strategy": "missing"} — only converts accounts
+    that do not yet have a Build counterpart. Safe to call repeatedly.
+
+    Uses the same admin credentials as v3 import (_grok2api_v3_credentials).
+    Returns the parsed SSE complete payload, or None on failure.
+    """
+    _root, username, password = _grok2api_v3_credentials()
+    if root:
+        _root = str(root or "").strip().rstrip("/")
+    if not _root:
+        if log_callback:
+            log_callback("[Debug] 未配置 grok2api_remote_base，跳过 Web→Build 转换")
+        return None
+    try:
+        access = _grok2api_v3_login(_root, username, password, log_callback=log_callback)
+    except Exception as exc:
+        if log_callback:
+            log_callback(f"[Debug] Web→Build 转换登录失败: {exc}")
+        return None
+    import urllib3
+    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+    convert_url = f"{_root}/api/admin/v1/accounts/web/convert-to-build"
+    payload = {"all": True, "strategy": "missing"}
+    try:
+        resp = http_post(
+            convert_url,
+            headers={
+                "Authorization": f"Bearer {access}",
+                "Content-Type": "application/json",
+                "Accept": "text/event-stream, application/json",
+            },
+            json=payload,
+            timeout=120,
+            verify=False,
+            proxies={},
+        )
+    except Exception as exc:
+        if log_callback:
+            log_callback(f"[Debug] Web→Build 转换请求失败: {exc}")
+        return None
+    status = int(getattr(resp, "status_code", 0) or 0)
+    body = ""
+    try:
+        body = resp.text or ""
+    except Exception:
+        pass
+    if status >= 400:
+        if log_callback:
+            log_callback(f"[Debug] Web→Build 转换 HTTP {status}: {body[:200]}")
+        return None
+    result = _parse_go_import_sse(body)
+    if result:
+        created = int(result.get("created", 0))
+        synced = int(result.get("synced", 0))
+        if log_callback:
+            log_callback(
+                f"[+] Web→Build 转换完成: created={created} synced={synced}"
+                + (f" updated={result.get('updated')}" if result.get("updated") else "")
+            )
+    else:
+        if log_callback:
+            log_callback(f"[*] Web→Build 转换成功，无 SSE 数据（可能无待转换账号）")
+    return result
+
+
 def _grok2api_v3_credentials():
     """Return (root, username, password) for v3 admin API."""
     base = str(config.get("grok2api_remote_base", "") or "").strip()
@@ -839,6 +931,13 @@ def add_token_to_grok2api_remote_pool_v3(raw_token, email="", log_callback=None)
     else:
         if log_callback:
             log_callback(f"[+] 已写入 grok2api v3 Web 池: {name} ({endpoint})")
+    # Auto convert web→build if enabled (Go backend API)
+    if config.get("grok2api_auto_add_build", False):
+        try:
+            _convert_web_to_build(root=root, log_callback=log_callback)
+        except Exception as conv_exc:
+            if log_callback:
+                log_callback(f"[Debug] Web→Build 转换异常（不影响账号导入）: {conv_exc}")
     return True
 
 
