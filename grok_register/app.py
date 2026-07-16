@@ -2282,6 +2282,19 @@ def start_browser(log_callback=None):
                 opts = create_browser_options(unique_profile=True, profile_tag="reg")
             except TypeError:
                 opts = create_browser_options()
+            # Extract the auto-assigned debug port BEFORE Chromium() constructor
+            # so we can precisely kill the subprocess if the constructor fails.
+            _auto_addr = (
+                getattr(opts, 'address', None)
+                or getattr(opts, '_address', None)
+                or ''
+            )
+            _auto_port = None
+            if ':' in str(_auto_addr):
+                try:
+                    _auto_port = int(str(_auto_addr).rsplit(':', 1)[-1])
+                except (ValueError, IndexError):
+                    _auto_port = None
             browser = Chromium(opts)
             tabs = browser.get_tabs()
             page = tabs[-1] if tabs else browser.new_tab()
@@ -2298,24 +2311,19 @@ def start_browser(log_callback=None):
             try:
                 if browser is not None:
                     browser.quit(del_data=True)
-                else:
-                    # Chromium() constructor may have spawned Chrome but failed
-                    # to connect — kill any orphans matching automation fingerprints
-                    try:
-                        kill_orphaned_automation_browsers(log_callback=log_callback)
-                    except Exception:
-                        pass
+                elif _auto_port is not None:
+                    # Chromium() constructor spawned Chrome but failed to
+                    # connect. Kill the orphan by its exact debug port so we
+                    # never touch other threads' Chrome processes.
+                    if _kill_chrome_by_port(_auto_port):
+                        if log_callback:
+                            log_callback(f"[Debug] 已清理端口 {_auto_port} 上的孤儿 Chrome")
             except Exception:
                 pass
             browser = None
             page = None
             _sync_thread_browser_globals()
             time.sleep(min(1.5 * attempt, 4))
-    # Last resort: one final scour after all 4 retries exhausted
-    try:
-        kill_orphaned_automation_browsers(log_callback=log_callback)
-    except Exception:
-        pass
     raise Exception(f"浏览器启动失败，已重试4次: {last_exc}")
 
 
