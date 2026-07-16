@@ -53,7 +53,7 @@ def _build_mint_browser_options(
 ):
     """Create isolated ChromiumOptions for CPA mint (unique port + profile)."""
     log = log or _noop_log
-    from DrissionPage import ChromiumOptions
+    from grok_register.browser_adapter import ChromiumOptions
 
     opts = None
     _pkg_root = Path(__file__).resolve().parents[2]  # project root
@@ -175,10 +175,10 @@ def create_standalone_page(
 ) -> tuple[Any, Any]:
     log = log or _noop_log
     try:
-        from DrissionPage import Chromium
+        from grok_register.browser_adapter import Chromium
     except ImportError as e:
         raise BrowserConfirmError(
-            "DrissionPage not installed; run inside grok_reg uv env or pip install DrissionPage"
+            "browser_adapter not available; run inside grok_reg uv env or pip install patchright"
         ) from e
 
     from .proxyutil import proxy_for_chromium, proxy_log_label, resolve_proxy

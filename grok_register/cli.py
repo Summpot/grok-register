@@ -43,7 +43,7 @@ def _patched_create_browser_options(*args, **kwargs):
     except Exception:
         opts = None
     if opts is None:
-        from DrissionPage import ChromiumOptions
+        from grok_register.browser_adapter import ChromiumOptions
 
         opts = ChromiumOptions()
         opts.auto_port()

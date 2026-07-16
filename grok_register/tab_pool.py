@@ -45,7 +45,7 @@ class TabPool:
 
     @classmethod
     def _create_browser(cls):
-        from DrissionPage import Chromium
+        from grok_register.browser_adapter import Chromium
 
         with cls._options_lock:
             factory = cls._options_factory

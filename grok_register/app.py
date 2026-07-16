@@ -59,8 +59,7 @@ def safe_print(*args, **kwargs):
             if kwargs.get("flush"):
                 stream.flush()
 
-from DrissionPage import Chromium, ChromiumOptions
-from DrissionPage.errors import PageDisconnectedError
+from grok_register.browser_adapter import Chromium, ChromiumOptions, PageDisconnectedError
 from curl_cffi import requests as curl_requests
 import requests as std_requests
 
