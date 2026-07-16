@@ -9,8 +9,13 @@ The adapter wraps Patchright (patched Playwright) and exposes the
 DrissionPage surface used by this project so that the bulk of the
 registration and CPA-mint logic stays unchanged.
 
+Browser: uses system Google Chrome via channel="chrome" for better
+stealth / fingerprinting (Patchright official recommendation).
+Fallback: auto-detect chrome.exe / chromium on Windows & Linux.
+See: https://github.com/Kaliiiiiiiiii-Vinyzu/patchright
+
 Key mapping:
-    ChromiumOptions   → dict of launch args (auto_port, set_argument, …)
+    ChromiumOptions   → dict of launch args (auto_port, set_argument, channel, …)
     Chromium          → PatchrightBrowser  (browser + context + page pool)
     Tab / Page        → PatchrightPage     (individual tab with run_js, ele, …)
     ChromiumElement   → PatchrightElement  (DOM node with click, attr, text, …)
@@ -104,6 +109,7 @@ class ChromiumOptions:
         self._timeout_base: int = 2
         self._address: str = ""
         self._browser_path: str | None = None
+        self._channel: str | None = None
 
     def auto_port(self):
         return self
@@ -141,6 +147,17 @@ class ChromiumOptions:
         self._browser_path = path
         return self
 
+    def set_channel(self, channel: str):
+        """Set browser channel to use system Chrome/Edge instead of bundled Chromium.
+        
+        Examples:
+            "chrome"     — Google Chrome (stable)
+            "chrome-dev" — Chrome Dev channel
+            "msedge"     — Microsoft Edge
+        """
+        self._channel = channel
+        return self
+
     @property
     def address(self) -> str:
         return self._address
@@ -154,6 +171,9 @@ class ChromiumOptions:
 
         if self._browser_path:
             kw["executable_path"] = self._browser_path
+
+        if self._channel:
+            kw["channel"] = self._channel
 
         if self._user_data_path:
             os.makedirs(self._user_data_path, exist_ok=True)
@@ -181,24 +201,13 @@ class ChromiumOptions:
                 continue
             if f.startswith("--user-data-dir="):
                 continue
+            # 过滤掉所有 --disable-* 和 --no-* 自动化特征参数
+            if f.startswith("--disable-") or f.startswith("--no-"):
+                continue
             args.append(f)
-
-        defaults = [
-            "--disable-gpu",
-            "--no-sandbox",
-            "--disable-dev-shm-usage",
-            "--mute-audio",
-            "--no-first-run",
-            "--no-default-browser-check",
-            "--disable-background-networking",
-        ]
-        for d in defaults:
-            if d not in args:
-                args.append(d)
 
         for ext_path in self._extensions:
             if os.path.isdir(ext_path):
-                args.append(f"--disable-extensions-except={ext_path}")
                 args.append(f"--load-extension={ext_path}")
 
         kw["args"] = args
@@ -206,7 +215,8 @@ class ChromiumOptions:
         if self._proxy:
             kw["proxy"] = {"server": self._proxy}
 
-        kw.setdefault("no_viewport", True)
+        # 注意: no_viewport 不设置 → Playwright 使用默认 viewport (1280x720)
+        # 不添加任何 --disable-* / --no-* 参数，避免自动化检测
 
         return kw
 
@@ -584,9 +594,10 @@ def Chromium(opts: ChromiumOptions) -> PatchrightBrowser:
     user_data_dir = kw.pop("user_data_dir", None)
     headless = kw.pop("headless", False)
     executable_path = kw.pop("executable_path", None)
+    channel = kw.pop("channel", None)
     args = kw.pop("args", [])
     proxy = kw.pop("proxy", None)
-    no_viewport = kw.pop("no_viewport", True)
+    # no_viewport 已移除 — 使用默认 viewport 避免自动化检测
 
     launch_options: dict[str, Any] = {
         "headless": headless,
@@ -594,6 +605,8 @@ def Chromium(opts: ChromiumOptions) -> PatchrightBrowser:
     }
     if executable_path:
         launch_options["executable_path"] = executable_path
+    if channel:
+        launch_options["channel"] = channel
     if proxy:
         launch_options["proxy"] = proxy
 
@@ -604,7 +617,6 @@ def Chromium(opts: ChromiumOptions) -> PatchrightBrowser:
             context = pw.chromium.launch_persistent_context(
                 user_data_dir=user_data_dir,
                 **launch_options,
-                no_viewport=no_viewport,
             )
             # Inject Turnstile anti-detection into every page (replaces extension).
             # Must run in MAIN world so Object.defineProperty overrides take effect.

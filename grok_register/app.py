@@ -1167,67 +1167,19 @@ def add_token_to_grok2api_pools(raw_token, email="", log_callback=None):
                 log_callback(f"[Debug] 写入 grok2api 远端池失败: {exc}")
 
 
-CHROMIUM_SLIM_FLAGS = (
-    "--disable-gpu",
-    "--no-sandbox",
-    "--disable-dev-shm-usage",
-    "--mute-audio",
-    "--no-first-run",
-    "--no-default-browser-check",
-    "--disable-background-networking",
-    "--disable-features=Translate,MediaRouter",
-    "--window-size=1280,900",
-)
-def _register_browser_background_enabled() -> bool:
-    try:
-        return bool(config.get("register_browser_background", True))
-    except Exception:
-        return True
-
-
-def _apply_register_background_flags(options) -> None:
-    """Place Chrome off-screen so registration does not steal desktop focus.
-
-    This is intentionally NOT headless — Cloudflare/Turnstile need a real page.
-    """
-    if not _register_browser_background_enabled():
-        return
-    pos = str(config.get("register_browser_window_position") or "-2400,100").strip().replace(" ", "")
-    size = str(config.get("register_browser_window_size") or "1000,800").strip().replace(" ", "")
-    if not re.match(r"^-?\d+,-?\d+$", pos):
-        pos = "-2400,100"
-    if not re.match(r"^\d+,\d+$", size):
-        size = "1000,800"
-    for flag in (
-        f"--window-position={pos}",
-        f"--window-size={size}",
-        "--disable-background-timer-throttling",
-        "--disable-renderer-backgrounding",
-        "--disable-backgrounding-occluded-windows",
-    ):
-        try:
-            options.set_argument(flag)
-        except Exception:
-            pass
+CHROMIUM_SLIM_FLAGS = ()
+# 自动化特征参数全部移除 — 不传递任何 --disable-* / --no-* 启动参数
+# 让 Patchright + Chrome 使用最自然的浏览器环境
 
 
 def create_browser_options(*, unique_profile: bool = False, profile_tag: str = "reg"):
-    """Build ChromiumOptions for register / CPA mint.
+    """Build minimal ChromiumOptions for register / CPA mint.
 
-    unique_profile=True: use an isolated temp user-data-dir (recommended for CPA
-    mint after the register browser has just been closed).
-
-    When config.register_browser_background is true (default), the window is
-    placed off-screen so it does not jump to the foreground. Not headless.
+    No automation-identifying flags, no off-screen window placement.
+    Patchright + system Chrome via channel="chrome" for best stealth.
     """
     options = ChromiumOptions()
     options.set_timeouts(base=2)
-    for flag in CHROMIUM_SLIM_FLAGS:
-        try:
-            options.set_argument(flag)
-        except Exception:
-            pass
-    _apply_register_background_flags(options)
     # Outbound proxy (pool pin or config.proxy)
     try:
         from grok_register.cpa_xai.proxyutil import (
@@ -1308,7 +1260,35 @@ def create_browser_options(*, unique_profile: bool = False, profile_tag: str = "
             options.add_extension(EXTENSION_PATH)
         except Exception:
             pass
+
+    # 使用系统 Google Chrome（而非 Patchright 捆绑的 Chromium）以获得更好的浏览器指纹伪装
+    # 参考 Patchright 官方推荐: https://github.com/Kaliiiiiiiiii-Vinyzu/patchright
+    try:
+        options.set_channel("chrome")
+    except Exception:
+        _auto_detect_chrome_path(options)
     return options
+
+
+def _auto_detect_chrome_path(options) -> None:
+    """Fallback Chrome/Chromium auto-detection when set_channel() is unavailable."""
+    for cand in (
+        # Windows
+        os.path.expandvars(r"%PROGRAMFILES%\Google\Chrome\Application\chrome.exe"),
+        os.path.expandvars(r"%PROGRAMFILES(X86)%\Google\Chrome\Application\chrome.exe"),
+        os.path.expandvars(r"%LOCALAPPDATA%\Google\Chrome\Application\chrome.exe"),
+        # Linux
+        "/usr/bin/google-chrome",
+        "/usr/bin/google-chrome-stable",
+        "/usr/bin/chromium",
+        "/usr/bin/chromium-browser",
+    ):
+        if os.path.isfile(cand):
+            try:
+                options.set_browser_path(cand)
+            except Exception:
+                pass
+            break
 
 
 def _build_request_kwargs(**kwargs):

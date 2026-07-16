@@ -79,20 +79,6 @@ def _build_mint_browser_options(
             opts.set_timeouts(base=2)
         except Exception:
             pass
-        for flag in (
-            "--disable-gpu",
-            "--no-sandbox",
-            "--disable-dev-shm-usage",
-            "--mute-audio",
-            "--no-first-run",
-            "--no-default-browser-check",
-            "--disable-background-networking",
-            "--window-size=1280,900",
-        ):
-            try:
-                opts.set_argument(flag)
-            except Exception:
-                pass
         import tempfile
         import uuid
 
@@ -117,16 +103,7 @@ def _build_mint_browser_options(
             except Exception as e:  # noqa: BLE001
                 log(f"extension add failed: {e}")
 
-    for flag in (
-        "--no-sandbox",
-        "--disable-dev-shm-usage",
-        "--disable-gpu",
-        "--mute-audio",
-    ):
-        try:
-            opts.set_argument(flag)
-        except Exception:
-            pass
+    # 注意: 不添加任何 --disable-* / --no-* 自动化特征参数
 
     if headless:
         try:
@@ -144,21 +121,32 @@ def _build_mint_browser_options(
             pass
         log(f"headed browser DISPLAY={os.environ.get('DISPLAY', '')!r}")
 
-    for cand in (
-        r"C:\Program Files\Google\Chrome\Application\chrome.exe",
-        r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
-        "/usr/bin/chromium",
-        "/usr/bin/chromium-browser",
-        "/usr/bin/google-chrome",
-        "/usr/bin/google-chrome-stable",
-    ):
-        if os.path.isfile(cand):
-            try:
-                opts.set_browser_path(cand)
-                log(f"browser path={cand}")
-            except Exception:
-                pass
-            break
+    # 优先使用 channel="chrome" 让 Patchright 自动查找系统 Chrome（更好的伪装）
+    # 参考 Patchright 官方推荐: https://github.com/Kaliiiiiiiiii-Vinyzu/patchright
+    _chrome_found = False
+    try:
+        opts.set_channel("chrome")
+        _chrome_found = True
+        log("browser channel=chrome (system Google Chrome)")
+    except Exception:
+        pass
+
+    if not _chrome_found:
+        for cand in (
+            r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+            r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+            "/usr/bin/chromium",
+            "/usr/bin/chromium-browser",
+            "/usr/bin/google-chrome",
+            "/usr/bin/google-chrome-stable",
+        ):
+            if os.path.isfile(cand):
+                try:
+                    opts.set_browser_path(cand)
+                    log(f"browser path={cand}")
+                except Exception:
+                    pass
+                break
     # auto_port last — set_user_data_path / set_browser_path may clear it
     try:
         opts.auto_port()
@@ -178,7 +166,7 @@ def create_standalone_page(
         from grok_register.browser_adapter import Chromium
     except ImportError as e:
         raise BrowserConfirmError(
-            "browser_adapter not available; run inside grok_reg uv env or pip install patchright"
+            "browser_adapter not available (patchright missing); run `uv sync` or `uv add patchright`"
         ) from e
 
     from .proxyutil import proxy_for_chromium, proxy_log_label, resolve_proxy

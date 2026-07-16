@@ -26,13 +26,13 @@ from grok_register import app as reg  # noqa: E402
 from grok_register.paths import PROJECT_ROOT, OUTPUT_DIR, ensure_output_dir, TURNSTILE_DIR
 
 
-# Linux 适配: DrissionPage 默认找 'chrome', 我们装的是 chromium
-# 保留原版 slim flags + proxy，再补 chromium 路径与 turnstilePatch。
+# Chrome 适配: 使用 Patchright + 系统 Chrome (channel="chrome") 获得最佳指纹伪装
+# 不传递任何 --disable-* / --no-* 自动化特征参数
+# 参考: https://github.com/Kaliiiiiiiiii-Vinyzu/patchright
 _orig_create_browser_options = reg.create_browser_options
 
 
 def _patched_create_browser_options(*args, **kwargs):
-    # Prefer original factory (proxy + CHROMIUM_SLIM_FLAGS + extension + background flags)
     try:
         opts = _orig_create_browser_options(*args, **kwargs)
     except TypeError:
@@ -48,17 +48,6 @@ def _patched_create_browser_options(*args, **kwargs):
         opts = ChromiumOptions()
         opts.auto_port()
         opts.set_timeouts(base=1)
-        for flag in getattr(reg, "CHROMIUM_SLIM_FLAGS", ()) or ():
-            try:
-                opts.set_argument(flag)
-            except Exception:
-                pass
-        try:
-            apply_bg = getattr(reg, "_apply_register_background_flags", None)
-            if callable(apply_bg):
-                apply_bg(opts)
-        except Exception:
-            pass
 
     try:
         opts.auto_port()
@@ -69,18 +58,34 @@ def _patched_create_browser_options(*args, **kwargs):
     except Exception:
         pass
 
-    for cand in (
-        "/usr/bin/chromium",
-        "/usr/bin/chromium-browser",
-        "/usr/bin/google-chrome",
-        "/usr/bin/google-chrome-stable",
-    ):
-        if os.path.isfile(cand):
-            try:
-                opts.set_browser_path(cand)
-            except Exception:
-                pass
-            break
+    # 使用系统 Chrome（优先推荐 channel 方式，Patchright 会查找系统安装的 Chrome）
+    # 参考 Patchright 官方推荐: https://github.com/Kaliiiiiiiiii-Vinyzu/patchright
+    _chrome_found_via_channel = False
+    try:
+        opts.set_channel("chrome")
+        _chrome_found_via_channel = True
+    except Exception:
+        pass
+
+    if not _chrome_found_via_channel:
+        # Fallback: 手动检测 Chrome/Chromium 路径
+        for cand in (
+            # Windows
+            os.path.expandvars(r"%PROGRAMFILES%\Google\Chrome\Application\chrome.exe"),
+            os.path.expandvars(r"%PROGRAMFILES(X86)%\Google\Chrome\Application\chrome.exe"),
+            os.path.expandvars(r"%LOCALAPPDATA%\Google\Chrome\Application\chrome.exe"),
+            # Linux
+            "/usr/bin/chromium",
+            "/usr/bin/chromium-browser",
+            "/usr/bin/google-chrome",
+            "/usr/bin/google-chrome-stable",
+        ):
+            if os.path.isfile(cand):
+                try:
+                    opts.set_browser_path(cand)
+                except Exception:
+                    pass
+                break
 
     ext_path = str(TURNSTILE_DIR)
     if os.path.isdir(ext_path):

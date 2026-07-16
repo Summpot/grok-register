@@ -652,11 +652,11 @@ def login_with_playwright(
     password = password or ""
 
     try:
-        from playwright.sync_api import sync_playwright
+        from patchright.sync_api import sync_playwright
     except ImportError as exc:
         raise RuntimeError(
-            "playwright is required for automated OAuth. "
-            "Install with: pip install playwright && playwright install chromium"
+            "patchright is required for automated OAuth. "
+            "Install with: uv add patchright && uv run patchright install chromium"
         ) from exc
 
     scopes = scopes or list(DEFAULT_SCOPES)
@@ -665,7 +665,10 @@ def login_with_playwright(
     )
     deadline = time.time() + max(30.0, float(timeout))
     try:
-        launch_kwargs: Dict[str, Any] = {"headless": headless}
+        launch_kwargs: Dict[str, Any] = {
+            "headless": headless,
+            "channel": "chrome",  # 使用系统 Google Chrome 获得更好伪装
+        }
         if proxy:
             launch_kwargs["proxy"] = {"server": proxy}
 
