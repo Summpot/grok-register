@@ -652,11 +652,11 @@ def login_with_playwright(
     password = password or ""
 
     try:
-        from patchright.sync_api import sync_playwright
+        from camoufox.sync_api import Camoufox
     except ImportError as exc:
         raise RuntimeError(
-            "patchright is required for automated OAuth. "
-            "Install with: uv add patchright && uv run patchright install chromium"
+            "camoufox is required for automated OAuth. "
+            "Install with: uv add 'camoufox[geoip]' && uv run camoufox fetch"
         ) from exc
 
     scopes = scopes or list(DEFAULT_SCOPES)
@@ -667,22 +667,24 @@ def login_with_playwright(
     try:
         launch_kwargs: Dict[str, Any] = {
             "headless": headless,
-            "channel": "chrome",  # 使用系统 Google Chrome 获得更好伪装
+            "humanize": True,
+            "disable_coop": True,
+            "i_know_what_im_doing": True,
+            "os": "windows",
         }
         if proxy:
-            launch_kwargs["proxy"] = {"server": proxy}
+            from grok_register.browser_adapter import proxy_dict_from_url
 
-        with sync_playwright() as p:
-            browser = p.chromium.launch(**launch_kwargs)
+            pdict = proxy_dict_from_url(proxy)
+            if pdict:
+                launch_kwargs["proxy"] = pdict
+                launch_kwargs["geoip"] = True
+            else:
+                launch_kwargs["proxy"] = {"server": proxy}
+
+        with Camoufox(**launch_kwargs) as browser:
             try:
-                context = browser.new_context(
-                    user_agent=(
-                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                        "AppleWebKit/537.36 (KHTML, like Gecko) "
-                        "Chrome/148.0.0.0 Safari/537.36"
-                    ),
-                    viewport={"width": 1280, "height": 900},
-                )
+                context = browser.new_context()
                 # Inject signup session cookies before hitting authorize.
                 if session_cookies:
                     cookie_list = []
@@ -714,6 +716,7 @@ def login_with_playwright(
 
                 page = context.new_page()
                 page.goto(auth_url, wait_until="domcontentloaded", timeout=int(min(timeout, 60) * 1000))
+                page.wait_for_timeout(int(300 + 400 * __import__("random").random()))
                 # If still on login form, fill credentials.
                 if email and password and not sink.event.is_set():
                     _playwright_drive_login(page, email, password, sink, deadline)
@@ -729,11 +732,12 @@ def login_with_playwright(
                         ):
                             loc = page.locator(sel)
                             if loc.count() > 0 and loc.first.is_visible():
+                                page.wait_for_timeout(int(150 + 250 * __import__("random").random()))
                                 loc.first.click(timeout=1500)
                                 break
                     except Exception:
                         pass
-                    page.wait_for_timeout(300)
+                    page.wait_for_timeout(int(280 + 200 * __import__("random").random()))
             finally:
                 try:
                     browser.close()

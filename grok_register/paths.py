@@ -1,6 +1,6 @@
 """Project path anchors for the grok_register package.
 
-PROJECT_ROOT = repository root (config.json, turnstilePatch/, output/)
+PROJECT_ROOT = repository root (config.json, output/)
 PACKAGE_DIR  = this package directory (grok_register/)
 """
 from __future__ import annotations
@@ -13,6 +13,7 @@ PROJECT_ROOT = PACKAGE_DIR.parent
 CONFIG_FILE = PROJECT_ROOT / "config.json"
 CONFIG_EXAMPLE = PROJECT_ROOT / "config.example.json"
 OUTPUT_DIR = PROJECT_ROOT / "output"
+# Legacy path kept for any external references; turnstilePatch is no longer loaded.
 TURNSTILE_DIR = PROJECT_ROOT / "turnstilePatch"
 CRASH_LOG_FILE = PROJECT_ROOT / "gui_crash.log"
 TOKEN_JSON = PROJECT_ROOT / "token.json"

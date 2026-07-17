@@ -112,7 +112,7 @@ def check_gc_tab() -> bool:
 
 @check("fingerprint-random")
 def check_fingerprint() -> bool:
-    """指纹随机化暂缓：Turnstile 已通过 turnstilePatch，非阻塞"""
+    """指纹随机化暂缓：Camoufox 引擎级伪装 + Playwright 原生 Turnstile 点击，非阻塞"""
     return True  # 暂缓，标记为 pass
 
 

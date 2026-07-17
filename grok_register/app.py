@@ -64,7 +64,7 @@ from curl_cffi import requests as curl_requests
 import requests as std_requests
 
 
-from grok_register.paths import PROJECT_ROOT, CONFIG_FILE as _CONFIG_PATH, CRASH_LOG_FILE as _CRASH_PATH, OUTPUT_DIR, TURNSTILE_DIR, TOKEN_JSON, ensure_output_dir
+from grok_register.paths import PROJECT_ROOT, CONFIG_FILE as _CONFIG_PATH, CRASH_LOG_FILE as _CRASH_PATH, OUTPUT_DIR, TOKEN_JSON, ensure_output_dir
 CONFIG_FILE = str(_CONFIG_PATH)
 CRASH_LOG_FILE = str(_CRASH_PATH)
 
@@ -256,11 +256,6 @@ if __name__ == "__main__":
     warn_runtime_compatibility()
 
 load_config()
-
-EXTENSION_PATH = os.path.abspath(
-    str(TURNSTILE_DIR)
-)
-
 
 DUCKMAIL_API_BASE = "https://api.duckmail.sbs"
 
@@ -1135,75 +1130,49 @@ def add_token_to_grok2api_pools(raw_token, email="", log_callback=None):
 
 
 CHROMIUM_SLIM_FLAGS = ()
-# 自动化特征参数全部移除 — 不传递任何 --disable-* / --no-* 启动参数
-# 让 Patchright + Chrome 使用最自然的浏览器环境
+# Camoufox: no Chromium automation flags; fingerprint is handled at engine level.
 
 
 def create_browser_options(*, unique_profile: bool = False, profile_tag: str = "reg"):
-    """Build minimal ChromiumOptions for register / CPA mint.
+    """Build Camoufox launch options for register / CPA mint.
 
-    No automation-identifying flags, no off-screen window placement.
-    Patchright + system Chrome via channel="chrome" for best stealth.
+    Uses stealth Firefox (Camoufox) with humanize cursor, disable_coop for
+    Turnstile iframe clicks, and native Playwright proxy auth (user:pass).
     """
     options = ChromiumOptions()
     options.set_timeouts(base=2)
-    # Outbound proxy (pool pin or config.proxy)
+    try:
+        options.set_humanize(True)
+        options.set_disable_coop(True)
+        options.set_os("windows")
+    except Exception:
+        pass
+
+    # Outbound proxy (pool pin or config.proxy) — Camoufox accepts user:pass natively
     proxy: str = ""
     try:
-        from grok_register.cpa_xai.proxyutil import (
-            get_runtime_proxy,
-            proxy_for_chromium,
-            proxy_auth_parts,
-            write_chromium_proxy_auth_extension,
-        )
+        from grok_register.cpa_xai.proxyutil import get_runtime_proxy
 
         proxy = (get_runtime_proxy() or str(config.get("proxy", "") or "")).strip()
         if proxy:
-            scheme, user, password, host, port = proxy_auth_parts(proxy)
-            chrome_proxy = proxy_for_chromium(proxy)
-            if user and password and host:
-                # Authenticated proxy: MV2 extension (Chromium cannot embed user:pass)
-                import tempfile
-                import uuid as _uuid
-
-                ext_dir = os.path.join(
-                    tempfile.gettempdir(),
-                    "grok_reg_proxy_ext",
-                    _uuid.uuid4().hex[:12],
-                )
-                ext_path = write_chromium_proxy_auth_extension(proxy, ext_dir)
-                if ext_path and os.path.isdir(ext_path):
-                    try:
-                        options.add_extension(ext_path)
-                    except Exception:
-                        # fallback: host:port only (may fail auth)
-                        if chrome_proxy:
-                            try:
-                                options.set_argument(f"--proxy-server={chrome_proxy}")
-                            except Exception:
-                                pass
-                elif chrome_proxy:
-                    try:
-                        options.set_argument(f"--proxy-server={chrome_proxy}")
-                    except Exception:
-                        pass
-            elif chrome_proxy:
-                try:
-                    options.set_proxy(chrome_proxy)
-                except Exception:
-                    try:
-                        options.set_argument(f"--proxy-server={chrome_proxy}")
-                    except Exception:
-                        pass
+            try:
+                options.set_proxy(proxy)
+            except Exception:
+                pass
+            try:
+                options.set_geoip(True)
+            except Exception:
+                pass
     except Exception:
         pass
+
     if unique_profile:
         import tempfile
         import uuid
 
         profile_dir = os.path.join(
             tempfile.gettempdir(),
-            "grok_reg_chrome",
+            "grok_reg_camoufox",
             f"{profile_tag}_{os.getpid()}_{uuid.uuid4().hex[:10]}",
         )
         os.makedirs(profile_dir, exist_ok=True)
@@ -1214,50 +1183,18 @@ def create_browser_options(*, unique_profile: bool = False, profile_tag: str = "
                 options.set_paths(user_data_path=profile_dir)
             except Exception:
                 pass
-        try:
-            options.set_argument(f"--user-data-dir={profile_dir}")
-        except Exception:
-            pass
-    # auto_port MUST be last: set_user_data_path can clear address/port state.
     try:
         options.auto_port()
     except Exception:
         pass
-    if os.path.exists(EXTENSION_PATH):
-        try:
-            options.add_extension(EXTENSION_PATH)
-        except Exception:
-            pass
-
-    # 使用系统 Google Chrome（而非 Patchright 捆绑的 Chromium）以获得更好的浏览器指纹伪装
-    # 参考 Patchright 官方推荐: https://github.com/Kaliiiiiiiiii-Vinyzu/patchright
-    try:
-        options.set_channel("chrome")
-    except Exception:
-        _auto_detect_chrome_path(options)
-
     return options
 
 
-def _auto_detect_chrome_path(options) -> None:
-    """Fallback Chrome/Chromium auto-detection when set_channel() is unavailable."""
-    for cand in (
-        # Windows
-        os.path.expandvars(r"%PROGRAMFILES%\Google\Chrome\Application\chrome.exe"),
-        os.path.expandvars(r"%PROGRAMFILES(X86)%\Google\Chrome\Application\chrome.exe"),
-        os.path.expandvars(r"%LOCALAPPDATA%\Google\Chrome\Application\chrome.exe"),
-        # Linux
-        "/usr/bin/google-chrome",
-        "/usr/bin/google-chrome-stable",
-        "/usr/bin/chromium",
-        "/usr/bin/chromium-browser",
-    ):
-        if os.path.isfile(cand):
-            try:
-                options.set_browser_path(cand)
-            except Exception:
-                pass
-            break
+def _human_pause_cancel(lo: float = 0.18, hi: float = 0.55, cancel_callback=None) -> None:
+    """Random pause that still respects cancel_callback."""
+    if hi < lo:
+        lo, hi = hi, lo
+    sleep_with_cancel(random.uniform(lo, hi), cancel_callback)
 
 
 def _build_request_kwargs(**kwargs):
@@ -2742,56 +2679,46 @@ def click_email_signup_button(timeout=10, log_callback=None, cancel_callback=Non
         browser = _tls_get_browser()
         _tls_set_browser(browser)
     deadline = time.time() + timeout
+    labels = [
+        "使用邮箱注册",
+        "Sign up with email",
+        "Continue with email",
+        "Sign up with Email",
+        "邮箱",
+    ]
     while time.time() < deadline:
         raise_if_cancelled(cancel_callback)
         if log_callback:
             log_callback("[Debug] 尝试查找“使用邮箱注册”按钮...")
 
-        clicked = page.run_js(r"""
-function isVisible(node) {
-    if (!node) return false;
-    const style = window.getComputedStyle(node);
-    if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') return false;
-    const rect = node.getBoundingClientRect();
-    return rect.width > 0 && rect.height > 0;
-}
-function nodeText(node) {
-    return [
-        node.innerText,
-        node.textContent,
-        node.getAttribute('aria-label'),
-        node.getAttribute('title'),
-        node.getAttribute('href'),
-    ].filter(Boolean).join(' ').replace(/\s+/g, ' ').trim();
-}
-function scoreEntry(node) {
-    const compact = nodeText(node).replace(/\s+/g, '');
-    const lower = compact.toLowerCase();
-    if (compact.includes('使用邮箱注册')) return 100;
-    if (lower.includes('signupwithemail')) return 95;
-    if (lower.includes('continuewithemail')) return 90;
-    if (lower.includes('email') && (lower.includes('sign') || lower.includes('continue') || lower.includes('use') || lower.includes('with'))) return 80;
-    if (lower === 'email' || lower.includes('邮箱')) return 70;
-    return 0;
-}
-const candidates = Array.from(document.querySelectorAll('button, a, [role="button"]'))
-    .filter((node) => isVisible(node) && !node.disabled && node.getAttribute('aria-disabled') !== 'true')
-    .map((node) => ({ node, score: scoreEntry(node), text: nodeText(node) }))
-    .filter((item) => item.score > 0)
-    .sort((a, b) => b.score - a.score);
-const target = candidates[0]?.node || null;
-if (!target) {
-    return false;
-}
-target.click();
-return candidates[0].text || true;
-        """)
+        _human_pause_cancel(0.25, 0.6, cancel_callback)
+        hit = None
+        try:
+            hit = page.click_by_text(labels, role="button")
+        except Exception:
+            hit = None
+        if not hit:
+            # broader native selectors
+            try:
+                if page.click_first(
+                    [
+                        'button:has-text("使用邮箱注册")',
+                        'a:has-text("使用邮箱注册")',
+                        '[role="button"]:has-text("使用邮箱注册")',
+                        'button:has-text("email")',
+                        'a:has-text("email")',
+                        'button:has-text("Email")',
+                    ]
+                ):
+                    hit = "selector"
+            except Exception:
+                pass
 
-        if clicked:
+        if hit:
             if log_callback:
-                detail = f": {clicked}" if isinstance(clicked, str) else ""
+                detail = f": {hit}" if isinstance(hit, str) else ""
                 log_callback(f"[*] 已点击「使用邮箱注册」按钮{detail}")
-            sleep_with_cancel(2, cancel_callback)
+            _human_pause_cancel(1.2, 2.2, cancel_callback)
             return True
 
         if log_callback:
@@ -2801,7 +2728,10 @@ return candidates[0].text || true;
         sleep_with_cancel(1, cancel_callback)
 
     if log_callback:
-        page_html = page.html[:500] if page else "no page"
+        try:
+            page_html = page.html[:500] if page else "no page"
+        except Exception:
+            page_html = "no page"
         log_callback(f"[Debug] 页面内容片段: {page_html}")
 
     raise Exception("未找到「使用邮箱注册」按钮")
@@ -2887,257 +2817,101 @@ def fill_email_and_submit(timeout=45, log_callback=None, cancel_callback=None):
     deadline = time.time() + timeout
     last_diag_time = 0
     last_reclick_time = 0
-    last_snapshot = None
+    email_selectors = [
+        'input[data-testid="email"]',
+        'input[name="email"]',
+        'input[type="email"]',
+        'input[autocomplete="email"]',
+        'input[placeholder*="mail" i]',
+        'input[aria-label*="mail" i]',
+        'input[aria-label*="邮箱"]',
+        'input[placeholder*="邮箱"]',
+    ]
+    submit_labels = ["注册", "继续", "下一步", "确认", "Sign up", "Continue", "Next", "Submit"]
     while time.time() < deadline:
         raise_if_cancelled(cancel_callback)
-        filled = page.run_js(
-            """
-const email = arguments[0];
-function isVisible(node) {
-    if (!node) return false;
-    const style = window.getComputedStyle(node);
-    if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') return false;
-    const rect = node.getBoundingClientRect();
-    return rect.width > 0 && rect.height > 0;
-}
-function textOf(node) {
-    return [
-        node.innerText,
-        node.textContent,
-        node.getAttribute('aria-label'),
-        node.getAttribute('title'),
-        node.getAttribute('placeholder'),
-        node.getAttribute('data-testid'),
-        node.getAttribute('name'),
-        node.getAttribute('id'),
-        node.getAttribute('autocomplete'),
-    ].filter(Boolean).join(' ').replace(/\s+/g, ' ').trim();
-}
-function describeInput(node) {
-    return [
-        `type=${node.getAttribute('type') || ''}`,
-        `name=${node.getAttribute('name') || ''}`,
-        `id=${node.getAttribute('id') || ''}`,
-        `placeholder=${node.getAttribute('placeholder') || ''}`,
-        `aria=${node.getAttribute('aria-label') || ''}`,
-        `testid=${node.getAttribute('data-testid') || ''}`,
-    ].join(' ').replace(/\s+/g, ' ').trim().slice(0, 160);
-}
-function describeAction(node) {
-    return textOf(node).slice(0, 120);
-}
-function emailCandidates() {
-    const direct = Array.from(document.querySelectorAll('input[data-testid="email"], input[name="email"], input[type="email"], input[autocomplete="email"], input[placeholder*="mail" i], input[aria-label*="mail" i]'));
-    const all = Array.from(document.querySelectorAll('input, textarea'));
-    for (const node of all) {
-        const type = (node.getAttribute('type') || '').toLowerCase();
-        if (['hidden', 'submit', 'button', 'checkbox', 'radio', 'file', 'search'].includes(type)) continue;
-        const meta = textOf(node).toLowerCase();
-        if (meta.includes('email') || meta.includes('e-mail') || meta.includes('mail') || meta.includes('邮箱') || meta.includes('电子邮件')) {
-            direct.push(node);
-        }
-    }
-    return Array.from(new Set(direct));
-}
-const visibleInputs = Array.from(document.querySelectorAll('input, textarea'))
-    .filter((node) => isVisible(node) && !node.disabled && !node.readOnly)
-    .map(describeInput)
-    .slice(0, 8);
-const visibleActions = Array.from(document.querySelectorAll('button, a, [role="button"]'))
-    .filter((node) => isVisible(node) && !node.disabled && node.getAttribute('aria-disabled') !== 'true')
-    .map(describeAction)
-    .filter(Boolean)
-    .slice(0, 10);
-const input = emailCandidates().find((node) => isVisible(node) && !node.disabled && !node.readOnly) || null;
-if (!input) {
-    return {
-        state: 'not-ready',
-        url: location.href,
-        title: document.title,
-        inputs: visibleInputs,
-        buttons: visibleActions,
-    };
-}
-input.focus(); input.click();
-const valueProto = input instanceof HTMLTextAreaElement ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
-const valueSetter = Object.getOwnPropertyDescriptor(valueProto, 'value')?.set;
-const tracker = input._valueTracker;
-if (tracker) tracker.setValue('');
-if (valueSetter) valueSetter.call(input, email); else input.value = email;
-input.dispatchEvent(new InputEvent('beforeinput', { bubbles: true, data: email, inputType: 'insertText' }));
-input.dispatchEvent(new InputEvent('input', { bubbles: true, data: email, inputType: 'insertText' }));
-input.dispatchEvent(new Event('change', { bubbles: true }));
-const inputType = (input.getAttribute('type') || '').toLowerCase();
-const isValid = inputType !== 'email' || input.checkValidity();
-if ((input.value || '').trim() !== email || !isValid) {
-    return {
-        state: 'fill-failed',
-        value: input.value || '',
-        valid: isValid,
-        input: describeInput(input),
-        url: location.href,
-    };
-}
-input.blur();
-return {
-    state: 'filled',
-    input: describeInput(input),
-    url: location.href,
-};
-            """,
-            email,
-        )
-        state = filled.get("state") if isinstance(filled, dict) else filled
-        if isinstance(filled, dict):
-            last_snapshot = filled
-        if state == "not-ready":
+        _human_pause_cancel(0.2, 0.5, cancel_callback)
+
+        filled_ok = False
+        try:
+            filled_ok = page.fill_first(email_selectors, email, human=True)
+        except Exception as exc:
+            if log_callback:
+                log_callback(f"[Debug] 原生填写邮箱异常: {exc}")
+
+        if not filled_ok:
             now = time.time()
             if now - last_reclick_time >= 3:
-                reclicked = page.run_js(r"""
-function isVisible(node) {
-    if (!node) return false;
-    const style = window.getComputedStyle(node);
-    if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') return false;
-    const rect = node.getBoundingClientRect();
-    return rect.width > 0 && rect.height > 0;
-}
-function nodeText(node) {
-    return [
-        node.innerText,
-        node.textContent,
-        node.getAttribute('aria-label'),
-        node.getAttribute('title'),
-        node.getAttribute('href'),
-    ].filter(Boolean).join(' ').replace(/\s+/g, ' ').trim();
-}
-function scoreEntry(node) {
-    const compact = nodeText(node).replace(/\s+/g, '');
-    const lower = compact.toLowerCase();
-    if (compact.includes('使用邮箱注册')) return 100;
-    if (lower.includes('signupwithemail')) return 95;
-    if (lower.includes('continuewithemail')) return 90;
-    if (lower.includes('email') && (lower.includes('sign') || lower.includes('continue') || lower.includes('use') || lower.includes('with'))) return 80;
-    if (lower === 'email' || lower.includes('邮箱')) return 70;
-    return 0;
-}
-const candidates = Array.from(document.querySelectorAll('button, a, [role="button"]'))
-    .filter((node) => isVisible(node) && !node.disabled && node.getAttribute('aria-disabled') !== 'true')
-    .map((node) => ({ node, score: scoreEntry(node), text: nodeText(node) }))
-    .filter((item) => item.score > 0)
-    .sort((a, b) => b.score - a.score);
-if (!candidates.length) return false;
-candidates[0].node.click();
-return candidates[0].text || true;
-                """)
+                try:
+                    rehit = page.click_by_text(
+                        ["使用邮箱注册", "Sign up with email", "Continue with email"],
+                        role="button",
+                    )
+                except Exception:
+                    rehit = None
                 last_reclick_time = now
-                if reclicked and log_callback:
-                    detail = f": {reclicked}" if isinstance(reclicked, str) else ""
-                    log_callback(f"[Debug] 邮箱输入框未出现，已再次触发邮箱注册入口{detail}")
+                if rehit and log_callback:
+                    log_callback(f"[Debug] 邮箱输入框未出现，已再次触发邮箱注册入口: {rehit}")
             if log_callback and now - last_diag_time >= 5:
                 last_diag_time = now
-                inputs = " | ".join((filled or {}).get("inputs", [])[:6]) if isinstance(filled, dict) else ""
-                buttons = " | ".join((filled or {}).get("buttons", [])[:8]) if isinstance(filled, dict) else ""
-                url = (filled or {}).get("url", page.url if page else "") if isinstance(filled, dict) else (page.url if page else "")
-                log_callback(f"[Debug] 等待邮箱输入框: url={url}; inputs={inputs or 'none'}; buttons={buttons or 'none'}")
-            sleep_with_cancel(0.5, cancel_callback)
+                url = page.url if page else ""
+                log_callback(f"[Debug] 等待邮箱输入框: url={url}")
+            sleep_with_cancel(0.6, cancel_callback)
             continue
-        if state != "filled":
-            if log_callback:
-                log_callback(f"[Debug] 邮箱输入框已出现，但写入失败: {filled}")
-            sleep_with_cancel(0.5, cancel_callback)
-            continue
-        sleep_with_cancel(0.4, cancel_callback)
-        clicked = page.run_js(
-            r"""
-function isVisible(node) {
-    if (!node) return false;
-    const style = window.getComputedStyle(node);
-    if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') return false;
-    const rect = node.getBoundingClientRect();
-    return rect.width > 0 && rect.height > 0;
-}
-function textOf(node) {
-    return [
-        node.innerText,
-        node.textContent,
-        node.getAttribute('aria-label'),
-        node.getAttribute('title'),
-        node.getAttribute('placeholder'),
-        node.getAttribute('data-testid'),
-        node.getAttribute('name'),
-        node.getAttribute('id'),
-        node.getAttribute('autocomplete'),
-    ].filter(Boolean).join(' ').replace(/\s+/g, ' ').trim();
-}
-function emailCandidates() {
-    const direct = Array.from(document.querySelectorAll('input[data-testid="email"], input[name="email"], input[type="email"], input[autocomplete="email"], input[placeholder*="mail" i], input[aria-label*="mail" i]'));
-    const all = Array.from(document.querySelectorAll('input, textarea'));
-    for (const node of all) {
-        const type = (node.getAttribute('type') || '').toLowerCase();
-        if (['hidden', 'submit', 'button', 'checkbox', 'radio', 'file', 'search'].includes(type)) continue;
-        const meta = textOf(node).toLowerCase();
-        if (meta.includes('email') || meta.includes('e-mail') || meta.includes('mail') || meta.includes('邮箱') || meta.includes('电子邮件')) {
-            direct.push(node);
-        }
-    }
-    return Array.from(new Set(direct));
-}
-const input = emailCandidates().find((node) => isVisible(node) && !node.disabled && !node.readOnly) || null;
-if (!input || !(input.value || '').trim()) return false;
-const inputType = (input.getAttribute('type') || '').toLowerCase();
-if (inputType === 'email' && !input.checkValidity()) return false;
-const buttons = Array.from(document.querySelectorAll('button[type="submit"], button, [role="button"], input[type="submit"]'))
-    .filter((node) => isVisible(node) && !node.disabled && node.getAttribute('aria-disabled') !== 'true');
-const submitButton = buttons.find((node) => {
-    const text = textOf(node).replace(/\s+/g, '');
-    const lower = text.toLowerCase();
-    return (
-        text === '注册' ||
-        text.includes('注册') ||
-        text.includes('继续') ||
-        text.includes('下一步') ||
-        text.includes('确认') ||
-        lower.includes('signup') ||
-        lower.includes('sign up') ||
-        lower.includes('continue') ||
-        lower.includes('next') ||
-        lower.includes('createaccount') ||
-        lower.includes('submit')
-    );
-});
-if (submitButton) {
-    submitButton.click();
-    return textOf(submitButton) || true;
-}
-const form = input.closest('form');
-if (form) {
-    if (form.requestSubmit) form.requestSubmit();
-    else form.dispatchEvent(new Event('submit', { bubbles: true, cancelable: true }));
-    return 'form-submit';
-}
-input.focus();
-input.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', code: 'Enter', bubbles: true, cancelable: true }));
-input.dispatchEvent(new KeyboardEvent('keyup', { key: 'Enter', code: 'Enter', bubbles: true, cancelable: true }));
-return 'enter';
-            """
-        )
+
+        _human_pause_cancel(0.35, 0.8, cancel_callback)
+
+        # Submit via Playwright-native click
+        clicked = None
+        try:
+            clicked = page.click_by_text(submit_labels, role="button")
+        except Exception:
+            clicked = None
+        if not clicked:
+            try:
+                if page.click_first(
+                    [
+                        'button[type="submit"]',
+                        'button:has-text("注册")',
+                        'button:has-text("继续")',
+                        'button:has-text("下一步")',
+                        'button:has-text("Continue")',
+                        'button:has-text("Next")',
+                        'button:has-text("Sign up")',
+                    ]
+                ):
+                    clicked = "selector"
+            except Exception:
+                pass
+        if not clicked:
+            # Enter key as last native fallback
+            try:
+                page._p.keyboard.press("Enter")
+                clicked = "enter"
+            except Exception:
+                pass
+
         if clicked:
-            sleep_with_cancel(1.0, cancel_callback)
-            rejection = page.run_js(
-                r"""
+            _human_pause_cancel(0.8, 1.4, cancel_callback)
+            rejection = ""
+            try:
+                rejection = page.run_js(
+                    r"""
 const text = String(document.body?.innerText || document.body?.textContent || '');
 const compact = text.replace(/\s+/g, ' ');
 const lower = compact.toLowerCase();
 if (
   (compact.includes('已被拒绝') && (compact.includes('邮箱域名') || compact.includes('域名'))) ||
   (lower.includes('rejected') && (lower.includes('email') || lower.includes('domain'))) ||
-  lower.includes('email domain') && lower.includes('not allowed')
+  (lower.includes('email domain') && lower.includes('not allowed'))
 ) {
   return compact.slice(0, 500);
 }
 return '';
-                """
-            )
+                    """
+                )
+            except Exception:
+                rejection = ""
             if rejection:
                 domain = email_domain(email)
                 if domain:
@@ -3150,14 +2924,8 @@ return '';
                 log_callback(f"[*] 已填写邮箱并提交: {email}{detail}")
             return email, dev_token
         sleep_with_cancel(0.5, cancel_callback)
-    if last_snapshot:
-        inputs = " | ".join(last_snapshot.get("inputs", [])[:6])
-        buttons = " | ".join(last_snapshot.get("buttons", [])[:8])
-        url = last_snapshot.get("url", page.url if page else "")
-        raise Exception(
-            f"未找到邮箱输入框或注册按钮，最后页面: url={url}; inputs={inputs or 'none'}; buttons={buttons or 'none'}"
-        )
-    raise Exception("未找到邮箱输入框或注册按钮")
+
+    raise Exception(f"未找到邮箱输入框或注册按钮，最后页面: url={page.url if page else ''}")
 
 
 def fill_code_and_submit(
@@ -3179,18 +2947,12 @@ def fill_code_and_submit(
         _tls_set_page(page)
         browser = _tls_get_browser()
         _tls_set_browser(browser)
+
     def _resend_code():
-        page.run_js(
-            r"""
-const nodes = Array.from(document.querySelectorAll('button, a, [role="button"]'));
-const target = nodes.find((node) => {
-  const t = (node.innerText || node.textContent || '').replace(/\s+/g, '').toLowerCase();
-  return t.includes('重新发送') || t.includes('resend') || t.includes('再次发送');
-});
-if (target && !target.disabled) { target.click(); return true; }
-return false;
-            """
-        )
+        try:
+            page.click_by_text(["重新发送", "再次发送", "Resend"], role="button")
+        except Exception:
+            pass
 
     if timeout is None:
         timeout = get_code_poll_timeout()
@@ -3212,124 +2974,87 @@ return false;
         raise Exception("获取验证码失败")
     clean_code = str(code).replace("-", "").strip()
     deadline = time.time() + timeout
+    otp_selectors = [
+        'input[data-input-otp="true"]',
+        'input[name="code"]',
+        'input[autocomplete="one-time-code"]',
+        'input[inputmode="numeric"]',
+        'input[inputmode="text"]',
+    ]
 
     while time.time() < deadline:
         raise_if_cancelled(cancel_callback)
-        filled = page.run_js(
-            """
-const code = String(arguments[0] || '').trim();
-if (!code) return 'empty-code';
+        _human_pause_cancel(0.2, 0.5, cancel_callback)
 
-function isVisible(node) {
-    if (!node) return false;
-    const style = window.getComputedStyle(node);
-    if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') return false;
-    const rect = node.getBoundingClientRect();
-    return rect.width > 0 && rect.height > 0;
-}
+        filled_ok = False
+        # Prefer single aggregate OTP input
+        try:
+            filled_ok = page.fill_first(otp_selectors, clean_code, human=True)
+        except Exception:
+            filled_ok = False
 
-function setInputValue(input, value) {
-    const nativeSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value')?.set;
-    const tracker = input._valueTracker;
-    if (tracker) tracker.setValue('');
-    if (nativeSetter) nativeSetter.call(input, value);
-    else input.value = value;
-    input.dispatchEvent(new InputEvent('beforeinput', { bubbles: true, data: value, inputType: 'insertText' }));
-    input.dispatchEvent(new InputEvent('input', { bubbles: true, data: value, inputType: 'insertText' }));
-    input.dispatchEvent(new Event('change', { bubbles: true }));
-}
+        # Single-char OTP boxes: type char-by-char natively
+        if not filled_ok:
+            try:
+                pw = page._p
+                boxes = pw.locator('input[maxlength="1"]')
+                n = boxes.count()
+                if n >= len(clean_code):
+                    for i, ch in enumerate(clean_code):
+                        box = boxes.nth(i)
+                        _human_pause_cancel(0.08, 0.22, cancel_callback)
+                        box.click(timeout=2000)
+                        _human_pause_cancel(0.04, 0.12, cancel_callback)
+                        box.fill("")
+                        box.press_sequentially(ch, delay=random.randint(40, 100))
+                    filled_ok = True
+            except Exception:
+                filled_ok = False
 
-const aggregate = Array.from(document.querySelectorAll(
-  'input[data-input-otp=\"true\"], input[name=\"code\"], input[autocomplete=\"one-time-code\"], input[inputmode=\"numeric\"], input[inputmode=\"text\"]'
-)).find((node) => isVisible(node) && !node.disabled && !node.readOnly && Number(node.maxLength || 6) > 1);
-
-if (aggregate) {
-    aggregate.focus();
-    aggregate.click();
-    setInputValue(aggregate, code);
-    return String(aggregate.value || '').replace(/\\s+/g, '') ? 'filled-aggregate' : 'aggregate-failed';
-}
-
-const otpBoxes = Array.from(document.querySelectorAll('input')).filter((node) => {
-    if (!isVisible(node) || node.disabled || node.readOnly) return false;
-    const maxLength = Number(node.maxLength || 0);
-    const ac = String(node.autocomplete || '').toLowerCase();
-    return maxLength === 1 || ac === 'one-time-code';
-});
-
-if (otpBoxes.length >= code.length) {
-    for (let i = 0; i < code.length; i += 1) {
-        const ch = code[i] || '';
-        const box = otpBoxes[i];
-        box.focus();
-        box.click();
-        setInputValue(box, ch);
-        box.dispatchEvent(new KeyboardEvent('keydown', { bubbles: true, key: ch }));
-        box.dispatchEvent(new KeyboardEvent('keyup', { bubbles: true, key: ch }));
-    }
-    const merged = otpBoxes.slice(0, code.length).map((x) => String(x.value || '').trim()).join('');
-    return merged.length ? 'filled-boxes' : 'boxes-failed';
-}
-
-return 'not-ready';
-            """,
-            clean_code,
-        )
-
-        if filled == "not-ready":
-            sleep_with_cancel(0.5, cancel_callback)
-            continue
-        if "failed" in str(filled):
-            if log_callback:
-                log_callback(f"[Debug] 验证码填写失败: {filled}")
+        if not filled_ok:
             sleep_with_cancel(0.5, cancel_callback)
             continue
 
-        clicked = page.run_js(
-            r"""
-function isVisible(node) {
-    if (!node) return false;
-    const style = window.getComputedStyle(node);
-    if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') return false;
-    const rect = node.getBoundingClientRect();
-    return rect.width > 0 && rect.height > 0;
-}
+        _human_pause_cancel(0.35, 0.75, cancel_callback)
+        clicked = None
+        try:
+            clicked = page.click_by_text(
+                ["确认邮箱", "继续", "下一步", "Confirm", "Continue", "Next"],
+                role="button",
+            )
+        except Exception:
+            clicked = None
+        if not clicked:
+            try:
+                if page.click_first(
+                    [
+                        'button[type="submit"]',
+                        'button:has-text("确认")',
+                        'button:has-text("继续")',
+                        'button:has-text("下一步")',
+                        'button:has-text("Continue")',
+                        'button:has-text("Next")',
+                    ]
+                ):
+                    clicked = "selector"
+            except Exception:
+                clicked = None
 
-const buttons = Array.from(document.querySelectorAll('button[type=\"submit\"], button')).filter((node) => {
-    return isVisible(node) && !node.disabled && node.getAttribute('aria-disabled') !== 'true';
-});
-
-const btn = buttons.find((node) => {
-    const t = (node.innerText || node.textContent || '').replace(/\\s+/g, '').toLowerCase();
-    return (
-        t.includes('确认邮箱') ||
-        t.includes('继续') ||
-        t.includes('下一步') ||
-        t.includes('confirm') ||
-        t.includes('continue') ||
-        t.includes('next')
-    );
-});
-
-if (!btn) return 'no-button';
-btn.focus();
-btn.click();
-return 'clicked';
-            """
-        )
-
-        if clicked == "clicked" or clicked == "no-button":
-            if log_callback:
-                log_callback(f"[*] 已填写验证码并提交: {code}")
-            sleep_with_cancel(1.5, cancel_callback)
-            return code
-
-        sleep_with_cancel(0.5, cancel_callback)
+        # OTP often auto-submits; treat filled+optional click as success
+        if log_callback:
+            log_callback(f"[*] 已填写验证码并提交: {code}")
+        _human_pause_cancel(1.0, 1.8, cancel_callback)
+        return code
 
     raise Exception("验证码已获取，但自动填写/提交失败")
 
 
 def getTurnstileToken(log_callback=None, cancel_callback=None):
+    """Wait for Cloudflare Turnstile via Playwright-native iframe click only.
+
+    No init-script patching, no forced token injection — Camoufox + disable_coop
+    lets the real checkbox be clicked; we only poll for the natural response.
+    """
     # thread-local page/browser (multi-thread safe)
     page = _tls_get_page()
     _tls_set_page(page)
@@ -3344,21 +3069,12 @@ def getTurnstileToken(log_callback=None, cancel_callback=None):
     if page is None:
         raise Exception("页面未就绪，无法执行 Turnstile")
 
-    # Patchright native Turnstile: use frame_locator + locator instead of
-    # shadow-DOM traversal.  Patchright already handles navigator.webdriver.
-    pw_page = page._p  # underlying Playwright Page
+    pw_page = page._p
+    clicked_once = False
 
-    try:
-        pw_page.evaluate(
-            "try { if (window.turnstile && typeof turnstile.reset === 'function') turnstile.reset(); } catch(e) {}"
-        )
-    except Exception:
-        pass
-
-    for _ in range(0, 30):
+    for attempt in range(0, 40):
         raise_if_cancelled(cancel_callback)
         try:
-            # 1. Check if token already present
             token = pw_page.evaluate(
                 """() => {
                     var el = document.querySelector('input[name="cf-turnstile-response"]');
@@ -3373,52 +3089,42 @@ def getTurnstileToken(log_callback=None, cancel_callback=None):
         except Exception:
             pass
 
-        # 2. Try to click the Turnstile checkbox via Patchright native locator
+        # Playwright-native click on checkbox inside Turnstile iframe
         try:
-            frame = pw_page.frame_locator('iframe[src*="challenges.cloudflare.com"]')
-            if frame:
-                checkbox = frame.locator('#checkbox, input[type="checkbox"], .mark')
-                if checkbox.count() > 0:
-                    try:
-                        checkbox.first.click(timeout=3000)
-                    except Exception:
-                        # Fallback: JS click inside the frame
-                        try:
-                            pw_page.evaluate("""
-                                () => {
-                                    var frames = document.querySelectorAll('iframe[src*="challenges.cloudflare.com"]');
-                                    for (var f of frames) {
-                                        try {
-                                            var doc = f.contentDocument || f.contentWindow.document;
-                                            var cb = doc.querySelector('#checkbox, input[type="checkbox"], .mark');
-                                            if (cb) { cb.click(); return true; }
-                                        } catch(e) {}
-                                    }
-                                    return false;
-                                }
-                            """)
-                        except Exception:
-                            pass
-        except Exception:
-            pass
-
-        # 3. Fallback: JS click on any turnstile element
-        try:
-            pw_page.evaluate(
-                """() => {
-                    var nodes = document.querySelectorAll('div,span,iframe');
-                    for (var i=0; i<nodes.length; i++) {
-                        var txt = (nodes[i].className||'') + ' ' + (nodes[i].id||'') + ' ' + (nodes[i].getAttribute('src')||'');
-                        if (txt.toLowerCase().includes('turnstile')) {
-                            nodes[i].click(); break;
-                        }
-                    }
-                }"""
+            frame = pw_page.frame_locator(
+                'iframe[src*="challenges.cloudflare.com"], iframe[src*="turnstile"]'
             )
+            checkbox = frame.locator(
+                '#checkbox, input[type="checkbox"], .mark, [role="checkbox"]'
+            )
+            if checkbox.count() > 0:
+                _human_pause_cancel(0.25, 0.7, cancel_callback)
+                try:
+                    checkbox.first.scroll_into_view_if_needed(timeout=2000)
+                except Exception:
+                    pass
+                _human_pause_cancel(0.15, 0.4, cancel_callback)
+                checkbox.first.click(timeout=4000)
+                clicked_once = True
+                if log_callback and attempt % 6 == 0:
+                    log_callback("[*] 已原生点击 Turnstile 复选框，等待通过...")
         except Exception:
             pass
 
-        sleep_with_cancel(0.5, cancel_callback)
+        # Also try clicking the visible widget / iframe on the main page
+        if not clicked_once or attempt % 5 == 0:
+            try:
+                widget = pw_page.locator(
+                    'iframe[src*="challenges.cloudflare.com"], iframe[src*="turnstile"], div.cf-turnstile'
+                )
+                if widget.count() > 0:
+                    _human_pause_cancel(0.2, 0.5, cancel_callback)
+                    widget.first.click(timeout=2500, force=False)
+                    clicked_once = True
+            except Exception:
+                pass
+
+        _human_pause_cancel(0.55, 1.1, cancel_callback)
 
     raise Exception("Turnstile 获取 token 失败")
 
@@ -3448,6 +3154,36 @@ def build_profile():
     return given_name, family_name, password
 
 
+def _cf_token_len(page) -> int:
+    """Return current Turnstile response length (0 if absent/empty)."""
+    try:
+        token = page._p.evaluate(
+            """() => {
+                var el = document.querySelector('input[name="cf-turnstile-response"]');
+                return (el && el.value) || '';
+            }"""
+        )
+        return len(str(token or "").strip())
+    except Exception:
+        return 0
+
+
+def _cf_present(page) -> bool:
+    try:
+        return bool(
+            page._p.evaluate(
+                """() => {
+                    return !!(
+                        document.querySelector('input[name="cf-turnstile-response"]')
+                        || document.querySelector('iframe[src*="turnstile"], iframe[src*="challenges.cloudflare.com"], div.cf-turnstile, [data-sitekey], script[src*="turnstile"]')
+                    );
+                }"""
+            )
+        )
+    except Exception:
+        return False
+
+
 def fill_profile_and_submit(timeout=120, log_callback=None, cancel_callback=None):
     # thread-local page/browser (multi-thread safe)
     page = _tls_get_page()
@@ -3463,232 +3199,105 @@ def fill_profile_and_submit(timeout=120, log_callback=None, cancel_callback=None
     given_name, family_name, password = build_profile()
     deadline = time.time() + timeout
     form_filled_once = False
-    wait_cf_since = None
     last_cf_retry_at = 0.0
+
+    given_sels = [
+        'input[data-testid="givenName"]',
+        'input[name="givenName"]',
+        'input[autocomplete="given-name"]',
+        'input[aria-label*="名"]',
+    ]
+    family_sels = [
+        'input[data-testid="familyName"]',
+        'input[name="familyName"]',
+        'input[autocomplete="family-name"]',
+        'input[aria-label*="姓"]',
+    ]
+    password_sels = [
+        'input[data-testid="password"]',
+        'input[name="password"]',
+        'input[type="password"]',
+        'input[autocomplete="new-password"]',
+    ]
+    submit_labels = ["完成注册", "创建账户", "Sign up", "Create account", "Create Account"]
 
     while time.time() < deadline:
         raise_if_cancelled(cancel_callback)
+
         if not form_filled_once:
-            filled = page.run_js(
-                """
-const givenName = arguments[0];
-const familyName = arguments[1];
-const password = arguments[2];
+            _human_pause_cancel(0.25, 0.6, cancel_callback)
+            ok_g = page.fill_first(given_sels, given_name, human=True)
+            if not ok_g:
+                sleep_with_cancel(0.5, cancel_callback)
+                continue
+            _human_pause_cancel(0.2, 0.55, cancel_callback)
+            ok_f = page.fill_first(family_sels, family_name, human=True)
+            if not ok_f:
+                sleep_with_cancel(0.5, cancel_callback)
+                continue
+            _human_pause_cancel(0.2, 0.55, cancel_callback)
+            ok_p = page.fill_first(password_sels, password, human=True)
+            if not ok_p:
+                if log_callback:
+                    log_callback("[Debug] 资料输入失败，重试中...")
+                sleep_with_cancel(0.5, cancel_callback)
+                continue
+            form_filled_once = True
+            if log_callback:
+                log_callback(f"[*] 资料已填写: {given_name} {family_name}")
+            _human_pause_cancel(0.35, 0.8, cancel_callback)
 
-function isVisible(node) {
-    if (!node) return false;
-    const style = window.getComputedStyle(node);
-    if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') return false;
-    const rect = node.getBoundingClientRect();
-    return rect.width > 0 && rect.height > 0;
-}
-
-function pickInput(selector) {
-    return Array.from(document.querySelectorAll(selector)).find((node) => {
-        return isVisible(node) && !node.disabled && !node.readOnly;
-    }) || null;
-}
-
-function setInputValue(input, value) {
-    if (!input) return false;
-    input.focus();
-    input.click();
-    const nativeSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value')?.set;
-    const tracker = input._valueTracker;
-    if (tracker) tracker.setValue('');
-    if (nativeSetter) nativeSetter.call(input, value);
-    else input.value = value;
-    input.dispatchEvent(new InputEvent('beforeinput', { bubbles: true, data: value, inputType: 'insertText' }));
-    input.dispatchEvent(new InputEvent('input', { bubbles: true, data: value, inputType: 'insertText' }));
-    input.dispatchEvent(new Event('change', { bubbles: true }));
-    input.blur();
-    return String(input.value || '').trim() === String(value || '').trim();
-}
-
-const givenInput = pickInput('input[data-testid="givenName"], input[name="givenName"], input[autocomplete="given-name"], input[aria-label*="名"]');
-const familyInput = pickInput('input[data-testid="familyName"], input[name="familyName"], input[autocomplete="family-name"], input[aria-label*="姓"]');
-const passwordInput = pickInput('input[data-testid="password"], input[name="password"], input[type="password"], input[autocomplete="new-password"]');
-
-if (!givenInput || !familyInput || !passwordInput) return 'not-ready';
-
-const ok1 = setInputValue(givenInput, givenName);
-const ok2 = setInputValue(familyInput, familyName);
-const ok3 = setInputValue(passwordInput, password);
-
-if (!ok1 || !ok2 || !ok3) return 'fill-failed';
-
-const buttons = Array.from(document.querySelectorAll('button[type="submit"], button, [role="button"], input[type="submit"]')).filter((node) => {
-    return isVisible(node) && !node.disabled && node.getAttribute('aria-disabled') !== 'true';
-});
-const submitBtn = buttons.find((node) => {
-    const t = (node.innerText || node.textContent || '').replace(/\\s+/g, '').toLowerCase();
-    return t.includes('完成注册') || t.includes('创建账户') || t.includes('signup') || t.includes('createaccount');
-});
-
-// 必须等待 Cloudflare 校验通过后再提交
-const cfInput = document.querySelector('input[name="cf-turnstile-response"]');
-const cfPresent = !!cfInput
-  || !!document.querySelector('iframe[src*="turnstile"], div.cf-turnstile, [data-sitekey], script[src*="turnstile"]');
-if (cfPresent) {
-    const token = String((cfInput && cfInput.value) || '').trim();
-    const solvedByToken = token.length >= 80;
-    if (!solvedByToken) return 'wait-cloudflare:' + token.length;
-}
-
-if (submitBtn) {
-    return 'ready-to-submit';
-}
-return 'filled-no-submit';
-            """,
-                given_name,
-                family_name,
-                password,
-            )
-
-            if isinstance(filled, str) and filled.startswith("wait-cloudflare"):
-                form_filled_once = True
-                token_len = filled.split(":", 1)[1] if ":" in filled else "0"
+        # Wait for natural Turnstile solve (native click only, no token injection)
+        if _cf_present(page):
+            token_len = _cf_token_len(page)
+            if token_len < 80:
                 now = time.time()
-                if wait_cf_since is None:
-                    wait_cf_since = now
-                    if log_callback:
-                        log_callback(
-                            f"[*] 资料已填写，立即处理 Cloudflare 人机验证... token长度={token_len}"
-                        )
-                elif log_callback and now - last_cf_retry_at >= 3:
+                if log_callback and now - last_cf_retry_at >= 3:
                     log_callback(f"[*] 等待 Cloudflare 人机验证... token长度={token_len}")
-                # 立刻主动点 Turnstile，不再空等 12s
-                if now - last_cf_retry_at >= 1.2:
+                if now - last_cf_retry_at >= 1.5:
                     if log_callback:
-                        log_callback("[*] 主动触发/复用 Turnstile...")
+                        log_callback("[*] 原生点击 Turnstile...")
                     try:
-                        token = getTurnstileToken(log_callback=log_callback, cancel_callback=cancel_callback)
-                        if token:
-                            synced = page.run_js(
-                                """
-const token = String(arguments[0] || '').trim();
-const cfInput = document.querySelector('input[name="cf-turnstile-response"]');
-if (!cfInput || !token) return false;
-const nativeSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value')?.set;
-if (nativeSetter) nativeSetter.call(cfInput, token);
-else cfInput.value = token;
-cfInput.dispatchEvent(new Event('input', { bubbles: true }));
-cfInput.dispatchEvent(new Event('change', { bubbles: true }));
-return String(cfInput.value || '').trim().length;
-                                """,
-                                token,
-                            )
-                            if log_callback:
-                                log_callback(f"[*] Turnstile 回填完成，长度={synced}")
+                        getTurnstileToken(
+                            log_callback=log_callback, cancel_callback=cancel_callback
+                        )
                     except Exception as cf_exc:
                         if log_callback:
                             log_callback(f"[Debug] Turnstile 触发失败: {cf_exc}")
-                    last_cf_retry_at = now
-                sleep_with_cancel(0.4, cancel_callback)
-                continue
-
-            if filled in ("ready-to-submit", "filled-no-submit"):
-                form_filled_once = True
-            elif filled == "fill-failed" and log_callback:
-                log_callback("[Debug] 资料输入失败，重试中...")
-                sleep_with_cancel(0.5, cancel_callback)
-                continue
-            elif filled == "not-ready":
+                    last_cf_retry_at = time.time()
                 sleep_with_cancel(0.5, cancel_callback)
                 continue
 
-        submit_state = page.run_js(
-            r"""
-function isVisible(node) {
-    if (!node) return false;
-    const style = window.getComputedStyle(node);
-    if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') return false;
-    const rect = node.getBoundingClientRect();
-    return rect.width > 0 && rect.height > 0;
-}
+        # Submit via Playwright-native click
+        _human_pause_cancel(0.3, 0.7, cancel_callback)
+        submitted = None
+        try:
+            submitted = page.click_by_text(submit_labels, role="button")
+        except Exception:
+            submitted = None
+        if not submitted:
+            try:
+                if page.click_first(
+                    [
+                        'button[type="submit"]',
+                        'button:has-text("完成注册")',
+                        'button:has-text("创建账户")',
+                        'button:has-text("Sign up")',
+                        'button:has-text("Create account")',
+                    ]
+                ):
+                    submitted = "selector"
+            except Exception:
+                submitted = None
 
-const cfInput = document.querySelector('input[name="cf-turnstile-response"]');
-const cfPresent = !!cfInput
-  || !!document.querySelector('iframe[src*="turnstile"], div.cf-turnstile, [data-sitekey], script[src*="turnstile"]');
-if (cfPresent) {
-    const token = String((cfInput && cfInput.value) || '').trim();
-    const solvedByToken = token.length >= 80;
-    if (!solvedByToken) return 'wait-cloudflare:' + token.length;
-}
-
-function buttonText(node) {
-    return [
-        node.innerText,
-        node.textContent,
-        node.getAttribute('value'),
-        node.getAttribute('aria-label'),
-        node.getAttribute('title'),
-    ].filter(Boolean).join(' ').replace(/\s+/g, ' ').trim();
-}
-const buttons = Array.from(document.querySelectorAll('button[type="submit"], button, [role="button"], input[type="submit"]')).filter((node) => {
-    return isVisible(node) && !node.disabled && node.getAttribute('aria-disabled') !== 'true';
-});
-const submitBtn = buttons.find((node) => {
-    const t = buttonText(node).replace(/\s+/g, '').toLowerCase();
-    return t.includes('完成注册') || t.includes('创建账户') || t.includes('signup') || t.includes('createaccount');
-});
-if (!submitBtn) {
-    const visibleTexts = buttons.map(buttonText).filter(Boolean).slice(0, 8).join(' | ');
-    return 'no-submit-button:' + visibleTexts;
-}
-submitBtn.focus();
-submitBtn.click();
-return 'submitted';
-            """
-        )
-
-        if isinstance(submit_state, str) and submit_state.startswith("wait-cloudflare"):
-            token_len = submit_state.split(":", 1)[1] if ":" in submit_state else "0"
-            now = time.time()
-            if wait_cf_since is None:
-                wait_cf_since = now
-            if log_callback and now - last_cf_retry_at >= 3:
-                log_callback(f"[*] 提交前等待 Cloudflare... token长度={token_len}")
-            if now - last_cf_retry_at >= 1.2:
-                if log_callback:
-                    log_callback("[*] 提交前主动触发 Turnstile...")
-                try:
-                    token = getTurnstileToken(log_callback=log_callback, cancel_callback=cancel_callback)
-                    if token:
-                        synced = page.run_js(
-                            """
-const token = String(arguments[0] || '').trim();
-const cfInput = document.querySelector('input[name="cf-turnstile-response"]');
-if (!cfInput || !token) return false;
-const nativeSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value')?.set;
-if (nativeSetter) nativeSetter.call(cfInput, token);
-else cfInput.value = token;
-cfInput.dispatchEvent(new Event('input', { bubbles: true }));
-cfInput.dispatchEvent(new Event('change', { bubbles: true }));
-return String(cfInput.value || '').trim().length;
-                            """,
-                            token,
-                        )
-                        if log_callback:
-                            log_callback(f"[*] Turnstile 回填完成，长度={synced}")
-                except Exception as cf_exc:
-                    if log_callback:
-                        log_callback(f"[Debug] Turnstile 触发失败: {cf_exc}")
-                last_cf_retry_at = now
-            sleep_with_cancel(0.4, cancel_callback)
-            continue
-
-        if submit_state == "submitted":
+        if submitted:
             if log_callback:
                 log_callback(f"[*] 已填写注册资料并提交: {given_name} {family_name}")
             return {"given_name": given_name, "family_name": family_name, "password": password}
-        wait_cf_since = None
-        if isinstance(submit_state, str) and submit_state.startswith("no-submit-button") and log_callback:
-            visible_buttons = submit_state.split(":", 1)[1] if ":" in submit_state else ""
-            suffix = f" 可见按钮: {visible_buttons}" if visible_buttons else ""
-            log_callback(f"[Debug] 未找到提交按钮，继续等待页面稳定...{suffix}")
 
-        sleep_with_cancel(0.5, cancel_callback)
+        if log_callback:
+            log_callback("[Debug] 未找到提交按钮，继续等待页面稳定...")
+        sleep_with_cancel(0.6, cancel_callback)
 
     raise Exception("最终注册页资料填写失败")
 
@@ -3721,61 +3330,75 @@ def wait_for_sso_cookie(timeout=120, log_callback=None, cancel_callback=None):
                 sleep_with_cancel(1, cancel_callback)
                 continue
 
-            # 仍停留在“完成注册”页时，若 Cloudflare 已通过，周期性重试点击提交
+            # 仍停留在“完成注册”页时，若 Cloudflare 已通过，周期性重试原生点击提交
             now = time.time()
             if now - last_submit_retry >= 2.5:
-                retried = page.run_js(
-                    r"""
-function isVisible(node) {
-    if (!node) return false;
-    const style = window.getComputedStyle(node);
-    if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') return false;
-    const rect = node.getBoundingClientRect();
-    return rect.width > 0 && rect.height > 0;
-}
+                retried = "not-final-page"
+                try:
+                    title_hit = page.run_js(
+                        r"""
 const titleHit = !!Array.from(document.querySelectorAll('h1,h2,div,span')).find((el) => {
     const t = (el.textContent || '').replace(/\s+/g, '');
     const lower = t.toLowerCase();
     return t.includes('完成注册') || lower.includes('completeyoursignup') || lower.includes('completesignup');
 });
-if (!titleHit) return 'not-final-page';
+return titleHit;
+                        """
+                    )
+                except Exception:
+                    title_hit = False
 
-const cfInput = document.querySelector('input[name="cf-turnstile-response"]');
-const cfPresent = !!cfInput
-  || !!document.querySelector('iframe[src*="turnstile"], div.cf-turnstile, [data-sitekey], script[src*="turnstile"]');
-if (cfPresent) {
-    const token = String((cfInput && cfInput.value) || '').trim();
-    const solved = token.length >= 80;
-    if (!solved) return 'final-page-wait-cf:' + token.length;
-}
+                if title_hit:
+                    if _cf_present(page) and _cf_token_len(page) < 80:
+                        token_len = _cf_token_len(page)
+                        retried = f"final-page-wait-cf:{token_len}"
+                        if log_callback:
+                            log_callback(
+                                f"[Debug] 最终页状态: final-page-wait-cf, token长度={token_len}"
+                            )
+                        if now - last_cf_retry_at >= 2:
+                            if log_callback:
+                                log_callback("[*] 最终页原生点击 Turnstile...")
+                            try:
+                                getTurnstileToken(
+                                    log_callback=log_callback,
+                                    cancel_callback=cancel_callback,
+                                )
+                            except Exception as cf_exc:
+                                if log_callback:
+                                    log_callback(f"[Debug] 最终页 Turnstile 失败: {cf_exc}")
+                            last_cf_retry_at = time.time()
+                    else:
+                        clicked = None
+                        try:
+                            clicked = page.click_by_text(
+                                ["完成注册", "创建账户", "Sign up", "Create account"],
+                                role="button",
+                            )
+                        except Exception:
+                            clicked = None
+                        if not clicked:
+                            try:
+                                if page.click_first(
+                                    [
+                                        'button[type="submit"]',
+                                        'button:has-text("完成注册")',
+                                        'button:has-text("创建账户")',
+                                    ]
+                                ):
+                                    clicked = "selector"
+                            except Exception:
+                                clicked = None
+                        if clicked:
+                            retried = "final-page-clicked-submit"
+                        else:
+                            retried = "final-page-no-submit"
 
-function buttonText(node) {
-    return [
-        node.innerText,
-        node.textContent,
-        node.getAttribute('value'),
-        node.getAttribute('aria-label'),
-        node.getAttribute('title'),
-    ].filter(Boolean).join(' ').replace(/\s+/g, ' ').trim();
-}
-const buttons = Array.from(document.querySelectorAll('button[type="submit"], button, [role="button"], input[type="submit"]')).filter((node) => {
-    return isVisible(node) && !node.disabled && node.getAttribute('aria-disabled') !== 'true';
-});
-const submitBtn = buttons.find((node) => {
-    const t = buttonText(node).replace(/\s+/g, '').toLowerCase();
-    return t.includes('完成注册') || t.includes('创建账户') || t.includes('signup') || t.includes('createaccount');
-});
-if (!submitBtn) {
-    const visibleTexts = buttons.map(buttonText).filter(Boolean).slice(0, 8).join(' | ');
-    return 'final-page-no-submit:' + visibleTexts;
-}
-submitBtn.focus();
-submitBtn.click();
-return 'final-page-clicked-submit';
-                    """
-                )
                 last_submit_retry = now
-                if log_callback and (retried == "final-page-clicked-submit" or (isinstance(retried, str) and retried.startswith("final-page-no-submit"))):
+                if log_callback and (
+                    retried == "final-page-clicked-submit"
+                    or (isinstance(retried, str) and retried.startswith("final-page-no-submit"))
+                ):
                     log_callback(f"[Debug] 最终页状态: {retried}")
                 if isinstance(retried, str) and retried.startswith("final-page-no-submit"):
                     if retried != final_no_submit_state:
@@ -3788,35 +3411,6 @@ return 'final-page-clicked-submit';
                 else:
                     final_no_submit_state = ""
                     final_no_submit_since = None
-                if log_callback and isinstance(retried, str) and retried.startswith("final-page-wait-cf"):
-                    token_len = retried.split(":", 1)[1] if ":" in retried else "0"
-                    log_callback(f"[Debug] 最终页状态: final-page-wait-cf, token长度={token_len}")
-                    if now - last_cf_retry_at >= 2:
-                        if log_callback:
-                            log_callback("[*] 最终页 Cloudflare 卡住，自动二次复用 Turnstile...")
-                        try:
-                            token = getTurnstileToken(log_callback=log_callback, cancel_callback=cancel_callback)
-                            if token:
-                                synced = page.run_js(
-                                    """
-const token = String(arguments[0] || '').trim();
-const cfInput = document.querySelector('input[name="cf-turnstile-response"]');
-if (!cfInput || !token) return false;
-const nativeSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value')?.set;
-if (nativeSetter) nativeSetter.call(cfInput, token);
-else cfInput.value = token;
-cfInput.dispatchEvent(new Event('input', { bubbles: true }));
-cfInput.dispatchEvent(new Event('change', { bubbles: true }));
-return String(cfInput.value || '').trim().length;
-                                    """,
-                                    token,
-                                )
-                                if log_callback:
-                                    log_callback(f"[*] 最终页 Turnstile 回填完成，长度={synced}")
-                        except Exception as cf_exc:
-                            if log_callback:
-                                log_callback(f"[Debug] 最终页 Turnstile 二次复用失败: {cf_exc}")
-                        last_cf_retry_at = now
 
             cookies = page.cookies(all_domains=True, all_info=True) or []
             for item in cookies:

@@ -4,8 +4,8 @@ version = "1.0.0"
 description = "Grok Register Mint — 注册 + Grok Build CPA mint（基于上游二次开发）"
 requires-python = ">=3.13,<3.14"
 dependencies = [
-    "patchright>=1.48",    # 无头浏览器自动化（Patchright = patched Playwright，系统 Chrome + turnstilePatch）
-    "curl_cffi>=0.7",      # HTTP client（带 TLS 指纹），邮箱 API + grok2api 调用
+    "camoufox[geoip]>=0.5.4",  # 反检测 Firefox + Playwright API（替代 patchright + turnstilePatch）
+    "curl_cffi>=0.7",          # HTTP client（带 TLS 指纹），邮箱 API + grok2api 调用
     "requests>=2.34.2",
 ]
 

@@ -1,4 +1,4 @@
-"""Approve xAI device-code in Chromium (DrissionPage).
+"""Approve xAI device-code in Camoufox (Playwright-native interactions).
 
 Paths resolve relative to the grok_reg project root (parent of cpa_xai).
 
@@ -17,7 +17,7 @@ Hard rules:
   - Token poll is source of truth
   - Button match is EXACT text only (允许 ≠ 全部允许)
   - Consent Allow MUST be a real click, not by_js
-  - Prefer headed browser + register turnstilePatch
+  - Prefer headed Camoufox + Playwright-native Turnstile click
 """
 
 from __future__ import annotations
@@ -27,7 +27,6 @@ import re
 import sys
 import threading
 import time
-from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import urlparse
 
@@ -51,12 +50,11 @@ def _build_mint_browser_options(
     headless: bool = False,
     log: LogFn | None = None,
 ):
-    """Create isolated ChromiumOptions for CPA mint (unique port + profile)."""
+    """Create isolated Camoufox options for CPA mint."""
     log = log or _noop_log
     from grok_register.browser_adapter import ChromiumOptions
 
     opts = None
-    _pkg_root = Path(__file__).resolve().parents[2]  # project root
     try:
         from grok_register.app import create_browser_options  # type: ignore
 
@@ -64,7 +62,7 @@ def _build_mint_browser_options(
             opts = create_browser_options(unique_profile=True, profile_tag="cpa")
         except TypeError:
             opts = create_browser_options()
-        log("using register create_browser_options (turnstilePatch, isolated profile)")
+        log("using register create_browser_options (camoufox, isolated profile)")
     except Exception as e:  # noqa: BLE001
         log(f"register browser options unavailable: {e}")
         opts = None
@@ -84,35 +82,27 @@ def _build_mint_browser_options(
 
         profile_dir = os.path.join(
             tempfile.gettempdir(),
-            "grok_reg_chrome",
+            "grok_reg_camoufox",
             f"cpa_{os.getpid()}_{uuid.uuid4().hex[:10]}",
         )
         os.makedirs(profile_dir, exist_ok=True)
         try:
             opts.set_user_data_path(profile_dir)
         except Exception:
-            try:
-                opts.set_argument(f"--user-data-dir={profile_dir}")
-            except Exception:
-                pass
-        ext = str(_pkg_root / "turnstilePatch")
-        if os.path.isdir(ext):
-            try:
-                opts.add_extension(ext)
-                log(f"added extension {ext}")
-            except Exception as e:  # noqa: BLE001
-                log(f"extension add failed: {e}")
+            pass
 
-    # 注意: 不添加任何 --disable-* / --no-* 自动化特征参数
+    try:
+        opts.set_humanize(True)
+        opts.set_disable_coop(True)
+        opts.set_os("windows")
+    except Exception:
+        pass
 
     if headless:
         try:
             opts.headless(True)
         except Exception:
-            try:
-                opts.set_argument("--headless=new")
-            except Exception:
-                pass
+            pass
         log("headless=True (may hit Cloudflare / break real clicks)")
     else:
         try:
@@ -121,33 +111,6 @@ def _build_mint_browser_options(
             pass
         log(f"headed browser DISPLAY={os.environ.get('DISPLAY', '')!r}")
 
-    # 优先使用 channel="chrome" 让 Patchright 自动查找系统 Chrome（更好的伪装）
-    # 参考 Patchright 官方推荐: https://github.com/Kaliiiiiiiiii-Vinyzu/patchright
-    _chrome_found = False
-    try:
-        opts.set_channel("chrome")
-        _chrome_found = True
-        log("browser channel=chrome (system Google Chrome)")
-    except Exception:
-        pass
-
-    if not _chrome_found:
-        for cand in (
-            r"C:\Program Files\Google\Chrome\Application\chrome.exe",
-            r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
-            "/usr/bin/chromium",
-            "/usr/bin/chromium-browser",
-            "/usr/bin/google-chrome",
-            "/usr/bin/google-chrome-stable",
-        ):
-            if os.path.isfile(cand):
-                try:
-                    opts.set_browser_path(cand)
-                    log(f"browser path={cand}")
-                except Exception:
-                    pass
-                break
-    # auto_port last — set_user_data_path / set_browser_path may clear it
     try:
         opts.auto_port()
     except Exception:
@@ -166,23 +129,26 @@ def create_standalone_page(
         from grok_register.browser_adapter import Chromium
     except ImportError as e:
         raise BrowserConfirmError(
-            "browser_adapter not available (patchright missing); run `uv sync` or `uv add patchright`"
+            "browser_adapter not available (camoufox missing); run `uv sync` or `uv add camoufox`"
         ) from e
 
-    from .proxyutil import proxy_for_chromium, proxy_log_label, resolve_proxy
+    from .proxyutil import proxy_log_label, resolve_proxy
 
     proxy = resolve_proxy(proxy)
-    chrome_proxy = proxy_for_chromium(proxy)
     last_err: BaseException | None = None
 
     for attempt in range(1, 5):
         opts = _build_mint_browser_options(headless=headless, log=log)
-        if chrome_proxy:
+        if proxy:
             try:
-                opts.set_argument(f"--proxy-server={chrome_proxy}")
+                opts.set_proxy(proxy)
             except Exception:
                 pass
-            log(f"browser proxy={proxy_log_label(proxy)} (chromium {chrome_proxy})")
+            try:
+                opts.set_geoip(True)
+            except Exception:
+                pass
+            log(f"browser proxy={proxy_log_label(proxy)}")
         else:
             log("browser proxy=(none)")
 
@@ -195,15 +161,15 @@ def create_standalone_page(
                 except Exception:
                     page = None
             if page is None:
-                raise BrowserConfirmError("standalone chromium started but page is None")
-            log(f"standalone chromium started (attempt {attempt}/4)")
+                raise BrowserConfirmError("standalone camoufox started but page is None")
+            log(f"standalone camoufox started (attempt {attempt}/4)")
             return browser, page
         except Exception as e:  # noqa: BLE001
             last_err = e
-            log(f"standalone chromium start failed attempt {attempt}/4: {e}")
+            log(f"standalone camoufox start failed attempt {attempt}/4: {e}")
             _sleep(min(1.2 * attempt, 4.0))
 
-    raise BrowserConfirmError(f"standalone chromium start failed after retries: {last_err}")
+    raise BrowserConfirmError(f"standalone camoufox start failed after retries: {last_err}")
 
 def close_standalone(browser: Any) -> None:
     try:
@@ -555,22 +521,29 @@ def _click_exact(
     *,
     real: bool = False,
 ) -> str | None:
-    """Click button by EXACT visible text. real=True uses physical click (needed for consent)."""
+    """Click button by EXACT visible text. Prefer Playwright-native click."""
+    # Prefer page-level native text click when available
+    if hasattr(page, "click_by_text"):
+        try:
+            hit = page.click_by_text(labels, role="button")
+            if hit:
+                log(f"clicked native text {hit!r}")
+                return hit
+        except Exception as e:
+            log(f"native text click failed: {e}")
+
     for label in labels:
         el = _find_button_exact(page, label)
         if not el:
             continue
         try:
-            if real:
-                try:
-                    el.scroll.to_see()
-                except Exception:
-                    pass
-                el.click()
-                log(f"clicked REAL exact {label!r}")
-            else:
-                el.click(by_js=True)
-                log(f"clicked JS exact {label!r}")
+            try:
+                el.scroll.to_see()
+            except Exception:
+                pass
+            _sleep(0.15)
+            el.click(by_js=not real)
+            log(f"clicked {'REAL' if real else 'native'} exact {label!r}")
             return label
         except Exception as e:
             log(f"click {label!r} failed: {e}")
@@ -584,8 +557,35 @@ def _click_exact(
     return None
 
 
+def _fill(page: Any, selector: str, value: str, log: LogFn, label: str = "field") -> bool:
+    """Playwright-native fill with human-like typing pauses."""
+    try:
+        if hasattr(page, "fill_first"):
+            ok = page.fill_first([selector], value, human=True)
+            if ok:
+                log(f"filled {label} via native")
+                return True
+    except Exception as e:
+        log(f"fill_first {label} failed: {e}")
+    try:
+        el = page.ele(selector, timeout=1.0) if hasattr(page, "ele") else None
+        if el is None:
+            return False
+        if hasattr(el, "input"):
+            el.input(value, clear=True, human=True)
+        elif hasattr(el, "fill"):
+            el.fill(value)
+        else:
+            return False
+        log(f"filled {label}")
+        return True
+    except Exception as e:
+        log(f"fill {label} failed: {e}")
+        return False
+
+
 def _wait_turnstile(page: Any, log: LogFn, timeout: float = 45.0) -> bool:
-    """Wait/click Cloudflare Turnstile using Patchright native locators."""
+    """Wait/click Cloudflare Turnstile using Playwright-native frame locators only."""
     pw_page = page._p
     deadline = time.time() + timeout
     clicked = False
@@ -604,33 +604,36 @@ def _wait_turnstile(page: Any, log: LogFn, timeout: float = 45.0) -> bool:
         except Exception:
             pass
 
-        if not clicked:
-            try:
-                frame = pw_page.frame_locator('iframe[src*="challenges.cloudflare.com"]')
-                cb = frame.locator('#checkbox, input[type="checkbox"], .mark')
-                if cb.count() > 0:
-                    cb.first.click(timeout=3000)
-                    clicked = True
-                    log("clicked turnstile checkbox via Patchright")
-            except Exception:
-                pass
+        try:
+            frame = pw_page.frame_locator(
+                'iframe[src*="challenges.cloudflare.com"], iframe[src*="turnstile"]'
+            )
+            cb = frame.locator(
+                '#checkbox, input[type="checkbox"], .mark, [role="checkbox"]'
+            )
+            if cb.count() > 0:
+                _sleep(0.25)
+                try:
+                    cb.first.scroll_into_view_if_needed(timeout=2000)
+                except Exception:
+                    pass
+                _sleep(0.15)
+                cb.first.click(timeout=4000)
+                clicked = True
+                log("clicked turnstile checkbox via Playwright native")
+        except Exception:
+            pass
 
         if not clicked:
             try:
-                pw_page.evaluate(
-                    """() => {
-                        var nodes = document.querySelectorAll('div,span,iframe');
-                        for (var i=0; i<nodes.length; i++) {
-                            var txt = (nodes[i].className||'') + ' ' + (nodes[i].id||'') + ' ' + (nodes[i].getAttribute('src')||'');
-                            if (txt.toLowerCase().includes('turnstile')) {
-                                nodes[i].click(); return true;
-                            }
-                        }
-                        return false;
-                    }"""
+                widget = pw_page.locator(
+                    'iframe[src*="challenges.cloudflare.com"], iframe[src*="turnstile"], div.cf-turnstile'
                 )
-                clicked = True
-                log("clicked turnstile container via JS")
+                if widget.count() > 0:
+                    _sleep(0.2)
+                    widget.first.click(timeout=2500)
+                    clicked = True
+                    log("clicked turnstile widget via Playwright native")
             except Exception:
                 pass
         _sleep(0.9)

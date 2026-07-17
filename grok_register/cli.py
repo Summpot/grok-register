@@ -18,12 +18,11 @@ import threading
 import time
 import traceback
 from grok_register import app as reg  # noqa: E402
-from grok_register.paths import OUTPUT_DIR, ensure_output_dir, TURNSTILE_DIR
+from grok_register.paths import OUTPUT_DIR, ensure_output_dir
 
 
-# Chrome 适配: 使用 Patchright + 系统 Chrome (channel="chrome") 获得最佳指纹伪装
-# 不传递任何 --disable-* / --no-* 自动化特征参数
-# 参考: https://github.com/Kaliiiiiiiiii-Vinyzu/patchright
+# Camoufox 适配: humanize 光标 + disable_coop（便于原生点击 Turnstile iframe）
+# 不再加载 turnstilePatch 扩展，也不再绑定系统 Chrome channel
 _orig_create_browser_options = reg.create_browser_options
 
 
@@ -52,42 +51,12 @@ def _patched_create_browser_options(*args, **kwargs):
         opts.set_timeouts(base=1)
     except Exception:
         pass
-
-    # 使用系统 Chrome（优先推荐 channel 方式，Patchright 会查找系统安装的 Chrome）
-    # 参考 Patchright 官方推荐: https://github.com/Kaliiiiiiiiii-Vinyzu/patchright
-    _chrome_found_via_channel = False
     try:
-        opts.set_channel("chrome")
-        _chrome_found_via_channel = True
+        opts.set_humanize(True)
+        opts.set_disable_coop(True)
+        opts.set_os("windows")
     except Exception:
         pass
-
-    if not _chrome_found_via_channel:
-        # Fallback: 手动检测 Chrome/Chromium 路径
-        for cand in (
-            # Windows
-            os.path.expandvars(r"%PROGRAMFILES%\Google\Chrome\Application\chrome.exe"),
-            os.path.expandvars(r"%PROGRAMFILES(X86)%\Google\Chrome\Application\chrome.exe"),
-            os.path.expandvars(r"%LOCALAPPDATA%\Google\Chrome\Application\chrome.exe"),
-            # Linux
-            "/usr/bin/chromium",
-            "/usr/bin/chromium-browser",
-            "/usr/bin/google-chrome",
-            "/usr/bin/google-chrome-stable",
-        ):
-            if os.path.isfile(cand):
-                try:
-                    opts.set_browser_path(cand)
-                except Exception:
-                    pass
-                break
-
-    ext_path = str(TURNSTILE_DIR)
-    if os.path.isdir(ext_path):
-        try:
-            opts.add_extension(ext_path)
-        except Exception:
-            pass
     return opts
 
 
