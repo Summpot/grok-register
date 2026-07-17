@@ -373,9 +373,15 @@ def _register_worker(
             # register_one already counted fail on exception path
             pass
 
-    # worker exit: free browser
+    # worker exit: free browser + this thread's Playwright driver
     try:
         reg.stop_browser()
+    except Exception:
+        pass
+    try:
+        from grok_register.browser_adapter import stop_thread_playwright
+
+        stop_thread_playwright()
     except Exception:
         pass
     log(worker_id, "register worker exit")
@@ -506,6 +512,9 @@ def main() -> int:
         )
         t.start()
         reg_threads.append(t)
+        # Stagger first Camoufox launches across workers (Windows process races).
+        if threads > 1 and wid < threads:
+            time.sleep(0.8)
 
     # 轮询等待注册线程完成，同时响应 Ctrl+C 取消
     try:

@@ -15,7 +15,6 @@ solved via Playwright-native clicks with human-like pauses.
 
 from __future__ import annotations
 
-import atexit
 import json
 import os
 import random
@@ -28,23 +27,47 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
-# ── Playwright singleton (shared by Camoufox NewBrowser) ─────────────
-_pw = None
-_pw_lock = threading.Lock()
+# ── Playwright per-thread driver (Camoufox NewBrowser) ────────────────
+#
+# Playwright's sync API is greenlet-bound to the OS thread that called
+# sync_playwright().start(). Sharing one process-wide instance across
+# register workers causes:
+#   greenlet.error: Cannot switch to a different thread
+# Keep one driver per thread; never call it from another thread.
+_pw_tls = threading.local()
+_pw_start_lock = threading.Lock()
 
 
 def _get_playwright():
-    global _pw
-    if _pw is not None:
-        return _pw
-    with _pw_lock:
-        if _pw is not None:
-            return _pw
-        from playwright.sync_api import sync_playwright
+    pw = getattr(_pw_tls, "pw", None)
+    if pw is not None:
+        return pw
+    from playwright.sync_api import sync_playwright
 
-        _pw = sync_playwright().start()
-        atexit.register(_pw.stop)
-        return _pw
+    # Serialize start() only: avoids concurrent driver bootstrap races on
+    # Windows while still giving each thread its own instance.
+    with _pw_start_lock:
+        pw = getattr(_pw_tls, "pw", None)
+        if pw is not None:
+            return pw
+        pw = sync_playwright().start()
+        _pw_tls.pw = pw
+        return pw
+
+
+def stop_thread_playwright() -> None:
+    """Stop the current thread's Playwright driver (call after browsers quit)."""
+    pw = getattr(_pw_tls, "pw", None)
+    if pw is None:
+        return
+    try:
+        pw.stop()
+    except Exception:
+        pass
+    try:
+        _pw_tls.pw = None
+    except Exception:
+        pass
 
 
 # ── Human-like timing helpers ─────────────────────────────────────────

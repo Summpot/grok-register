@@ -2414,6 +2414,10 @@ def prepare_browser_for_next_account(log_callback=None):
 
 def shutdown_browser():
     stop_browser()
+    # Browsers created on other worker threads are greenlet-bound to those
+    # threads (Playwright sync). Workers already call stop_browser() on exit;
+    # only best-effort quit leftovers here — never share one Playwright across
+    # threads. Orphan process kill covers anything that remains.
     with _browser_registry_lock:
         browsers = list(_all_thread_browsers)
         _all_thread_browsers.clear()
@@ -2425,6 +2429,12 @@ def shutdown_browser():
                 b.quit()
             except Exception:
                 pass
+    try:
+        from grok_register.browser_adapter import stop_thread_playwright
+
+        stop_thread_playwright()
+    except Exception:
+        pass
     try:
         from grok_register.cpa_xai.browser_confirm import shutdown_mint_browsers
 
