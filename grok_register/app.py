@@ -147,6 +147,8 @@ DEFAULT_CONFIG = {
     "register_threads": 1,
     "thread_start_interval": 0.8,
     "register_browser_background": True,
+    # headless = no OS window (Camoufox stealth); offscreen = headed + move off-screen
+    "register_browser_background_mode": "headless",
     "register_browser_window_position": "-2400,100",
     "register_browser_window_size": "1000,800",
     "proxy_pool_enabled": True,
@@ -1137,7 +1139,80 @@ def add_token_to_grok2api_pools(raw_token, email="", log_callback=None):
 
 
 CHROMIUM_SLIM_FLAGS = ()
-# Camoufox: no Chromium automation flags; fingerprint is handled at engine level.
+# Camoufox: fingerprint is handled at engine level; only translate a few
+# Chrome-era flags (proxy / window position-size) in the adapter.
+
+
+def _register_browser_background_enabled() -> bool:
+    try:
+        return bool(config.get("register_browser_background", True))
+    except Exception:
+        return True
+
+
+def _apply_register_background_options(options) -> None:
+    """Run registration browser with no desktop window flash.
+
+    Camoufox path: use stealth-patched **headless** so the OS window never
+    appears. (Chrome-era code used --window-position off-screen; Firefox has
+    no equivalent launch flag, and post-launch SetWindowPos still flashes once.)
+
+    Optional config register_browser_background_mode:
+      - "headless" (default): true invisible, recommended for Camoufox
+      - "offscreen": headed + move window off-screen (may flash briefly)
+    Window size still applied for a stable viewport/fingerprint.
+    """
+    if not _register_browser_background_enabled():
+        return
+
+    size = str(config.get("register_browser_window_size") or "1000,800").strip().replace(
+        " ", ""
+    )
+    if not re.match(r"^\d+,\d+$", size):
+        size = "1000,800"
+    try:
+        sw, sh = (int(x) for x in size.split(","))
+    except Exception:
+        sw, sh = 1000, 800
+
+    try:
+        options.set_window((sw, sh))
+    except Exception:
+        try:
+            options.set_argument(f"--window-size={sw},{sh}")
+        except Exception:
+            pass
+
+    mode = str(config.get("register_browser_background_mode") or "headless").strip().lower()
+    if mode in {"offscreen", "off-screen", "position", "window-position"}:
+        # Headed fallback: place off-screen after launch (may flash once).
+        pos = str(
+            config.get("register_browser_window_position") or "-2400,100"
+        ).strip().replace(" ", "")
+        if not re.match(r"^-?\d+,-?\d+$", pos):
+            pos = "-2400,100"
+        try:
+            px, py = (int(x) for x in pos.split(","))
+        except Exception:
+            px, py = -2400, 100
+        try:
+            options.set_window_position(px, py)
+        except Exception:
+            try:
+                options.set_argument(f"--window-position={px},{py}")
+            except Exception:
+                pass
+        try:
+            options.headless(False)
+        except Exception:
+            pass
+        return
+
+    # Default: Camoufox stealth headless — no OS window, no flash.
+    try:
+        options.headless(True)
+    except Exception:
+        pass
 
 
 def create_browser_options(*, unique_profile: bool = False, profile_tag: str = "reg"):
@@ -1145,6 +1220,10 @@ def create_browser_options(*, unique_profile: bool = False, profile_tag: str = "
 
     Uses stealth Firefox (Camoufox) with humanize cursor, disable_coop for
     Turnstile iframe clicks, and native Playwright proxy auth (user:pass).
+
+    When config.register_browser_background is true (default), Camoufox runs
+    headless (stealth-patched) so no window appears. Set
+    register_browser_background_mode to "offscreen" for headed+off-screen.
     """
     options = ChromiumOptions()
     options.set_timeouts(base=2)
@@ -1154,6 +1233,8 @@ def create_browser_options(*, unique_profile: bool = False, profile_tag: str = "
         options.set_os("windows")
     except Exception:
         pass
+
+    _apply_register_background_options(options)
 
     # Outbound proxy (pool pin or config.proxy) — Camoufox accepts user:pass natively
     proxy: str = ""
@@ -3712,7 +3793,7 @@ class GrokRegisterGUI:
         )
         self.register_browser_bg_check = tk_checkbutton(
             adv_frame,
-            text="不抢前台(屏外)",
+            text="后台无窗口(headless)",
             variable=self.register_browser_bg_var,
         )
         adv_field(self.register_browser_bg_check, 0, 3, sticky=tk.W)

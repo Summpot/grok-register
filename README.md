@@ -199,8 +199,9 @@ uv run python cf_mail_debug.py `
 | --- | --- | --- |
 | `register_count` | 建议 | 默认目标数量；CLI 可用 `--count` 覆盖 |
 | `register_threads` | 建议 | GUI/部分逻辑读取；**CLI 真正并发以 `--threads` 为准** |
-| `register_browser_background` | 可选 | 默认 `true`：注册 Chrome 屏外放置，不抢前台（非 headless） |
-| `register_browser_window_position` | 可选 | 默认 `-2400,100`（屏外坐标） |
+| `register_browser_background` | 可选 | 默认 `true`：注册浏览器后台运行、不抢前台 |
+| `register_browser_background_mode` | 可选 | 默认 `headless`（Camoufox 无窗口，推荐）；`offscreen` 为有界面+屏外（可能闪一下） |
+| `register_browser_window_position` | 可选 | `offscreen` 模式用，默认 `-2400,100` |
 | `register_browser_window_size` | 可选 | 默认 `1000,800` |
 | `code_poll_timeout` | 建议 | 等验证码超时秒数，批量建议 60–90 |
 | `code_poll_interval` | 可选 | 轮询间隔秒数 |
@@ -446,9 +447,9 @@ uv run python -u register_cli.py `
 
 ### 1. CLI 为什么还弹浏览器？
 
-注册页、Turnstile、SSO cookie 依赖真实 Chrome/Chromium。CLI 只是不启动 Tk 窗口。
+注册页、Turnstile、SSO cookie 依赖真实浏览器（Camoufox）。CLI 只是不启动 Tk 窗口。
 
-默认 `register_browser_background=true`：注册 Chrome **不会抢前台**（窗口放到屏外坐标），**不是 headless**。若要看见窗口，配置里设 `register_browser_background: false`。
+默认 `register_browser_background=true` 且 `register_browser_background_mode=headless`：注册用 Camoufox **stealth headless**，**操作系统层不出现窗口**（无闪屏）。若要看见窗口，设 `register_browser_background: false`。若只要屏外有界面窗口（可能闪一下），设 `register_browser_background_mode: "offscreen"`。
 
 ### 2. 账号有了，但 grok2api 里没有？
 

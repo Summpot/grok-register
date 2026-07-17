@@ -16,6 +16,7 @@
     "register_count": 1,
     "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36",
     "register_browser_background": true,
+    "register_browser_background_mode": "headless",
     "register_browser_window_position": "-2400,100",
     "register_browser_window_size": "1000,800",
     "grok2api_auto_add_local": false,

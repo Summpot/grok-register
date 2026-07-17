@@ -521,6 +521,195 @@ def proxy_dict_from_url(proxy: str | None) -> dict[str, str] | None:
     return out
 
 
+# ── OS window placement (background / off-screen mode) ────────────────
+#
+# Chrome used --window-position / --window-size. Camoufox is Firefox: size
+# is a first-class launch option, but real desktop position must be applied
+# after the OS window exists (Win32 SetWindowPos / best-effort elsewhere).
+
+_window_place_lock = threading.Lock()
+
+
+def _win_enum_mozilla_hwnds(*, include_hidden: bool = True) -> set[int]:
+    """Top-level Mozilla/Firefox/Camoufox window handles on Windows."""
+    if os.name != "nt":
+        return set()
+    try:
+        import ctypes
+        from ctypes import wintypes
+    except Exception:
+        return set()
+
+    user32 = ctypes.windll.user32  # type: ignore[attr-defined]
+    found: set[int] = set()
+    WNDENUMPROC = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+
+    def _cb(hwnd, _lparam):
+        try:
+            if not include_hidden and not user32.IsWindowVisible(hwnd):
+                return True
+            buf = ctypes.create_unicode_buffer(64)
+            user32.GetClassNameW(hwnd, buf, 64)
+            cls = (buf.value or "").lower()
+            # Firefox / Camoufox main chrome windows
+            if "mozilla" in cls or "firefox" in cls:
+                found.add(int(hwnd))
+        except Exception:
+            pass
+        return True
+
+    try:
+        user32.EnumWindows(WNDENUMPROC(_cb), 0)
+    except Exception:
+        return set()
+    return found
+
+
+def _win_place_hwnd(
+    hwnd: int,
+    x: int,
+    y: int,
+    w: int | None,
+    h: int | None,
+    *,
+    hide: bool = False,
+) -> bool:
+    """Move (and optionally resize/hide) a window without activating it."""
+    if os.name != "nt":
+        return False
+    try:
+        import ctypes
+        from ctypes import wintypes
+    except Exception:
+        return False
+
+    user32 = ctypes.windll.user32  # type: ignore[attr-defined]
+    SWP_NOSIZE = 0x0001
+    SWP_NOZORDER = 0x0004
+    SWP_NOACTIVATE = 0x0010
+    SWP_HIDEWINDOW = 0x0080
+    SWP_SHOWWINDOW = 0x0040
+    SW_HIDE = 0
+    SW_SHOWNOACTIVATE = 4
+
+    flags = SWP_NOZORDER | SWP_NOACTIVATE
+    width = int(w or 0)
+    height = int(h or 0)
+    if width <= 0 or height <= 0:
+        flags |= SWP_NOSIZE
+        width, height = 0, 0
+    try:
+        if hide:
+            # Fully hide: no taskbar flash / no visible paint on desktop.
+            user32.ShowWindow(wintypes.HWND(hwnd), SW_HIDE)
+            flags |= SWP_HIDEWINDOW
+        else:
+            user32.ShowWindow(wintypes.HWND(hwnd), SW_SHOWNOACTIVATE)
+            flags |= SWP_SHOWWINDOW
+        ok = user32.SetWindowPos(
+            wintypes.HWND(hwnd),
+            wintypes.HWND(0),
+            int(x),
+            int(y),
+            width,
+            height,
+            flags,
+        )
+        return bool(ok)
+    except Exception:
+        return False
+
+
+def _place_new_browser_windows(
+    before: set[int],
+    *,
+    x: int,
+    y: int,
+    w: int | None,
+    h: int | None,
+    retries: int = 40,
+    delay_s: float = 0.02,
+    hide: bool = True,
+) -> int:
+    """Place any Mozilla windows that appeared after `before` was snapshotted."""
+    moved = 0
+    for _ in range(max(1, retries)):
+        now = _win_enum_mozilla_hwnds(include_hidden=True)
+        new_hwnds = now - before
+        for hwnd in new_hwnds:
+            if _win_place_hwnd(hwnd, x, y, w, h, hide=hide):
+                moved += 1
+        if moved:
+            return moved
+        time.sleep(delay_s)
+    return moved
+
+
+def _seed_firefox_xulstore(
+    user_data_dir: str,
+    *,
+    x: int,
+    y: int,
+    w: int,
+    h: int,
+) -> None:
+    """Pre-seed Firefox profile so the first chrome window opens off-screen."""
+    if not user_data_dir:
+        return
+    try:
+        os.makedirs(user_data_dir, exist_ok=True)
+        payload = {
+            "chrome://browser/content/browser.xhtml": {
+                "main-window": {
+                    "screenX": str(int(x)),
+                    "screenY": str(int(y)),
+                    "width": str(int(w)),
+                    "height": str(int(h)),
+                    "sizemode": "normal",
+                }
+            },
+            # Older chrome URL still checked by some Firefox builds.
+            "chrome://browser/content/browser.xul": {
+                "main-window": {
+                    "screenX": str(int(x)),
+                    "screenY": str(int(y)),
+                    "width": str(int(w)),
+                    "height": str(int(h)),
+                    "sizemode": "normal",
+                }
+            },
+        }
+        path = os.path.join(user_data_dir, "xulstore.json")
+        Path(path).write_text(json.dumps(payload), encoding="utf-8")
+    except Exception:
+        pass
+
+
+def apply_window_placement(opts: "ChromiumOptions", before_hwnds: set[int] | None = None) -> None:
+    """Apply off-screen (or configured) window position after Camoufox launch."""
+    if opts is None:
+        return
+    pos = getattr(opts, "_window_position", None)
+    if not pos:
+        return
+    try:
+        x, y = int(pos[0]), int(pos[1])
+    except Exception:
+        return
+    size = getattr(opts, "_window", None)
+    w = int(size[0]) if size and len(size) >= 2 else None
+    h = int(size[1]) if size and len(size) >= 2 else None
+
+    if os.name == "nt":
+        base = before_hwnds if before_hwnds is not None else set()
+        # hide=True: no visible desktop window (offscreen mode without flash).
+        _place_new_browser_windows(base, x=x, y=y, w=w, h=h, hide=True)
+        return
+
+    # Best-effort on non-Windows (often ignored by browsers for the main window).
+    # Call sites can still pass size via Camoufox `window=`.
+
+
 # ── ChromiumOptions compatibility ─────────────────────────────────────
 class ChromiumOptions:
     """Drop-in replacement for DrissionPage's ChromiumOptions.
@@ -545,6 +734,10 @@ class ChromiumOptions:
         self._geoip: bool | str | None = None
         self._os: str | list[str] | None = "windows"
         self._window: tuple[int, int] | None = None
+        # Real desktop position (x, y); applied post-launch via OS APIs.
+        self._window_position: tuple[int, int] | None = None
+        # Extra Firefox prefs merged into launch (e.g. reduce bg timer throttling).
+        self._firefox_user_prefs: dict[str, Any] = {}
 
     def auto_port(self):
         return self
@@ -554,10 +747,26 @@ class ChromiumOptions:
         return self
 
     def set_argument(self, flag: str):
-        # Camoufox/Firefox ignores most Chromium flags; keep only proxy-server.
+        # Camoufox/Firefox ignores most Chromium flags; translate a useful subset.
         f = (flag or "").strip()
         if f.startswith("--proxy-server="):
             self._proxy = f.split("=", 1)[1].strip() or self._proxy
+        elif f.startswith("--window-position="):
+            raw = f.split("=", 1)[1].strip().replace(" ", "")
+            parts = raw.split(",")
+            if len(parts) == 2:
+                try:
+                    self._window_position = (int(parts[0]), int(parts[1]))
+                except Exception:
+                    pass
+        elif f.startswith("--window-size="):
+            raw = f.split("=", 1)[1].strip().replace(" ", "")
+            parts = raw.split(",")
+            if len(parts) == 2:
+                try:
+                    self._window = (int(parts[0]), int(parts[1]))
+                except Exception:
+                    pass
         self._flags.append(flag)
         return self
 
@@ -608,6 +817,30 @@ class ChromiumOptions:
 
     def set_os(self, os_name: str | list[str] | None = "windows"):
         self._os = os_name
+        return self
+
+    def set_window(self, size: tuple[int, int] | None):
+        """Outer window size (width, height) for Camoufox `window=`."""
+        if size is None:
+            self._window = None
+            return self
+        try:
+            self._window = (int(size[0]), int(size[1]))
+        except Exception:
+            pass
+        return self
+
+    def set_window_position(self, x: int, y: int):
+        """Desktop position applied after launch (not a Firefox CLI flag)."""
+        try:
+            self._window_position = (int(x), int(y))
+        except Exception:
+            pass
+        return self
+
+    def set_firefox_pref(self, key: str, value: Any):
+        if key:
+            self._firefox_user_prefs[str(key)] = value
         return self
 
     @property
@@ -669,6 +902,24 @@ class ChromiumOptions:
             os.makedirs(self._user_data_path, exist_ok=True)
             kw["persistent_context"] = True
             kw["user_data_dir"] = self._user_data_path
+
+        # Merge firefox prefs (background-timer relief when window is off-screen).
+        prefs = dict(self._firefox_user_prefs) if self._firefox_user_prefs else {}
+        if self._window_position is not None:
+            # Off-screen / background windows get aggressive timer throttling in
+            # Firefox; loosen it so register polling / humanize delays stay sane.
+            prefs.setdefault("dom.min_background_timeout_value", 4)
+            prefs.setdefault("dom.min_background_timeout_value_without_budget_throttling", 4)
+            prefs.setdefault("dom.timeout.background_budget_regeneration_rate", 1000)
+            prefs.setdefault("dom.timeout.background_throttling_max_budget", -1)
+        if prefs:
+            existing = kw.get("firefox_user_prefs")
+            if isinstance(existing, dict):
+                merged = dict(existing)
+                merged.update(prefs)
+                kw["firefox_user_prefs"] = merged
+            else:
+                kw["firefox_user_prefs"] = prefs
 
         return kw
 
@@ -1318,34 +1569,94 @@ def Chromium(opts: ChromiumOptions) -> PatchrightBrowser:
     kw = opts.to_camoufox_kwargs()
     persistent = bool(kw.pop("persistent_context", False))
     user_data_dir = kw.pop("user_data_dir", None)
+    is_headless = bool(kw.get("headless"))
+    need_place = bool(getattr(opts, "_window_position", None)) and not is_headless
 
     last_err: Exception | None = None
 
     for attempt in range(1, 5):
         try:
-            if persistent and user_data_dir:
-                context = NewBrowser(
-                    pw,
-                    persistent_context=True,
-                    user_data_dir=user_data_dir,
-                    **kw,
+            # Serialize launch+place so multi-thread workers don't steal each
+            # other's newly created HWNDs when placing off-screen windows.
+            with _window_place_lock:
+                before = (
+                    _win_enum_mozilla_hwnds(include_hidden=True) if need_place else set()
                 )
-                # persistent returns BrowserContext
-                if not context.pages:
-                    context.new_page()
-                return PatchrightBrowser(
-                    getattr(context, "browser", None) or context,
-                    context,
-                    opts,
-                    is_persistent_context=True,
-                )
+                if need_place and user_data_dir:
+                    pos = opts._window_position or (-2400, 100)
+                    size = opts._window or (1000, 800)
+                    _seed_firefox_xulstore(
+                        user_data_dir,
+                        x=int(pos[0]),
+                        y=int(pos[1]),
+                        w=int(size[0]),
+                        h=int(size[1]),
+                    )
 
-            browser = NewBrowser(pw, **kw)
-            # Prefer a single shared context (multi-tab like Chromium)
-            context = browser.new_context()
-            if not context.pages:
-                context.new_page()
-            return PatchrightBrowser(browser, context, opts, is_persistent_context=False)
+                # While NewBrowser blocks, race-hide any new Mozilla windows so
+                # offscreen mode barely flashes (headless mode needs no watcher).
+                stop_watch = threading.Event()
+                watch_thread: threading.Thread | None = None
+                if need_place:
+
+                    def _watch():
+                        pos = opts._window_position or (-2400, 100)
+                        size = opts._window or (1000, 800)
+                        while not stop_watch.is_set():
+                            _place_new_browser_windows(
+                                before,
+                                x=int(pos[0]),
+                                y=int(pos[1]),
+                                w=int(size[0]),
+                                h=int(size[1]),
+                                retries=1,
+                                delay_s=0.0,
+                                hide=True,
+                            )
+                            time.sleep(0.01)
+
+                    watch_thread = threading.Thread(
+                        target=_watch, name="camoufox-win-place", daemon=True
+                    )
+                    watch_thread.start()
+
+                try:
+                    if persistent and user_data_dir:
+                        context = NewBrowser(
+                            pw,
+                            persistent_context=True,
+                            user_data_dir=user_data_dir,
+                            **kw,
+                        )
+                        # persistent returns BrowserContext
+                        if not context.pages:
+                            context.new_page()
+                        browser_wrap = PatchrightBrowser(
+                            getattr(context, "browser", None) or context,
+                            context,
+                            opts,
+                            is_persistent_context=True,
+                        )
+                    else:
+                        browser = NewBrowser(pw, **kw)
+                        # Prefer a single shared context (multi-tab like Chromium)
+                        context = browser.new_context()
+                        if not context.pages:
+                            context.new_page()
+                        browser_wrap = PatchrightBrowser(
+                            browser, context, opts, is_persistent_context=False
+                        )
+                finally:
+                    if watch_thread is not None:
+                        stop_watch.set()
+                        try:
+                            watch_thread.join(timeout=1.0)
+                        except Exception:
+                            pass
+
+                if need_place:
+                    apply_window_placement(opts, before_hwnds=before)
+                return browser_wrap
         except Exception as exc:
             last_err = exc
             time.sleep(min(1.5 * attempt, 4.0))
