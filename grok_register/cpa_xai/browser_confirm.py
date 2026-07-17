@@ -585,57 +585,23 @@ def _fill(page: Any, selector: str, value: str, log: LogFn, label: str = "field"
 
 
 def _wait_turnstile(page: Any, log: LogFn, timeout: float = 45.0) -> bool:
-    """Wait/click Cloudflare Turnstile using Playwright-native frame locators only."""
+    """Wait/click Cloudflare Turnstile via coordinate mouse click (Camoufox pattern)."""
+    from grok_register.browser_adapter import (
+        click_turnstile_checkbox,
+        turnstile_token_len,
+    )
+
     pw_page = page._p
     deadline = time.time() + timeout
-    clicked = False
     while time.time() < deadline:
+        n = turnstile_token_len(pw_page)
+        if n > 20:
+            log(f"turnstile ready len={n}")
+            return True
         try:
-            val = pw_page.evaluate(
-                """() => {
-                    var el = document.querySelector('input[name="cf-turnstile-response"]');
-                    return (el && el.value) || '';
-                }"""
-            )
-            v = (val or "").strip()
-            if len(v) > 20:
-                log(f"turnstile ready len={len(v)}")
-                return True
-        except Exception:
-            pass
-
-        try:
-            frame = pw_page.frame_locator(
-                'iframe[src*="challenges.cloudflare.com"], iframe[src*="turnstile"]'
-            )
-            cb = frame.locator(
-                '#checkbox, input[type="checkbox"], .mark, [role="checkbox"]'
-            )
-            if cb.count() > 0:
-                _sleep(0.25)
-                try:
-                    cb.first.scroll_into_view_if_needed(timeout=2000)
-                except Exception:
-                    pass
-                _sleep(0.15)
-                cb.first.click(timeout=4000)
-                clicked = True
-                log("clicked turnstile checkbox via Playwright native")
-        except Exception:
-            pass
-
-        if not clicked:
-            try:
-                widget = pw_page.locator(
-                    'iframe[src*="challenges.cloudflare.com"], iframe[src*="turnstile"], div.cf-turnstile'
-                )
-                if widget.count() > 0:
-                    _sleep(0.2)
-                    widget.first.click(timeout=2500)
-                    clicked = True
-                    log("clicked turnstile widget via Playwright native")
-            except Exception:
-                pass
+            click_turnstile_checkbox(pw_page, log=log)
+        except Exception as e:
+            log(f"turnstile click err: {e}")
         _sleep(0.9)
     log("turnstile not ready")
     return False

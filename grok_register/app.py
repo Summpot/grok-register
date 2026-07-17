@@ -59,7 +59,14 @@ def safe_print(*args, **kwargs):
             if kwargs.get("flush"):
                 stream.flush()
 
-from grok_register.browser_adapter import Chromium, ChromiumOptions, PageDisconnectedError
+from grok_register.browser_adapter import (
+    Chromium,
+    ChromiumOptions,
+    PageDisconnectedError,
+    click_turnstile_checkbox,
+    find_turnstile_boxes,
+    turnstile_token_len,
+)
 from curl_cffi import requests as curl_requests
 import requests as std_requests
 
@@ -3050,10 +3057,11 @@ def fill_code_and_submit(
 
 
 def getTurnstileToken(log_callback=None, cancel_callback=None):
-    """Wait for Cloudflare Turnstile via Playwright-native iframe click only.
+    """Wait for Cloudflare Turnstile by mouse-clicking the visible checkbox.
 
-    No init-script patching, no forced token injection — Camoufox + disable_coop
-    lets the real checkbox be clicked; we only poll for the natural response.
+    Camoufox-recommended path: disable_coop + coordinate mouse.click on the
+    widget (Turnstile sits in cross-origin iframe / shadow DOM, so frame_locator
+    often cannot see #checkbox even when the box is clearly visible).
     """
     # thread-local page/browser (multi-thread safe)
     page = _tls_get_page()
@@ -3070,61 +3078,75 @@ def getTurnstileToken(log_callback=None, cancel_callback=None):
         raise Exception("页面未就绪，无法执行 Turnstile")
 
     pw_page = page._p
-    clicked_once = False
+    last_diag = 0.0
 
-    for attempt in range(0, 40):
+    def _log(msg: str) -> None:
+        if log_callback:
+            log_callback(msg)
+
+    for attempt in range(0, 45):
         raise_if_cancelled(cancel_callback)
-        try:
-            token = pw_page.evaluate(
-                """() => {
-                    var el = document.querySelector('input[name="cf-turnstile-response"]');
-                    return (el && el.value) || '';
-                }"""
-            )
-            token = str(token or "").strip()
-            if len(token) >= 80:
-                if log_callback:
-                    log_callback(f"[*] Turnstile 已通过，token长度={len(token)}")
-                return token
-        except Exception:
-            pass
 
-        # Playwright-native click on checkbox inside Turnstile iframe
-        try:
-            frame = pw_page.frame_locator(
-                'iframe[src*="challenges.cloudflare.com"], iframe[src*="turnstile"]'
-            )
-            checkbox = frame.locator(
-                '#checkbox, input[type="checkbox"], .mark, [role="checkbox"]'
-            )
-            if checkbox.count() > 0:
-                _human_pause_cancel(0.25, 0.7, cancel_callback)
-                try:
-                    checkbox.first.scroll_into_view_if_needed(timeout=2000)
-                except Exception:
-                    pass
-                _human_pause_cancel(0.15, 0.4, cancel_callback)
-                checkbox.first.click(timeout=4000)
-                clicked_once = True
-                if log_callback and attempt % 6 == 0:
-                    log_callback("[*] 已原生点击 Turnstile 复选框，等待通过...")
-        except Exception:
-            pass
-
-        # Also try clicking the visible widget / iframe on the main page
-        if not clicked_once or attempt % 5 == 0:
+        n = turnstile_token_len(pw_page)
+        if n >= 80:
+            # read full token for return
             try:
-                widget = pw_page.locator(
-                    'iframe[src*="challenges.cloudflare.com"], iframe[src*="turnstile"], div.cf-turnstile'
+                token = pw_page.evaluate(
+                    """() => {
+                        var el = document.querySelector('input[name="cf-turnstile-response"]');
+                        return (el && el.value) || '';
+                    }"""
                 )
-                if widget.count() > 0:
-                    _human_pause_cancel(0.2, 0.5, cancel_callback)
-                    widget.first.click(timeout=2500, force=False)
-                    clicked_once = True
+                token = str(token or "").strip()
             except Exception:
-                pass
+                token = ""
+            if len(token) >= 80:
+                _log(f"[*] Turnstile 已通过，token长度={len(token)}")
+                return token
 
-        _human_pause_cancel(0.55, 1.1, cancel_callback)
+        # Coordinate / frame mouse click (primary)
+        def _click_log(msg: str) -> None:
+            if attempt % 4 == 0 or "mouse click @" in msg:
+                _log(f"[*] {msg}")
+
+        try:
+            ok = click_turnstile_checkbox(pw_page, log=_click_log)
+            if ok and attempt % 5 == 0:
+                _log("[*] 已尝试点击 Turnstile 复选框，等待通过...")
+        except Exception as exc:
+            if attempt % 6 == 0:
+                _log(f"[Debug] Turnstile 点击异常: {exc}")
+
+        now = time.time()
+        if log_callback and now - last_diag >= 4.0:
+            last_diag = now
+            boxes = find_turnstile_boxes(pw_page)
+            if boxes:
+                b0 = boxes[0]
+                _log(
+                    f"[Debug] Turnstile 可见部件 n={len(boxes)} "
+                    f"kind={b0.get('kind')} size={b0.get('width'):.0f}x{b0.get('height'):.0f} "
+                    f"@({b0.get('x'):.0f},{b0.get('y'):.0f}) token_len={n}"
+                )
+            else:
+                # Fall back: list iframes for diagnosis
+                try:
+                    info = pw_page.evaluate(
+                        """() => {
+                            const ifr = Array.from(document.querySelectorAll('iframe')).slice(0, 6).map(f => ({
+                                src: String(f.src||'').slice(0,120),
+                                w: f.getBoundingClientRect().width,
+                                h: f.getBoundingClientRect().height,
+                            }));
+                            const frames = (window.frames && window.frames.length) || 0;
+                            return {ifr, frames, hasInput: !!document.querySelector('input[name="cf-turnstile-response"]')};
+                        }"""
+                    )
+                    _log(f"[Debug] 未解析到 Turnstile bbox，diag={info} token_len={n}")
+                except Exception as de:
+                    _log(f"[Debug] 未解析到 Turnstile bbox token_len={n} err={de}")
+
+        _human_pause_cancel(0.7, 1.3, cancel_callback)
 
     raise Exception("Turnstile 获取 token 失败")
 

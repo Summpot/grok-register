@@ -61,6 +61,410 @@ def human_type_delay_ms() -> int:
     return random.randint(35, 115)
 
 
+# ── Turnstile: shadow-pierce bbox + mouse click (Camoufox recommended) ──
+#
+# Turnstile checkbox lives in a cross-origin iframe, often under open/closed
+# shadow roots. frame_locator('#checkbox') frequently finds nothing even when
+# the box is visible. Camoufox docs solve this with disable_coop + mouse.click
+# at the widget coordinates.
+
+_TURNSTILE_BBOX_JS = """
+() => {
+    const out = [];
+    const seen = new Set();
+
+    function pushRect(el, kind) {
+        try {
+            const r = el.getBoundingClientRect();
+            if (!r || r.width < 12 || r.height < 12) return;
+            if (r.bottom < 0 || r.right < 0) return;
+            if (r.top > (window.innerHeight || 2000) + 40) return;
+            const key = [
+                Math.round(r.x), Math.round(r.y),
+                Math.round(r.width), Math.round(r.height), kind
+            ].join(',');
+            if (seen.has(key)) return;
+            seen.add(key);
+            out.push({
+                x: r.x,
+                y: r.y,
+                width: r.width,
+                height: r.height,
+                kind: kind,
+                tag: String(el.tagName || '').toLowerCase(),
+            });
+        } catch (e) {}
+    }
+
+    function isCfIframe(el) {
+        const src = String(el.src || el.getAttribute('src') || '');
+        const name = String(el.name || el.getAttribute('name') || '');
+        const title = String(el.title || el.getAttribute('title') || '');
+        const id = String(el.id || '');
+        const hay = (src + ' ' + name + ' ' + title + ' ' + id).toLowerCase();
+        return (
+            hay.includes('challenges.cloudflare.com')
+            || hay.includes('turnstile')
+            || hay.includes('cf-chl')
+            || hay.includes('cf-turnstile')
+        );
+    }
+
+    function walk(root) {
+        if (!root || !root.querySelectorAll) return;
+        try {
+            for (const el of root.querySelectorAll(
+                'div.cf-turnstile, .cf-turnstile, [data-sitekey], [data-callback]'
+            )) {
+                pushRect(el, 'widget');
+            }
+            for (const el of root.querySelectorAll('iframe')) {
+                if (isCfIframe(el)) pushRect(el, 'iframe');
+            }
+            // Some hosts only expose a small wrapper around the shadow/iframe
+            for (const el of root.querySelectorAll(
+                '[id*="cf-" i], [id*="turnstile" i], [class*="turnstile" i], [class*="cf-turnstile" i]'
+            )) {
+                pushRect(el, 'host');
+            }
+        } catch (e) {}
+        try {
+            for (const el of root.querySelectorAll('*')) {
+                if (el.shadowRoot) walk(el.shadowRoot);
+            }
+        } catch (e) {}
+    }
+
+    walk(document);
+    // Prefer real iframes / widgets over generic hosts
+    const rank = { iframe: 0, widget: 1, host: 2 };
+    out.sort((a, b) => {
+        const ra = rank[a.kind] ?? 9;
+        const rb = rank[b.kind] ?? 9;
+        if (ra !== rb) return ra - rb;
+        return (a.y - b.y) || (a.x - b.x);
+    });
+    return out;
+}
+"""
+
+
+def _checkbox_point_from_box(box: dict[str, Any]) -> tuple[float, float]:
+    """Map widget bbox → typical Turnstile checkbox center (left side of widget)."""
+    x = float(box.get("x") or 0)
+    y = float(box.get("y") or 0)
+    w = float(box.get("width") or 0)
+    h = float(box.get("height") or 0)
+    # Checkbox is a ~28px circle near the left edge, vertically centered.
+    cx = x + min(28.0, max(14.0, w * 0.10)) + random.uniform(-2.5, 2.5)
+    cy = y + h * 0.5 + random.uniform(-3.0, 3.0)
+    return cx, cy
+
+
+def mouse_click_xy(pw_page: Any, x: float, y: float) -> None:
+    """Human-ish mouse move + click at viewport coordinates."""
+    # Start from a nearby random offset if possible, then ease in.
+    try:
+        sx = max(0.0, x + random.uniform(-80, 40))
+        sy = max(0.0, y + random.uniform(-40, 40))
+        pw_page.mouse.move(sx, sy, steps=random.randint(4, 10))
+        human_pause(0.04, 0.12)
+    except Exception:
+        pass
+    pw_page.mouse.move(x, y, steps=random.randint(10, 24))
+    human_pause(0.06, 0.18)
+    # delay = hold time before mouseup (ms)
+    try:
+        pw_page.mouse.click(x, y, delay=random.randint(45, 140))
+    except TypeError:
+        pw_page.mouse.click(x, y)
+    human_pause(0.12, 0.35)
+
+
+def find_turnstile_boxes(pw_page: Any) -> list[dict[str, Any]]:
+    """Return visible Turnstile widget/iframe bboxes.
+
+    Combines:
+      - JS walk through open shadow roots
+      - Playwright frame.frame_element().bounding_box() for closed-shadow iframes
+        (page.frames still lists them even when querySelector cannot)
+    """
+    boxes: list[dict[str, Any]] = []
+    try:
+        raw = pw_page.evaluate(_TURNSTILE_BBOX_JS)
+        if isinstance(raw, list):
+            boxes.extend(b for b in raw if isinstance(b, dict))
+    except Exception:
+        pass
+
+    # Closed shadow / cross-origin: recover iframe geometry via frame handles
+    try:
+        for fr in list(getattr(pw_page, "frames", []) or []):
+            try:
+                url = (fr.url or "").lower()
+            except Exception:
+                url = ""
+            if not any(
+                k in url
+                for k in ("cloudflare", "turnstile", "challenges", "cf-chl", "cdn-cgi")
+            ):
+                continue
+            try:
+                # main_frame is the page itself — skip
+                if fr == pw_page.main_frame:
+                    continue
+            except Exception:
+                pass
+            try:
+                fe = fr.frame_element()
+                if not fe:
+                    continue
+                bb = fe.bounding_box()
+                if not bb or bb.get("width", 0) < 12 or bb.get("height", 0) < 12:
+                    continue
+                boxes.append(
+                    {
+                        "x": bb["x"],
+                        "y": bb["y"],
+                        "width": bb["width"],
+                        "height": bb["height"],
+                        "kind": "iframe",
+                        "tag": "iframe",
+                        "frame_url": url[:120],
+                    }
+                )
+            except Exception:
+                continue
+    except Exception:
+        pass
+
+    # Dedupe near-identical boxes
+    deduped: list[dict[str, Any]] = []
+    seen: set[tuple[int, int, int, int]] = set()
+    for b in boxes:
+        key = (
+            int(round(float(b.get("x", 0)))),
+            int(round(float(b.get("y", 0)))),
+            int(round(float(b.get("width", 0)))),
+            int(round(float(b.get("height", 0)))),
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(b)
+
+    rank = {"iframe": 0, "widget": 1, "host": 2}
+    deduped.sort(
+        key=lambda b: (
+            rank.get(str(b.get("kind")), 9),
+            float(b.get("y") or 0),
+            float(b.get("x") or 0),
+        )
+    )
+    return deduped
+
+
+def click_turnstile_checkbox(pw_page: Any, *, log: Any | None = None) -> bool:
+    """Attempt to click the Cloudflare Turnstile checkbox.
+
+    Strategy (in order):
+      1. Mouse click at checkbox coordinates from shadow-piercing bbox
+         (Camoufox official pattern for disable_coop)
+      2. Playwright frame API: page.frames + locator('#checkbox')
+      3. frame_locator / main-page iframe locator click
+
+    Returns True if at least one click strategy ran without hard failure.
+    """
+    clicked = False
+    log_fn = log if callable(log) else None
+
+    # Ensure any candidate is scrolled into view first (main document only).
+    try:
+        pw_page.evaluate(
+            """() => {
+                const sels = [
+                  'iframe[src*="challenges.cloudflare.com"]',
+                  'iframe[src*="turnstile"]',
+                  'div.cf-turnstile',
+                  '[data-sitekey]',
+                ];
+                for (const s of sels) {
+                    const el = document.querySelector(s);
+                    if (el) { el.scrollIntoView({block:'center', inline:'center'}); return true; }
+                }
+                // shadow walk scroll
+                function walk(root) {
+                    if (!root || !root.querySelectorAll) return false;
+                    for (const el of root.querySelectorAll('iframe, div.cf-turnstile, [data-sitekey]')) {
+                        const src = String(el.src || el.getAttribute('src') || el.className || '');
+                        if (/cloudflare|turnstile|cf-turnstile|data-sitekey/i.test(src + el.outerHTML.slice(0,200))) {
+                            try { el.scrollIntoView({block:'center', inline:'center'}); return true; } catch(e) {}
+                        }
+                    }
+                    for (const el of root.querySelectorAll('*')) {
+                        if (el.shadowRoot && walk(el.shadowRoot)) return true;
+                    }
+                    return false;
+                }
+                return walk(document);
+            }"""
+        )
+        human_pause(0.15, 0.35)
+    except Exception:
+        pass
+
+    # 1) Coordinate mouse click (most reliable with Camoufox)
+    boxes = find_turnstile_boxes(pw_page)
+    if boxes:
+        # Prefer first iframe/widget; if that fails, try next distinct box
+        tried_pts: set[tuple[int, int]] = set()
+        for box in boxes[:3]:
+            try:
+                cx, cy = _checkbox_point_from_box(box)
+                key = (int(cx // 5), int(cy // 5))
+                if key in tried_pts:
+                    continue
+                tried_pts.add(key)
+                if log_fn:
+                    log_fn(
+                        f"turnstile mouse click @ ({cx:.0f},{cy:.0f}) "
+                        f"box={box.get('kind')}:{box.get('width'):.0f}x{box.get('height'):.0f}"
+                    )
+                mouse_click_xy(pw_page, cx, cy)
+                clicked = True
+                # One solid click is enough; avoid multi-widget spam
+                return True
+            except Exception as exc:
+                if log_fn:
+                    log_fn(f"turnstile mouse click failed: {exc}")
+
+    # 2) Direct frame handles — only Cloudflare/turnstile frames, never main doc body
+    try:
+        for fr in list(getattr(pw_page, "frames", []) or []):
+            try:
+                url = (fr.url or "").lower()
+            except Exception:
+                url = ""
+            is_cf = any(
+                k in url
+                for k in ("cloudflare", "turnstile", "challenges", "cf-chl", "cdn-cgi")
+            )
+            # Skip top-level page frame unless URL itself is a challenge page
+            try:
+                if fr == pw_page.main_frame and not is_cf:
+                    continue
+            except Exception:
+                if not is_cf:
+                    continue
+            if not is_cf:
+                # Non-CF child frame: only attempt real checkbox selectors
+                sels = (
+                    "#checkbox",
+                    'input[type="checkbox"]',
+                    ".mark",
+                    '[role="checkbox"]',
+                )
+            else:
+                sels = (
+                    "#checkbox",
+                    'input[type="checkbox"]',
+                    ".mark",
+                    '[role="checkbox"]',
+                    "label.cb-lb",
+                    "label",
+                )
+            for sel in sels:
+                try:
+                    loc = fr.locator(sel)
+                    if loc.count() <= 0:
+                        continue
+                    target = loc.first
+                    try:
+                        if not target.is_visible(timeout=400):
+                            continue
+                    except Exception:
+                        pass
+                    human_pause(0.1, 0.25)
+                    target.click(timeout=3000, force=True)
+                    clicked = True
+                    if log_fn:
+                        log_fn(f"turnstile frame click sel={sel!r} url={url[:80]}")
+                    return True
+                except Exception:
+                    continue
+    except Exception:
+        pass
+
+    # 3) frame_locator checkbox (when accessible)
+    try:
+        frame = pw_page.frame_locator(
+            'iframe[src*="challenges.cloudflare.com"], iframe[src*="turnstile"]'
+        )
+        for sel in ("#checkbox", 'input[type="checkbox"]', ".mark", '[role="checkbox"]'):
+            try:
+                cb = frame.locator(sel)
+                if cb.count() > 0:
+                    human_pause(0.1, 0.25)
+                    cb.first.click(timeout=3000, force=True)
+                    clicked = True
+                    if log_fn:
+                        log_fn(f"turnstile frame_locator click sel={sel!r}")
+                    return True
+            except Exception:
+                continue
+    except Exception:
+        pass
+
+    # 4) Locator bounding_box → mouse (pierces some open shadow via CSS)
+    try:
+        widget = pw_page.locator(
+            'iframe[src*="challenges.cloudflare.com"], iframe[src*="turnstile"], div.cf-turnstile, [data-sitekey]'
+        )
+        n = widget.count()
+        for i in range(min(n, 4)):
+            cand = widget.nth(i)
+            try:
+                if not cand.is_visible(timeout=300):
+                    continue
+                bb = cand.bounding_box()
+                if not bb or bb.get("width", 0) < 12:
+                    continue
+                cx = bb["x"] + min(28.0, bb["width"] * 0.1) + random.uniform(-2, 2)
+                cy = bb["y"] + bb["height"] * 0.5 + random.uniform(-2, 2)
+                mouse_click_xy(pw_page, cx, cy)
+                clicked = True
+                if log_fn:
+                    log_fn(f"turnstile locator bbox click ({cx:.0f},{cy:.0f})")
+                return True
+            except Exception:
+                try:
+                    cand.click(timeout=2000, force=True, position={"x": 25, "y": 30})
+                    clicked = True
+                    if log_fn:
+                        log_fn("turnstile locator position click")
+                    return True
+                except Exception:
+                    continue
+    except Exception:
+        pass
+
+    return clicked
+
+
+def turnstile_token_len(pw_page: Any) -> int:
+    """Length of input[name=cf-turnstile-response] value, or 0."""
+    try:
+        token = pw_page.evaluate(
+            """() => {
+                const el = document.querySelector('input[name="cf-turnstile-response"]');
+                return (el && el.value) || '';
+            }"""
+        )
+        return len(str(token or "").strip())
+    except Exception:
+        return 0
+
+
 # ── Error compatibility ───────────────────────────────────────────────
 class PageDisconnectedError(Exception):
     pass
