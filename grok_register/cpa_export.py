@@ -226,18 +226,5 @@ def export_cpa_xai_for_account(
             f.write(f"{email}----{result.get('error') or 'unknown'}----{int(time.time())}\n")
         if cfg.get("cpa_mint_required", False):
             raise RuntimeError(f"CPA mint required but failed: {result.get('error')}")
-    elif result.get("path") and cfg.get("sub2api_export_enabled", True):
-        try:
-            from grok_register import cpa_to_sub2api
-
-            sub_res = cpa_to_sub2api.export_after_cpa_result(
-                result,
-                config=cfg,
-                log_callback=log,
-            )
-            result["sub2api"] = sub_res
-        except Exception as e:  # noqa: BLE001
-            log(f"[sub2api] export failed: {e}")
-            result["sub2api_error"] = str(e)
 
     return result

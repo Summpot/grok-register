@@ -5,7 +5,6 @@ This package intentionally excludes local/private runtime data:
 - output/accounts_*.txt
 - output/mail_credentials.txt
 - output/cpa_auths/
-- output/sub2api_exports/
 - .venv/
 - __pycache__/
 - gui_crash.log

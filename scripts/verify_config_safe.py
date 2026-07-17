@@ -56,14 +56,11 @@ def main() -> int:
         "register_count",
         "max_mail_retry",
         "code_poll_timeout",
-        "cpa_export_enabled",
-        "cpa_auth_dir",
-        "cpa_base_url",
-        "sub2api_export_enabled",
-        "sub2api_combined_file",
+        "grok2api_auto_add_local",
         "grok2api_auto_add_remote",
+        "grok2api_auto_add_build",
         "grok2api_remote_base",
-        "cpa_cloud_upload_enabled",
+        "grok2api_remote_mode",
     ]
     for key in keys:
         print(f"{key}:", config.get(key))
@@ -71,7 +68,7 @@ def main() -> int:
     print("cloudflare_api_key:", mask(config.get("cloudflare_api_key")))
     print("yyds_api_key:", mask(config.get("yyds_api_key")))
     print("grok2api_remote_app_key:", mask(config.get("grok2api_remote_app_key")))
-    print("cpa_cloud_management_key:", mask(config.get("cpa_cloud_management_key")))
+    print("grok2api_remote_password:", mask(config.get("grok2api_remote_password")))
 
     if args.probe_mail:
         _probe_mail(config)
