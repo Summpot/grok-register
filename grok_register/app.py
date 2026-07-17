@@ -2218,10 +2218,55 @@ def _bind_thread_browser_globals():
 
 
 def _sync_thread_browser_globals():
-    """Save module globals browser/page into thread-local storage."""
+    """Mirror module globals into TLS only when safe.
+
+    Never overwrite this thread's TLS browser with another thread's object.
+    Multi-thread code should prefer _tls_set_* on local objects; module
+    globals are a best-effort legacy mirror for single-thread GUI paths.
+    """
     global browser, page
-    _tls_set_browser(browser)
-    _tls_set_page(page)
+    tls_b = _tls_get_browser()
+    tls_p = _tls_get_page()
+    if browser is not None and (tls_b is None or browser is tls_b):
+        _tls_set_browser(browser)
+    elif browser is None and tls_b is None:
+        pass
+    if page is not None and (tls_p is None or page is tls_p):
+        _tls_set_page(page)
+
+
+def _mirror_thread_browser_globals(b, p):
+    """Best-effort module-global mirror; TLS remains source of truth.
+
+    Pass explicit values (including None) — never fall back to another
+    thread's module-global state.
+    """
+    global browser, page
+    browser = b
+    page = p
+    return browser, page
+
+
+def _is_playwright_thread_error(exc: BaseException) -> bool:
+    """True when Playwright sync objects are used off their creating thread."""
+    msg = str(exc) if exc is not None else ""
+    if "Cannot switch to a different thread" in msg:
+        return True
+    mod = (getattr(type(exc), "__module__", "") or "").lower()
+    if "greenlet" in mod and "thread" in msg.lower():
+        return True
+    return False
+
+
+def _ensure_thread_browser(log_callback=None, *, force_restart: bool = False):
+    """Return (browser, page) owned by the current thread."""
+    if force_restart:
+        return restart_browser(log_callback=log_callback)
+    browser = _tls_get_browser()
+    page = _tls_get_page()
+    if browser is None or page is None:
+        return start_browser(log_callback=log_callback)
+    return browser, page
 
 
 browser = None
@@ -2331,12 +2376,13 @@ def tk_option_menu(parent, variable, values, width=12):
 
 
 def start_browser(log_callback=None):
-    global browser, page
-    # Never leave a previous thread-local Chromium alive when opening a new one.
+    # TLS is the source of truth. Module globals are only a legacy mirror —
+    # never read them back into TLS (that races across register workers and
+    # causes: greenlet.error: Cannot switch to a different thread).
     try:
         existing = _tls_get_browser()
     except Exception:
-        existing = browser
+        existing = None
     if existing is not None:
         try:
             stop_browser()
@@ -2349,6 +2395,9 @@ def start_browser(log_callback=None):
         pass
     last_exc = None
     for attempt in range(1, 5):
+        new_browser = None
+        new_page = None
+        _auto_port = None
         try:
             try:
                 opts = create_browser_options(unique_profile=True, profile_tag="reg")
@@ -2361,28 +2410,29 @@ def start_browser(log_callback=None):
                 or getattr(opts, '_address', None)
                 or ''
             )
-            _auto_port = None
             if ':' in str(_auto_addr):
                 try:
                     _auto_port = int(str(_auto_addr).rsplit(':', 1)[-1])
                 except (ValueError, IndexError):
                     _auto_port = None
-            browser = Chromium(opts)
-            tabs = browser.get_tabs()
-            page = tabs[-1] if tabs else browser.new_tab()
-            _sync_thread_browser_globals()
-            if log_callback and getattr(browser, "user_data_path", None):
-                log_callback(f"[Debug] 当前浏览器资料目录: {browser.user_data_path}")
+            new_browser = Chromium(opts)
+            tabs = new_browser.get_tabs()
+            new_page = tabs[-1] if tabs else new_browser.new_tab()
+            _tls_set_browser(new_browser)
+            _tls_set_page(new_page)
+            _mirror_thread_browser_globals(new_browser, new_page)
+            if log_callback and getattr(new_browser, "user_data_path", None):
+                log_callback(f"[Debug] 当前浏览器资料目录: {new_browser.user_data_path}")
             if log_callback and attempt > 1:
                 log_callback(f"[*] 浏览器第 {attempt} 次启动成功")
-            return browser, page
+            return new_browser, new_page
         except Exception as exc:
             last_exc = exc
             if log_callback:
                 log_callback(f"[Debug] 浏览器启动失败(第{attempt}/4次): {exc}")
             try:
-                if browser is not None:
-                    browser.quit(del_data=True)
+                if new_browser is not None:
+                    new_browser.quit(del_data=True)
                 elif _auto_port is not None:
                     # Chromium() constructor spawned Chrome but failed to
                     # connect. Kill the orphan by its exact debug port so we
@@ -2392,38 +2442,46 @@ def start_browser(log_callback=None):
                             log_callback(f"[Debug] 已清理端口 {_auto_port} 上的孤儿 Chrome")
             except Exception:
                 pass
-            browser = None
-            page = None
-            _sync_thread_browser_globals()
+            # Clear only this thread's TLS. Do not wipe module globals —
+            # another worker may currently mirror its own browser there.
+            _tls_set_browser(None)
+            _tls_set_page(None)
             time.sleep(min(1.5 * attempt, 4))
     raise Exception(f"浏览器启动失败，已重试4次: {last_exc}")
 
 
 def stop_browser():
-    global browser, page
-    _bind_thread_browser_globals()
+    # Quit only THIS thread's browser. Do not funnel through module globals —
+    # concurrent workers race on those and can steal each other's objects.
+    b = _tls_get_browser()
+    p = _tls_get_page()
     _user_data_path = None
-    if browser is not None:
+    if b is not None:
         try:
-            _user_data_path = getattr(browser, "user_data_path", None)
+            _user_data_path = getattr(b, "user_data_path", None)
         except Exception:
             pass
         try:
-            browser.quit(del_data=True)
+            b.quit(del_data=True)
         except TypeError:
             try:
-                browser.quit()
+                b.quit()
             except Exception:
                 pass
         except Exception:
             try:
-                browser.quit()
+                b.quit()
             except Exception:
                 pass
-        _unregister_thread_browser(browser)
-    browser = None
-    page = None
-    _sync_thread_browser_globals()
+        _unregister_thread_browser(b)
+    _tls_set_browser(None)
+    _tls_set_page(None)
+    # Clear module globals only if they still point at this thread's objects.
+    global browser, page
+    if browser is b:
+        browser = None
+    if page is p:
+        page = None
     # Force-kill any Chrome still alive on this profile / auto port after quit
     if _user_data_path:
         try:
@@ -2443,8 +2501,8 @@ def prepare_browser_for_next_account(log_callback=None):
     When proxy pool rotates each account, restart browser so the new proxy
     (and auth extension) takes effect.
     """
-    global browser, page
-    _bind_thread_browser_globals()
+    browser = _tls_get_browser()
+    page = _tls_get_page()
     if config.get("proxy_pool_enabled") and config.get("proxy_pool_rotate_each_account", True):
         try:
             assign_thread_proxy(log_callback, force_new=True)
@@ -2484,11 +2542,14 @@ def prepare_browser_for_next_account(log_callback=None):
                     pass
         if log_callback:
             log_callback("[*] 浏览器会话已清理，准备下一账号")
-        _sync_thread_browser_globals()
         return True
     except Exception as exc:
         if log_callback:
             log_callback(f"[Debug] 会话清理失败，重启浏览器: {exc}")
+        if _is_playwright_thread_error(exc):
+            # Drop poisoned TLS ref before restart.
+            _tls_set_browser(None)
+            _tls_set_page(None)
         restart_browser(log_callback=log_callback)
         return False
 
@@ -2739,43 +2800,35 @@ def cleanup_runtime_memory(log_callback=None, reason="定期清理"):
 
 def refresh_active_page():
     # thread-local page/browser (multi-thread safe)
-    page = _tls_get_page()
-    _tls_set_page(page)
-    browser = _tls_get_browser()
-    _tls_set_browser(browser)
-    if page is None or browser is None:
-        start_browser()
-        page = _tls_get_page()
-        _tls_set_page(page)
-        browser = _tls_get_browser()
-        _tls_set_browser(browser)
-    if browser is None:
-        restart_browser()
+    browser, page = _ensure_thread_browser()
     try:
         tabs = browser.get_tabs()
         if tabs:
             page = tabs[-1]
-            _tls_set_page(page)
         else:
             page = browser.new_tab()
-            _tls_set_page(page)
-    except Exception:
-        restart_browser()
-    return page
+        _tls_set_page(page)
+        _mirror_thread_browser_globals(browser, page)
+        return page
+    except Exception as exc:
+        if _is_playwright_thread_error(exc):
+            _tls_set_browser(None)
+            _tls_set_page(None)
+        browser, page = restart_browser()
+        try:
+            tabs = browser.get_tabs() if browser is not None else []
+            page = tabs[-1] if tabs else (browser.new_tab() if browser is not None else None)
+            if page is not None:
+                _tls_set_page(page)
+            _mirror_thread_browser_globals(browser, page)
+        except Exception:
+            pass
+        return _tls_get_page()
 
 
 def click_email_signup_button(timeout=10, log_callback=None, cancel_callback=None):
     # thread-local page/browser (multi-thread safe)
-    page = _tls_get_page()
-    _tls_set_page(page)
-    browser = _tls_get_browser()
-    _tls_set_browser(browser)
-    if page is None or browser is None:
-        start_browser()
-        page = _tls_get_page()
-        _tls_set_page(page)
-        browser = _tls_get_browser()
-        _tls_set_browser(browser)
+    browser, page = _ensure_thread_browser(log_callback=log_callback)
     deadline = time.time() + timeout
     labels = [
         "使用邮箱注册",
@@ -2837,37 +2890,64 @@ def click_email_signup_button(timeout=10, log_callback=None, cancel_callback=Non
 
 def open_signup_page(log_callback=None, cancel_callback=None):
     # thread-local page/browser (multi-thread safe)
-    page = _tls_get_page()
-    _tls_set_page(page)
-    browser = _tls_get_browser()
-    _tls_set_browser(browser)
-    if page is None or browser is None:
-        start_browser()
-        page = _tls_get_page()
-        _tls_set_page(page)
-        browser = _tls_get_browser()
-        _tls_set_browser(browser)
+    browser, page = _ensure_thread_browser(log_callback=log_callback)
     raise_if_cancelled(cancel_callback)
     if browser is None:
-        start_browser()
+        browser, page = start_browser(log_callback=log_callback)
         if log_callback:
             log_callback("[*] 浏览器已启动")
+
+    def _navigate(b, p):
+        tab = None
+        try:
+            tab = b.get_tab(0) if b is not None else None
+        except Exception:
+            tab = None
+        if tab is None:
+            tab = b.new_tab(SIGNUP_URL) if b is not None else None
+            if tab is not None:
+                _tls_set_page(tab)
+                _mirror_thread_browser_globals(b, tab)
+            return tab
+        _tls_set_page(tab)
+        tab.get(SIGNUP_URL)
+        _mirror_thread_browser_globals(b, tab)
+        return tab
+
     try:
-        page = browser.get_tab(0)
-        _tls_set_page(page)
-        page.get(SIGNUP_URL)
+        page = _navigate(browser, page)
     except Exception as e:
         if log_callback:
             log_callback(f"[Debug] 打开URL异常: {e}")
-        try:
-            page = browser.new_tab(SIGNUP_URL)
-            _tls_set_page(page)
-        except Exception as e2:
-            if log_callback:
-                log_callback(f"[Debug] 创建新标签页异常: {e2}")
-            restart_browser()
-            page = browser.new_tab(SIGNUP_URL)
-            _tls_set_page(page)
+        # Cross-thread Playwright objects cannot be recovered in-place.
+        if _is_playwright_thread_error(e):
+            _tls_set_browser(None)
+            _tls_set_page(None)
+            browser, page = restart_browser(log_callback=log_callback)
+            page = _navigate(browser, page)
+        else:
+            try:
+                page = browser.new_tab(SIGNUP_URL)
+                _tls_set_page(page)
+                _mirror_thread_browser_globals(browser, page)
+            except Exception as e2:
+                if log_callback:
+                    log_callback(f"[Debug] 创建新标签页异常: {e2}")
+                if _is_playwright_thread_error(e2):
+                    _tls_set_browser(None)
+                    _tls_set_page(None)
+                browser, page = restart_browser(log_callback=log_callback)
+                # Must use the NEW browser from restart — never the stale local.
+                page = browser.new_tab(SIGNUP_URL)
+                _tls_set_page(page)
+                _mirror_thread_browser_globals(browser, page)
+
+    if page is None:
+        browser, page = _ensure_thread_browser(log_callback=log_callback, force_restart=True)
+        page = browser.new_tab(SIGNUP_URL)
+        _tls_set_page(page)
+        _mirror_thread_browser_globals(browser, page)
+
     page.wait.doc_loaded()
     sleep_with_cancel(2, cancel_callback)
     if log_callback:
@@ -2878,7 +2958,9 @@ def open_signup_page(log_callback=None, cancel_callback=None):
 
 
 def has_profile_form(log_callback=None):
-    refresh_active_page()
+    page = refresh_active_page()
+    if page is None:
+        return False
     try:
         return bool(
             page.run_js(
@@ -2896,16 +2978,7 @@ return !!(givenInput && familyInput && passwordInput);
 
 def fill_email_and_submit(timeout=45, log_callback=None, cancel_callback=None):
     # thread-local page/browser (multi-thread safe)
-    page = _tls_get_page()
-    _tls_set_page(page)
-    browser = _tls_get_browser()
-    _tls_set_browser(browser)
-    if page is None or browser is None:
-        start_browser()
-        page = _tls_get_page()
-        _tls_set_page(page)
-        browser = _tls_get_browser()
-        _tls_set_browser(browser)
+    browser, page = _ensure_thread_browser(log_callback=log_callback)
     raise_if_cancelled(cancel_callback)
     email, dev_token = get_email_and_token()
     if not email or not dev_token:
@@ -3035,16 +3108,7 @@ def fill_code_and_submit(
     cancel_callback=None,
 ):
     # thread-local page/browser (multi-thread safe)
-    page = _tls_get_page()
-    _tls_set_page(page)
-    browser = _tls_get_browser()
-    _tls_set_browser(browser)
-    if page is None or browser is None:
-        start_browser()
-        page = _tls_get_page()
-        _tls_set_page(page)
-        browser = _tls_get_browser()
-        _tls_set_browser(browser)
+    browser, page = _ensure_thread_browser(log_callback=log_callback)
 
     def _resend_code():
         try:
@@ -3155,16 +3219,7 @@ def getTurnstileToken(log_callback=None, cancel_callback=None):
     often cannot see #checkbox even when the box is clearly visible).
     """
     # thread-local page/browser (multi-thread safe)
-    page = _tls_get_page()
-    _tls_set_page(page)
-    browser = _tls_get_browser()
-    _tls_set_browser(browser)
-    if page is None or browser is None:
-        start_browser()
-        page = _tls_get_page()
-        _tls_set_page(page)
-        browser = _tls_get_browser()
-        _tls_set_browser(browser)
+    browser, page = _ensure_thread_browser(log_callback=log_callback)
     if page is None:
         raise Exception("页面未就绪，无法执行 Turnstile")
 
@@ -3299,16 +3354,7 @@ def _cf_present(page) -> bool:
 
 def fill_profile_and_submit(timeout=120, log_callback=None, cancel_callback=None):
     # thread-local page/browser (multi-thread safe)
-    page = _tls_get_page()
-    _tls_set_page(page)
-    browser = _tls_get_browser()
-    _tls_set_browser(browser)
-    if page is None or browser is None:
-        start_browser()
-        page = _tls_get_page()
-        _tls_set_page(page)
-        browser = _tls_get_browser()
-        _tls_set_browser(browser)
+    browser, page = _ensure_thread_browser(log_callback=log_callback)
     given_name, family_name, password = build_profile()
     deadline = time.time() + timeout
     form_filled_once = False
@@ -3417,16 +3463,7 @@ def fill_profile_and_submit(timeout=120, log_callback=None, cancel_callback=None
 
 def wait_for_sso_cookie(timeout=120, log_callback=None, cancel_callback=None):
     # thread-local page/browser (multi-thread safe)
-    page = _tls_get_page()
-    _tls_set_page(page)
-    browser = _tls_get_browser()
-    _tls_set_browser(browser)
-    if page is None or browser is None:
-        start_browser()
-        page = _tls_get_page()
-        _tls_set_page(page)
-        browser = _tls_get_browser()
-        _tls_set_browser(browser)
+    browser, page = _ensure_thread_browser(log_callback=log_callback)
     deadline = time.time() + timeout
     last_seen_names = set()
     last_submit_retry = 0.0
