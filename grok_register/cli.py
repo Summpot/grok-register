@@ -249,25 +249,19 @@ def register_one(
             log_callback=lambda m: log(worker_id, m), cancel_callback=cancel
         )
         password = profile.get("password", "") or ""
-        line = f"{email}----{password}----{sso}\n"
-        os.makedirs(os.path.dirname(os.path.abspath(accounts_file)) or ".", exist_ok=True)
-        with open(accounts_file, "a", encoding="utf-8") as f:
-            f.write(line)
-        log(worker_id, f"+ 注册成功: {email}")
-        reg.mark_used(email, password)
-
         page = reg._get_page()
         if page and reg.PERF_FLAGS.get("cookie_snapshot", True):
             try:
                 reg.save_cookies_snapshot(page, "success", email)
             except Exception:
                 pass
-        try:
-            reg.add_token_to_grok2api_pools(
-                sso, email=email, log_callback=lambda m: log(worker_id, m)
-            )
-        except Exception as exc:
-            log(worker_id, f"[Debug] grok2api: {exc}")
+
+        pool = reg.apply_post_register_pools(
+            sso,
+            email=email,
+            log_callback=lambda m: log(worker_id, m),
+            page=page,
+        )
 
         try:
             reuse = True
@@ -285,12 +279,30 @@ def register_one(
             except Exception:
                 pass
 
+        if pool.get("bot_flagged") or not pool.get("ok", True):
+            log(
+                worker_id,
+                f"! 注册失败: bot_flag_source=1 ({email})，未导入 Web/Build",
+            )
+            reg.mark_error(email or "", reason="bot_flag_source=1")
+            _inc("reg_fail")
+            return None
+
+        line = f"{email}----{password}----{sso}\n"
+        os.makedirs(os.path.dirname(os.path.abspath(accounts_file)) or ".", exist_ok=True)
+        with open(accounts_file, "a", encoding="utf-8") as f:
+            f.write(line)
+        log(worker_id, f"+ 注册成功: {email}")
+        reg.mark_used(email, password)
+
         job = {
             "email": email,
             "password": password,
             "sso": sso,
             "profile": profile,
             "idx": idx,
+            "build": bool(pool.get("build_seed")),
+            "skipped_web": bool(pool.get("skipped_web")),
         }
 
         _inc("reg_success")
@@ -453,9 +465,11 @@ def main() -> int:
     print(f"[*] accounts_file = {args.accounts_file}", flush=True)
     g2a_remote = bool(cfg0.get("grok2api_auto_add_remote"))
     g2a_build = bool(cfg0.get("grok2api_auto_add_build"))
-    if g2a_remote or g2a_build:
+    local_build = bool(cfg0.get("local_build_device_flow"))
+    if g2a_remote or g2a_build or local_build:
         print(
             f"[*] grok2api: remote_web={g2a_remote} web_to_build={g2a_build} "
+            f"local_device_flow={local_build} mode={cfg0.get('local_build_mode') or 'auto'} "
             f"base={cfg0.get('grok2api_remote_base') or '(empty)'}",
             flush=True,
         )

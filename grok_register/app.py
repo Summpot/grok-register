@@ -128,6 +128,8 @@ DEFAULT_CONFIG = {
     "grok2api_pool_name": "ssoBasic",
     "grok2api_auto_add_remote": False,
     # v3 only: after Web import, ask remote to convert Web→Build. Default off.
+    # When local_build_device_flow succeeds, remote convert is skipped and Build
+    # OAuth is imported instead (if remote is enabled).
     "grok2api_auto_add_build": False,
     "grok2api_remote_base": "",
     "grok2api_remote_app_key": "",
@@ -138,6 +140,12 @@ DEFAULT_CONFIG = {
     "grok2api_remote_password": "",
     # v3 web tier: auto | basic | super | heavy
     "grok2api_v3_web_tier": "auto",
+    # Local Web SSO → Build OAuth Device Flow (port of grok2api sso_build.go).
+    # Runs right after registration SSO is obtained; does not need remote grok2api.
+    "local_build_device_flow": False,
+    # auto | http | browser  (auto: prefer browser page when available)
+    "local_build_mode": "auto",
+    "local_build_auth_dir": "./output/build_auths",
     "yyds_preferred_domains": "",
     "yyds_blocked_domains": "",
     "yyds_domain_selection": "random",
@@ -692,12 +700,237 @@ def _parse_go_import_sse(text: str) -> dict | None:
     return last_complete
 
 
+def convert_sso_to_build_local(
+    raw_token,
+    email="",
+    log_callback=None,
+    page=None,
+) -> dict | None:
+    """Run local Web SSO → Build Device Flow after registration.
+
+    Returns the OAuth seed dict on success, or None if disabled / failed.
+
+    Special flags on the returned seed:
+      - ``_bot_flagged``: access_token JWT has bot_flag_source=1 → treat as
+        registration failure; nothing is saved or imported.
+      - ``_remote_build_imported``: Build OAuth uploaded to grok2api.
+
+    When Device Flow succeeds (and not bot-flagged), callers must NOT import
+    Grok Web for this account — only Build.
+    """
+    if not config.get("local_build_device_flow", False):
+        return None
+    token = _normalize_sso_token(raw_token)
+    if not token:
+        if log_callback:
+            log_callback("[Debug] local Device Flow: empty SSO, skip")
+        return None
+    try:
+        from grok_register.sso_build import (
+            access_token_has_bot_flag,
+            convert_sso_to_build,
+            save_build_auth,
+            SSOBuildError,
+        )
+    except Exception as exc:
+        if log_callback:
+            log_callback(f"[Debug] local Device Flow import failed: {exc}")
+        return None
+
+    mode = str(config.get("local_build_mode", "auto") or "auto").strip().lower() or "auto"
+    ua = str(config.get("user_agent", "") or "").strip()
+    proxies = get_proxies()
+    active_page = page
+    if active_page is None and mode in ("auto", "browser"):
+        try:
+            active_page = _get_page()
+        except Exception:
+            active_page = None
+
+    if log_callback:
+        log_callback(f"[*] 本地 Web→Build Device Flow 开始 (mode={mode})")
+    try:
+        seed = convert_sso_to_build(
+            token,
+            email=email,
+            user_agent=ua,
+            proxies=proxies,
+            page=active_page,
+            mode=mode,
+            log_callback=log_callback,
+        )
+    except SSOBuildError as exc:
+        if log_callback:
+            log_callback(f"[!] 本地 Device Flow 失败: {exc}")
+        return None
+    except Exception as exc:
+        if log_callback:
+            log_callback(f"[!] 本地 Device Flow 异常: {exc}")
+        return None
+
+    seed["_bot_flagged"] = False
+    seed["_remote_build_imported"] = False
+
+    # Reject bot-flagged Build tokens before any local save / remote import.
+    if access_token_has_bot_flag(seed.get("access_token")):
+        seed["_bot_flagged"] = True
+        if log_callback:
+            log_callback(
+                "[!] access_token 含 bot_flag_source=1，视为注册失败，"
+                "不保存/导入 Grok Build，也不导入 Grok Web"
+            )
+        return seed
+
+    auth_dir = str(config.get("local_build_auth_dir", "") or "").strip()
+    if not auth_dir:
+        auth_dir = str(OUTPUT_DIR / "build_auths")
+    try:
+        path = save_build_auth(seed, auth_dir, email=email)
+        if log_callback:
+            log_callback(
+                f"[+] 本地 Build OAuth 已保存: {path} "
+                f"(email={seed.get('email') or email or '?'})"
+            )
+    except Exception as exc:
+        if log_callback:
+            log_callback(f"[Debug] 保存 Build OAuth 文件失败: {exc}")
+
+    # Device Flow 成功：只导入 Build，不再走 Web 池 / 远端 convert。
+    if config.get("grok2api_auto_add_remote", False) and config.get(
+        "grok2api_auto_add_build", False
+    ):
+        try:
+            ok = add_build_credential_to_grok2api_remote(
+                seed, email=email, log_callback=log_callback
+            )
+            seed["_remote_build_imported"] = bool(ok)
+        except Exception as exc:
+            if log_callback:
+                log_callback(f"[Debug] 远端 Build 导入失败（本地凭据已保存）: {exc}")
+    elif config.get("grok2api_auto_add_build", False) and log_callback:
+        # Build 开关开着但远端 Web 关着：仍只本地落盘
+        log_callback("[*] Device Flow 完成：已跳过 Grok Web 导入（仅本地 Build）")
+    return seed
+
+
+def apply_post_register_pools(
+    sso_token,
+    *,
+    email="",
+    log_callback=None,
+    page=None,
+) -> dict:
+    """Device Flow + grok2api pool routing after SSO is obtained.
+
+    Returns a result dict:
+      ok: bool — overall registration acceptance
+      bot_flagged: bool
+      build_seed: dict | None
+      skipped_web: bool — True when Device Flow succeeded (Web must not be imported)
+    """
+    result = {
+        "ok": True,
+        "bot_flagged": False,
+        "build_seed": None,
+        "skipped_web": False,
+    }
+    build_seed = None
+    try:
+        build_seed = convert_sso_to_build_local(
+            sso_token, email=email, log_callback=log_callback, page=page
+        )
+    except Exception as exc:
+        if log_callback:
+            log_callback(f"[Debug] local Device Flow: {exc}")
+        build_seed = None
+    result["build_seed"] = build_seed
+
+    if build_seed and build_seed.get("_bot_flagged"):
+        result["ok"] = False
+        result["bot_flagged"] = True
+        result["skipped_web"] = True
+        return result
+
+    if build_seed:
+        # Device Flow succeeded → Build only, never import Grok Web.
+        result["skipped_web"] = True
+        if log_callback:
+            log_callback("[*] Device Flow 成功：跳过 Grok Web 导入（仅 Grok Build）")
+        return result
+
+    # No local Device Flow result → keep legacy Web import path.
+    try:
+        add_token_to_grok2api_pools(
+            sso_token,
+            email=email,
+            log_callback=log_callback,
+            skip_build_convert=False,
+        )
+    except Exception as exc:
+        if log_callback:
+            log_callback(f"[Debug] grok2api: {exc}")
+    return result
+
+
+def add_build_credential_to_grok2api_remote(seed: dict, email="", log_callback=None) -> bool:
+    """Upload a local Build OAuth seed to chenyme grok2api v3 accounts/import."""
+    if not isinstance(seed, dict):
+        return False
+    if not (seed.get("access_token") or seed.get("refresh_token")):
+        return False
+    mode = _grok2api_remote_mode()
+    if mode not in ("v3", "auto"):
+        if log_callback:
+            log_callback("[Debug] 远端 Build 导入仅支持 v3/auto，跳过")
+        return False
+    try:
+        from grok_register.sso_build import build_grok2api_import_document
+    except Exception as exc:
+        if log_callback:
+            log_callback(f"[Debug] Build import document: {exc}")
+        return False
+    root, _user, _pw = _grok2api_v3_credentials()
+    if not root:
+        if log_callback:
+            log_callback("[Debug] grok2api v3 未配置 remote_base，跳过 Build 导入")
+        return False
+    document = build_grok2api_import_document(seed)
+    file_bytes = (json.dumps(document, ensure_ascii=False) + "\n").encode("utf-8")
+    label = (email or seed.get("email") or seed.get("user_id") or "build").strip()
+    filename = f"build-{label.replace('@', '_').replace('/', '_')[:48]}.json"
+    endpoint = f"{root}/api/admin/v1/accounts/import"
+    complete = _grok2api_v3_multipart_import(
+        endpoint=endpoint,
+        file_bytes=file_bytes,
+        filename=filename,
+        log_callback=log_callback,
+        label="build import",
+    )
+    if complete is False:
+        return False
+    if isinstance(complete, dict):
+        created = complete.get("created", "?")
+        updated = complete.get("updated", "?")
+        synced = complete.get("synced", complete.get("syncSucceeded", "?"))
+        if log_callback:
+            log_callback(
+                f"[+] 已写入 grok2api v3 Build 池: created={created} updated={updated} "
+                f"synced={synced} ({endpoint})"
+            )
+    else:
+        if log_callback:
+            log_callback(f"[+] 已写入 grok2api v3 Build 池: {label} ({endpoint})")
+    return True
+
+
 def _convert_web_to_build(root: str | None = None, log_callback=None) -> dict | None:
     """Call Go backend API to convert imported web accounts to Build.
 
     POST /api/admin/v1/accounts/web/convert-to-build
     Payload: {"all": True, "strategy": "missing"} — only converts accounts
     that do not yet have a Build counterpart. Safe to call repeatedly.
+
+    Prefer local_build_device_flow when possible; this is the remote fallback.
 
     Uses the same admin credentials as v3 import (_grok2api_v3_credentials).
     Returns the parsed SSE complete payload, or None on failure.
@@ -850,12 +1083,17 @@ def _grok2api_v3_multipart_import(
     return complete if complete is not None else True
 
 
-def add_token_to_grok2api_remote_pool_v3(raw_token, email="", log_callback=None):
+def add_token_to_grok2api_remote_pool_v3(
+    raw_token, email="", log_callback=None, skip_build_convert=False
+):
     """Upload one SSO token to chenyme grok2api v3 Grok Web pool.
 
     API:
       POST {root}/api/admin/v1/auth/login
       POST {root}/api/admin/v1/accounts/web/import  (multipart files/file)
+
+    skip_build_convert: when True, do not call remote Web→Build convert
+    (local Device Flow already produced Build OAuth and imported it).
     """
     token = _normalize_sso_token(raw_token)
     if not token:
@@ -901,13 +1139,15 @@ def add_token_to_grok2api_remote_pool_v3(raw_token, email="", log_callback=None)
     else:
         if log_callback:
             log_callback(f"[+] 已写入 grok2api v3 Web 池: {name} ({endpoint})")
-    # Auto convert web→build if enabled (Go backend API)
-    if config.get("grok2api_auto_add_build", False):
+    # Remote convert only as fallback when local Device Flow did not import Build.
+    if config.get("grok2api_auto_add_build", False) and not skip_build_convert:
         try:
             _convert_web_to_build(root=root, log_callback=log_callback)
         except Exception as conv_exc:
             if log_callback:
                 log_callback(f"[Debug] Web→Build 转换异常（不影响账号导入）: {conv_exc}")
+    elif skip_build_convert and log_callback and config.get("grok2api_auto_add_build", False):
+        log_callback("[*] 已本地完成 Build，跳过远端 Web→Build 转换")
     return True
 
 
@@ -993,7 +1233,9 @@ def add_token_to_grok2api_remote_pool_legacy(raw_token, email="", log_callback=N
     raise RuntimeError(f"grok2api 远端 /tokens 全量模式写入失败: {'; '.join(save_errors)}")
 
 
-def add_token_to_grok2api_remote_pool(raw_token, email="", log_callback=None):
+def add_token_to_grok2api_remote_pool(
+    raw_token, email="", log_callback=None, skip_build_convert=False
+):
     """Upload SSO token to remote grok2api (v3 preferred, legacy fallback)."""
     token = _normalize_sso_token(raw_token)
     if not token:
@@ -1002,7 +1244,12 @@ def add_token_to_grok2api_remote_pool(raw_token, email="", log_callback=None):
     errors = []
     if mode in ("v3", "auto"):
         try:
-            return add_token_to_grok2api_remote_pool_v3(raw_token, email=email, log_callback=log_callback)
+            return add_token_to_grok2api_remote_pool_v3(
+                raw_token,
+                email=email,
+                log_callback=log_callback,
+                skip_build_convert=skip_build_convert,
+            )
         except Exception as exc:
             errors.append(f"v3: {exc}")
             if mode == "v3":
@@ -1011,7 +1258,9 @@ def add_token_to_grok2api_remote_pool(raw_token, email="", log_callback=None):
                 log_callback(f"[Debug] grok2api v3 导入失败，尝试 legacy: {exc}")
     if mode in ("legacy", "auto"):
         try:
-            return add_token_to_grok2api_remote_pool_legacy(raw_token, email=email, log_callback=log_callback)
+            return add_token_to_grok2api_remote_pool_legacy(
+                raw_token, email=email, log_callback=log_callback
+            )
         except Exception as exc:
             errors.append(f"legacy: {exc}")
             if mode == "legacy":
@@ -1019,7 +1268,9 @@ def add_token_to_grok2api_remote_pool(raw_token, email="", log_callback=None):
     raise RuntimeError("grok2api 远端写入失败: " + "; ".join(errors) if errors else "未知错误")
 
 
-def add_token_to_grok2api_pools(raw_token, email="", log_callback=None):
+def add_token_to_grok2api_pools(
+    raw_token, email="", log_callback=None, skip_build_convert=False
+):
     if config.get("grok2api_auto_add_local", False):
         try:
             add_token_to_grok2api_local_pool(raw_token, email=email, log_callback=log_callback)
@@ -1028,7 +1279,12 @@ def add_token_to_grok2api_pools(raw_token, email="", log_callback=None):
                 log_callback(f"[Debug] 写入 grok2api 本地池失败: {exc}")
     if config.get("grok2api_auto_add_remote", False):
         try:
-            add_token_to_grok2api_remote_pool(raw_token, email=email, log_callback=log_callback)
+            add_token_to_grok2api_remote_pool(
+                raw_token,
+                email=email,
+                log_callback=log_callback,
+                skip_build_convert=skip_build_convert,
+            )
         except Exception as exc:
             if log_callback:
                 log_callback(f"[Debug] 写入 grok2api 远端池失败: {exc}")
@@ -3643,31 +3899,50 @@ class GrokRegisterGUI:
         add_label(7, 2, "Web→Build:")
         self.grok2api_build_auto_var = tk.BooleanVar(value=bool(config.get("grok2api_auto_add_build", False)))
         self.grok2api_build_auto_check = tk_checkbutton(
-            config_frame, text="远端转换", variable=self.grok2api_build_auto_var
+            config_frame, text="远端/导入Build", variable=self.grok2api_build_auto_var
         )
         add_field(self.grok2api_build_auto_check, 7, 3, sticky=tk.W)
 
-        add_label(8, 0, "grok2api 远端 Base:")
+        add_label(8, 0, "本地Device Flow:")
+        self.local_build_device_flow_var = tk.BooleanVar(
+            value=bool(config.get("local_build_device_flow", False))
+        )
+        self.local_build_device_flow_check = tk_checkbutton(
+            config_frame,
+            text="注册后本机转换",
+            variable=self.local_build_device_flow_var,
+        )
+        add_field(self.local_build_device_flow_check, 8, 1, sticky=tk.W)
+        add_label(8, 2, "模式:")
+        self.local_build_mode_var = tk.StringVar(
+            value=str(config.get("local_build_mode", "auto") or "auto")
+        )
+        self.local_build_mode_combo = tk_option_menu(
+            config_frame, self.local_build_mode_var, ["auto", "browser", "http"], width=10
+        )
+        add_field(self.local_build_mode_combo, 8, 3, sticky=tk.W)
+
+        add_label(9, 0, "grok2api 远端 Base:")
         self.grok2api_remote_base_var = tk.StringVar(value=str(config.get("grok2api_remote_base", "")))
         self.grok2api_remote_base_entry = tk_entry(config_frame, textvariable=self.grok2api_remote_base_var, width=72)
-        add_field(self.grok2api_remote_base_entry, 8, 1, columnspan=3)
+        add_field(self.grok2api_remote_base_entry, 9, 1, columnspan=3)
 
-        add_label(9, 0, "远端 mode/user:")
+        add_label(10, 0, "远端 mode/user:")
         self.grok2api_remote_mode_var = tk.StringVar(value=str(config.get("grok2api_remote_mode", "auto") or "auto"))
         self.grok2api_remote_mode_combo = tk_option_menu(
             config_frame, self.grok2api_remote_mode_var, ["auto", "v3", "legacy"], width=10
         )
-        add_field(self.grok2api_remote_mode_combo, 9, 1, sticky=tk.W)
+        add_field(self.grok2api_remote_mode_combo, 10, 1, sticky=tk.W)
         self.grok2api_remote_user_var = tk.StringVar(value=str(config.get("grok2api_remote_username", "admin") or "admin"))
         self.grok2api_remote_user_entry = tk_entry(config_frame, textvariable=self.grok2api_remote_user_var, width=28)
-        add_field(self.grok2api_remote_user_entry, 9, 2, columnspan=2)
+        add_field(self.grok2api_remote_user_entry, 10, 2, columnspan=2)
 
-        add_label(10, 0, "v3密码/legacy key:")
+        add_label(11, 0, "v3密码/legacy key:")
         self.grok2api_remote_key_var = tk.StringVar(
             value=str(config.get("grok2api_remote_password", "") or config.get("grok2api_remote_app_key", "") or "")
         )
         self.grok2api_remote_key_entry = tk_entry(config_frame, textvariable=self.grok2api_remote_key_var, width=72)
-        add_field(self.grok2api_remote_key_entry, 10, 1, columnspan=3)
+        add_field(self.grok2api_remote_key_entry, 11, 1, columnspan=3)
 
         adv_frame = tk.LabelFrame(
             main_frame,
@@ -3811,7 +4086,8 @@ class GrokRegisterGUI:
             f"[*] 当前邮箱服务商: {self.email_provider_var.get()} | 注册数量: {self.count_var.get()} | "
             f"后台浏览器={bool(self.register_browser_bg_var.get())} | "
             f"g2a_web={bool(self.grok2api_remote_auto_var.get())} "
-            f"web→build={bool(self.grok2api_build_auto_var.get())} | "
+            f"web→build={bool(self.grok2api_build_auto_var.get())} "
+            f"local_df={bool(self.local_build_device_flow_var.get())} | "
             f"代理池={bool(self.proxy_pool_enabled_var.get())}"
         )
 
@@ -3855,6 +4131,10 @@ class GrokRegisterGUI:
         config["grok2api_pool_name"] = self.grok2api_pool_name_var.get().strip() or "ssoBasic"
         config["grok2api_auto_add_remote"] = bool(self.grok2api_remote_auto_var.get())
         config["grok2api_auto_add_build"] = bool(self.grok2api_build_auto_var.get())
+        config["local_build_device_flow"] = bool(self.local_build_device_flow_var.get())
+        config["local_build_mode"] = (
+            self.local_build_mode_var.get() or "auto"
+        ).strip() or "auto"
         config["grok2api_remote_base"] = self.grok2api_remote_base_var.get().strip()
         config["grok2api_remote_mode"] = (self.grok2api_remote_mode_var.get() or "auto").strip() or "auto"
         config["grok2api_remote_username"] = (self.grok2api_remote_user_var.get() or "admin").strip() or "admin"
@@ -3906,6 +4186,8 @@ class GrokRegisterGUI:
             f"[*] grok2api: local={config.get('grok2api_auto_add_local')} "
             f"remote_web={config.get('grok2api_auto_add_remote')} "
             f"web_to_build={config.get('grok2api_auto_add_build')} "
+            f"local_device_flow={config.get('local_build_device_flow')} "
+            f"local_mode={config.get('local_build_mode')} "
             f"bg_browser={config.get('register_browser_background')}"
         )
         if int(config.get("register_threads") or 1) > 1:
@@ -4015,27 +4297,43 @@ class GrokRegisterGUI:
                             self.log(f"[+] NSFW 开启成功: {nsfw_msg}")
                         else:
                             self.log(f"[!] NSFW 未开启，继续保存账号: {nsfw_msg}")
-                    self.results.append({"email": email, "sso": sso, "profile": profile})
-                    try:
-                        line = f"{email}----{profile.get('password','')}----{sso}\n"
-                        with open(self.accounts_output_file, "a", encoding="utf-8") as f:
-                            f.write(line)
-                    except Exception as file_exc:
-                        self.log(f"[Debug] 保存账号文件失败: {file_exc}")
-                    add_token_to_grok2api_pools(sso, email=email, log_callback=self.log)
-                    self.success_count += 1
-                    retry_count_for_slot = 0
-                    i += 1
-                    self.log(f"[+] 注册成功: {email}")
-                    if (
-                        self.success_count > 0
-                        and self.success_count % MEMORY_CLEANUP_INTERVAL == 0
-                        and i < count
-                    ):
-                        cleanup_runtime_memory(
-                            log_callback=self.log,
-                            reason=f"已成功 {self.success_count} 个账号，执行定期清理",
+                    pool = apply_post_register_pools(
+                        sso, email=email, log_callback=self.log
+                    )
+                    if pool.get("bot_flagged") or not pool.get("ok", True):
+                        self.fail_count += 1
+                        retry_count_for_slot = 0
+                        i += 1
+                        self.log(
+                            f"[-] 注册失败: bot_flag_source=1 ({email})，未导入 Web/Build"
                         )
+                    else:
+                        self.results.append(
+                            {"email": email, "sso": sso, "profile": profile}
+                        )
+                        try:
+                            line = (
+                                f"{email}----{profile.get('password','')}----{sso}\n"
+                            )
+                            with open(
+                                self.accounts_output_file, "a", encoding="utf-8"
+                            ) as f:
+                                f.write(line)
+                        except Exception as file_exc:
+                            self.log(f"[Debug] 保存账号文件失败: {file_exc}")
+                        self.success_count += 1
+                        retry_count_for_slot = 0
+                        i += 1
+                        self.log(f"[+] 注册成功: {email}")
+                        if (
+                            self.success_count > 0
+                            and self.success_count % MEMORY_CLEANUP_INTERVAL == 0
+                            and i < count
+                        ):
+                            cleanup_runtime_memory(
+                                log_callback=self.log,
+                                reason=f"已成功 {self.success_count} 个账号，执行定期清理",
+                            )
                 except RegistrationCancelled:
                     self.log("[!] 注册被用户停止")
                     break
@@ -4187,23 +4485,36 @@ def run_registration_cli(count):
                         cli_log(f"[+] NSFW 开启成功: {nsfw_msg}")
                     else:
                         cli_log(f"[!] NSFW 未开启，继续保存账号: {nsfw_msg}")
-                try:
-                    line = f"{email}----{profile.get('password','')}----{sso}\n"
-                    with open(accounts_output_file, "a", encoding="utf-8") as f:
-                        f.write(line)
-                except Exception as file_exc:
-                    cli_log(f"[Debug] 保存账号文件失败: {file_exc}")
-                add_token_to_grok2api_pools(sso, email=email, log_callback=cli_log)
-                success_count += 1
-                retry_count_for_slot = 0
-                i += 1
-                cli_log(f"[+] 注册成功: {email}")
-                cli_log(f"[*] 当前统计: 成功 {success_count} | 失败 {fail_count}")
-                if success_count > 0 and success_count % MEMORY_CLEANUP_INTERVAL == 0 and i < count:
-                    cleanup_runtime_memory(
-                        log_callback=cli_log,
-                        reason=f"已成功 {success_count} 个账号，执行定期清理",
+                pool = apply_post_register_pools(sso, email=email, log_callback=cli_log)
+                if pool.get("bot_flagged") or not pool.get("ok", True):
+                    fail_count += 1
+                    retry_count_for_slot = 0
+                    i += 1
+                    cli_log(
+                        f"[-] 注册失败: bot_flag_source=1 ({email})，未导入 Web/Build"
                     )
+                    cli_log(f"[*] 当前统计: 成功 {success_count} | 失败 {fail_count}")
+                else:
+                    try:
+                        line = f"{email}----{profile.get('password','')}----{sso}\n"
+                        with open(accounts_output_file, "a", encoding="utf-8") as f:
+                            f.write(line)
+                    except Exception as file_exc:
+                        cli_log(f"[Debug] 保存账号文件失败: {file_exc}")
+                    success_count += 1
+                    retry_count_for_slot = 0
+                    i += 1
+                    cli_log(f"[+] 注册成功: {email}")
+                    cli_log(f"[*] 当前统计: 成功 {success_count} | 失败 {fail_count}")
+                    if (
+                        success_count > 0
+                        and success_count % MEMORY_CLEANUP_INTERVAL == 0
+                        and i < count
+                    ):
+                        cleanup_runtime_memory(
+                            log_callback=cli_log,
+                            reason=f"已成功 {success_count} 个账号，执行定期清理",
+                        )
             except RegistrationCancelled:
                 cli_log("[!] 注册被停止")
                 break
