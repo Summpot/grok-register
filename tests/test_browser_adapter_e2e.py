@@ -1,7 +1,7 @@
 """Comprehensive end-to-end test for the Patchright browser adapter.
 
-Tests all the DrissionPage-compatible APIs used by the registration and
-CPA mint flows, including shadow DOM, iframes, cookies, and Turnstile patterns.
+Tests all the DrissionPage-compatible APIs used by the registration
+flows, including shadow DOM, iframes, cookies, and Turnstile patterns.
 """
 import sys
 import time

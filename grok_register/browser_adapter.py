@@ -1,12 +1,12 @@
 """
 Camoufox adapter — drop-in compatibility layer for DrissionPage API.
 
-Usage (app.py / browser_confirm.py / tab_pool.py):
+Usage (app.py / tab_pool.py):
     from grok_register.browser_adapter import Chromium, ChromiumOptions
 
 Wraps Camoufox (stealth Firefox + Playwright API) and exposes the
-DrissionPage surface used by this project so registration / CPA-mint
-logic stays largely unchanged.
+DrissionPage surface used by this project so registration logic stays
+largely unchanged.
 
 Browser: Camoufox Firefox (anti-detect at engine level).
 No turnstilePatch extension / init-script injection — Turnstile is

@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python
+#!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
 Grok 注册机 - TTK GUI 版本
@@ -275,7 +275,7 @@ def get_proxies():
     Priority: thread-local pool pin > config.proxy
     """
     try:
-        from grok_register.cpa_xai.proxyutil import get_runtime_proxy
+        from grok_register.proxyutil import get_runtime_proxy
 
         runtime = (get_runtime_proxy() or "").strip()
     except Exception:
@@ -287,14 +287,14 @@ def get_proxies():
 
 
 def assign_thread_proxy(log_callback=None, *, force_new: bool = False) -> str:
-    """Assign a proxy for the current register/mint thread.
+    """Assign a proxy for the current register thread.
 
     When proxy_pool_enabled, takes next from pool (and pins thread-local).
     Otherwise uses config.proxy / existing runtime pin.
     """
     log = log_callback or (lambda m: None)
     try:
-        from grok_register.cpa_xai.proxyutil import (
+        from grok_register.proxyutil import (
             ensure_pool_from_config,
             get_runtime_proxy,
             next_pool_proxy,
@@ -306,7 +306,7 @@ def assign_thread_proxy(log_callback=None, *, force_new: bool = False) -> str:
         return str(config.get("proxy", "") or "").strip()
 
     if config.get("proxy_pool_enabled", False):
-        from grok_register.cpa_xai.proxyutil import (
+        from grok_register.proxyutil import (
             is_pool_exhausted,
             note_pool_exhausted_message,
             pool_size,
@@ -911,110 +911,6 @@ def add_token_to_grok2api_remote_pool_v3(raw_token, email="", log_callback=None)
     return True
 
 
-def cpa_xai_auth_to_v3_build_entry(auth: dict) -> dict:
-    """Convert local CPA xai-*.json object to chenyme v3 grok_build import entry."""
-    if not isinstance(auth, dict):
-        raise ValueError("auth must be a dict")
-    access = str(auth.get("access_token") or "").strip()
-    refresh = str(auth.get("refresh_token") or "").strip()
-    if not access and not refresh:
-        raise ValueError("access_token/refresh_token missing")
-    email = str(auth.get("email") or "").strip()
-    sub = str(auth.get("sub") or "").strip()
-    name = email or (f"build-{sub[:8]}" if sub else "grok-build")
-    expires_at = str(auth.get("expires_at") or auth.get("expired") or "").strip()
-    entry = {
-        "provider": "grok_build",
-        "name": name,
-        "client_id": str(auth.get("client_id") or "b1a00492-073a-47ea-816f-4c329264a828").strip(),
-        "access_token": access,
-        "refresh_token": refresh,
-        "token_type": str(auth.get("token_type") or "Bearer").strip() or "Bearer",
-        "email": email,
-        "user_id": sub,
-        "principal_id": sub,
-    }
-    if expires_at:
-        entry["expires_at"] = expires_at
-    if auth.get("expires_in") is not None:
-        try:
-            entry["expires_in"] = int(auth.get("expires_in"))
-        except Exception:
-            pass
-    id_token = str(auth.get("id_token") or "").strip()
-    if id_token:
-        entry["id_token"] = id_token
-    team_id = str(auth.get("team_id") or "").strip()
-    if team_id:
-        entry["team_id"] = team_id
-    return entry
-
-
-def load_cpa_xai_auth_file(path: str) -> dict:
-    p = Path(path)
-    data = json.loads(p.read_text(encoding="utf-8"))
-    if not isinstance(data, dict):
-        raise ValueError("CPA auth JSON must be an object")
-    return data
-
-
-def add_cpa_auth_to_grok2api_v3_build(auth_or_path, log_callback=None):
-    """Upload one CPA OAuth auth (Grok Build) to chenyme grok2api v3.
-
-    API:
-      POST {root}/api/admin/v1/accounts/import  (multipart OAuth JSON)
-    Accepts a path to xai-*.json or an auth dict.
-    """
-    if isinstance(auth_or_path, (str, Path)):
-        auth = load_cpa_xai_auth_file(str(auth_or_path))
-        path_hint = str(auth_or_path)
-    elif isinstance(auth_or_path, dict):
-        auth = auth_or_path
-        path_hint = str(auth.get("email") or "inline")
-    else:
-        raise ValueError("auth_or_path must be path or dict")
-
-    mode = _grok2api_remote_mode()
-    if mode == "legacy":
-        if log_callback:
-            log_callback("[Debug] grok2api legacy 模式不支持 Grok Build 导入，跳过")
-        return False
-
-    root, _user, _pw = _grok2api_v3_credentials()
-    if not root:
-        if log_callback:
-            log_callback("[Debug] grok2api v3 Build 导入未配置 remote_base，跳过")
-        return False
-
-    entry = cpa_xai_auth_to_v3_build_entry(auth)
-    document = {"accounts": [entry]}
-    file_bytes = (json.dumps(document, ensure_ascii=False) + "\n").encode("utf-8")
-    safe_name = (entry.get("email") or entry.get("name") or "build").replace("@", "_").replace("/", "_")[:48]
-    filename = f"build-{safe_name}.json"
-    endpoint = f"{root}/api/admin/v1/accounts/import"
-    complete = _grok2api_v3_multipart_import(
-        endpoint=endpoint,
-        file_bytes=file_bytes,
-        filename=filename,
-        log_callback=log_callback,
-        label="build import",
-    )
-    if complete is False:
-        return False
-    if isinstance(complete, dict):
-        created = complete.get("created", "?")
-        updated = complete.get("updated", "?")
-        synced = complete.get("synced", complete.get("syncSucceeded", "?"))
-        if log_callback:
-            log_callback(
-                f"[+] 已写入 grok2api v3 Build 池: created={created} updated={updated} "
-                f"synced={synced} ({Path(path_hint).name if path_hint else filename})"
-            )
-    else:
-        if log_callback:
-            log_callback(f"[+] 已写入 grok2api v3 Build 池: {entry.get('email') or entry.get('name')}")
-    return True
-
 def add_token_to_grok2api_remote_pool_legacy(raw_token, email="", log_callback=None):
     """Legacy jiujiu/Python grok2api token pool upload (/tokens/add)."""
     token = _normalize_sso_token(raw_token)
@@ -1216,7 +1112,7 @@ def _apply_register_background_options(options) -> None:
 
 
 def create_browser_options(*, unique_profile: bool = False, profile_tag: str = "reg"):
-    """Build Camoufox launch options for register / CPA mint.
+    """Build Camoufox launch options for registration.
 
     Uses stealth Firefox (Camoufox) with humanize cursor, disable_coop for
     Turnstile iframe clicks, and native Playwright proxy auth (user:pass).
@@ -1239,7 +1135,7 @@ def create_browser_options(*, unique_profile: bool = False, profile_tag: str = "
     # Outbound proxy (pool pin or config.proxy) — Camoufox accepts user:pass natively
     proxy: str = ""
     try:
-        from grok_register.cpa_xai.proxyutil import get_runtime_proxy
+        from grok_register.proxyutil import get_runtime_proxy
 
         proxy = (get_runtime_proxy() or str(config.get("proxy", "") or "")).strip()
         if proxy:
@@ -2575,12 +2471,6 @@ def shutdown_browser():
         from grok_register.browser_adapter import stop_thread_playwright
 
         stop_thread_playwright()
-    except Exception:
-        pass
-    try:
-        from grok_register.cpa_xai.browser_confirm import shutdown_mint_browsers
-
-        shutdown_mint_browsers()
     except Exception:
         pass
 
@@ -4382,12 +4272,6 @@ def main():
             pass
         try:
             stop_browser()
-        except Exception:
-            pass
-        try:
-            from grok_register.cpa_xai.browser_confirm import shutdown_mint_browsers
-
-            shutdown_mint_browsers()
         except Exception:
             pass
         root.destroy()

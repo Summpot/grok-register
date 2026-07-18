@@ -1,4 +1,4 @@
-"""Resolve outbound proxy for CPA mint HTTP + browser + register pool.
+"""Resolve outbound proxy for register browser / HTTP + optional proxy pool.
 
 Priority (highest first) for resolve_proxy():
   1. explicit argument

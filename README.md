@@ -1,6 +1,6 @@
 <div align="center">
 
-[![Grok Register Mint — GUI and CLI registration + Grok Build CPA pipeline](assets/banner.png)](https://github.com/van7517/grok-register-mint)
+[![Grok Register — GUI and CLI registration + optional grok2api upload](assets/banner.png)](https://github.com/van7517/grok-register-mint)
 
 **Grok Register** — 面向 Windows 的 Grok 账号注册自动化工具（二次开发版）  
 支持 GUI / CLI、临时邮箱、多线程批量注册，以及可选写入 **grok2api**（Web 池；可选 Web→Build 远端转换）。
@@ -34,7 +34,7 @@
 
 上游项目与社区讨论仍见 [AaronL725/grok-register](https://github.com/AaronL725/grok-register) 与 [linux.do](https://linux.do)。本 README 只描述 **本仓库当前行为**。
 
-主路径：注册拿 SSO → 写 `accounts_*.txt` →（可选）上传 grok2api Web 池 →（可选）远端 **Web→Build** 转换。不再在注册流水线中自动做 CPA OAuth mint。
+主路径：注册拿 SSO → 写 `accounts_*.txt` →（可选）上传 grok2api Web 池 →（可选）远端 **Web→Build** 转换。
 
 ## 目录
 
@@ -67,7 +67,7 @@
 | `docs/` | 本机/打包说明（主文档仍是 `README.md`） |
 | `tests/` | unittest |
 
-默认输出指向 `output/`。旧路径 `cpa_auths/`、根目录 `accounts_*.txt` 仍被 gitignore。
+默认输出指向 `output/`。旧路径根目录 `accounts_*.txt` 仍被 gitignore。
 
 ### 启动方式（兼容旧命令）
 
@@ -129,7 +129,7 @@ copy config.example.json config.json
 
 ## 必须配置
 
-下面这些是跑通注册 / 出 CPA 通常必须正确的项。完整字段见 `config.example.json`。
+下面这些是跑通注册通常必须正确的项。完整字段见 `config.example.json`。
 
 ### 1. 临时邮箱（必填）
 
@@ -237,7 +237,7 @@ uv run python cf_mail_debug.py `
 说明：
 
 - **v3 Web**：注册成功后的 SSO JWT 作为 Grok Web 账号导入（`grok2api_auto_add_remote`）。
-- **Web→Build**：导入 Web 后调用远端转换（`grok2api_auto_add_build`，仅 v3/auto）。**不依赖本地 CPA mint**。
+- **Web→Build**：导入 Web 后调用远端转换（`grok2api_auto_add_build`，仅 v3/auto）。
 - Web tier：`ssoBasic`→`basic`，`ssoSuper`→`super`，可用 `grok2api_v3_web_tier` 覆盖。
 - **legacy**：`grok2api_remote_base` 可填站点根或 `/admin/api`；优先 `/tokens/add`。
 - 打开远端：设 `grok2api_auto_add_remote: true`，并填 `remote_base` +（v3 密码 **或** legacy `app_key`）。
@@ -264,7 +264,7 @@ uv run python cf_mail_debug.py `
 ```
 
 - `all_proxies.txt`：每行一个代理，支持 `http://user:pass@host:port`
-- 启用后**每个账号**从池中取代理（注册 Chrome + mint HTTP 同绑）
+- 启用后**每个账号**从池中取代理（注册浏览器绑定）
 - 带账号密码的代理通过临时 Chrome 扩展注入认证（Chromium 本身不支持 URL 内嵌 user:pass）
 
 访问不了 `accounts.x.ai` 时必须配置可用代理。
@@ -318,7 +318,7 @@ mise run gui
 uv run python -u register_cli.py --count 1 --threads 1
 ```
 
-### 旧 CLI 入口（兼容，非完整 mint 流水线）
+### 旧 CLI 入口（兼容）
 
 ```powershell
 uv run python grok_register_ttk.py cli
@@ -486,7 +486,7 @@ uv run python -u register_cli.py `
 │   ├── tab_pool.py
 │   ├── cf_mail_debug.py
 │   ├── paths.py             # 项目根 / output / config 路径
-│   └── cpa_xai/             # 代理池等辅助（注册主路径不再 mint）
+│   └── proxyutil.py         # 代理解析 / 代理池
 ├── turnstilePatch/          # Chromium 扩展（勿删除）
 ├── output/                  # 运行产物（gitignore）
 ├── scripts/
@@ -520,7 +520,7 @@ mise run check
 
 - 未配置 Ruff / Black / mypy / pytest 为必需项
 - `scripts/optimization_checks.py`、`scripts/verify_config_safe.py` 可能访问外部服务；后者默认只打印脱敏配置，`--probe-mail` / `--probe-remote` 才会打真实网络，不宜当作离线 CI
-- 不要为验证普通改动而跑真实注册 / mint / 远端上传
+- 不要为验证普通改动而跑真实注册 / 远端上传
 
 新增配置键时，请同步更新：**代码默认值**、`config.example.json`、本 README。
 

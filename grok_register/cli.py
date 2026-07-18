@@ -198,7 +198,7 @@ def register_one(
         except Exception as exc:
             msg = str(exc)
             try:
-                from grok_register.cpa_xai.proxyutil import (
+                from grok_register.proxyutil import (
                     disable_proxy,
                     get_runtime_proxy,
                     is_proxy_failure,
@@ -298,7 +298,7 @@ def register_one(
     except Exception as exc:
         log(worker_id, f"! 注册失败: {exc}")
         try:
-            from grok_register.cpa_xai.proxyutil import (
+            from grok_register.proxyutil import (
                 disable_proxy,
                 get_runtime_proxy,
                 is_proxy_failure,
@@ -460,7 +460,7 @@ def main() -> int:
             flush=True,
         )
     try:
-        from grok_register.cpa_xai.proxyutil import ensure_pool_from_config, proxy_log_label
+        from grok_register.proxyutil import ensure_pool_from_config, proxy_log_label
 
         cfg0 = getattr(reg, "config", {}) or {}
         if cfg0.get("proxy_pool_enabled"):

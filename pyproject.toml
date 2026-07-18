@@ -1,7 +1,7 @@
 [project]
 name = "grok-register-mint"
 version = "1.0.0"
-description = "Grok Register Mint — 注册 + Grok Build CPA mint（基于上游二次开发）"
+description = "Grok Register — 批量注册 + 可选 grok2api 上传（基于上游二次开发）"
 requires-python = ">=3.13,<3.14"
 dependencies = [
     "camoufox[geoip]>=0.5.4",  # 反检测 Firefox + Playwright API（替代 patchright + turnstilePatch）

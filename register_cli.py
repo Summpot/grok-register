@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""兼容入口：多线程注册 + 异步 CPA mint。
+"""兼容入口：多线程注册 CLI。
 
 推荐：
   uv run python register_cli.py --count 1 --threads 1

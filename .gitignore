@@ -12,7 +12,7 @@ env/
 config.json
 config.local.json
 
-# All generated runtime output (accounts, CPA auths, tokens, logs, exports)
+# All generated runtime output (accounts, tokens, logs, exports)
 output/
 mail_credentials.txt
 grok2api_tokens.json

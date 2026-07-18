@@ -1,4 +1,4 @@
-"""Grok Register Mint package — registration + Grok Build CPA mint."""
+"""Grok Register package — batch registration + optional grok2api upload."""
 
 from .paths import PROJECT_ROOT, OUTPUT_DIR, CONFIG_FILE
 
