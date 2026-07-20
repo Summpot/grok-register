@@ -127,9 +127,8 @@ DEFAULT_CONFIG = {
     "grok2api_local_token_file": "",
     "grok2api_pool_name": "ssoBasic",
     "grok2api_auto_add_remote": False,
-    # v3 only: after Web import, ask remote to convert Web→Build. Default off.
-    # When local_build_device_flow succeeds, remote convert is skipped and Build
-    # OAuth is imported instead (if remote is enabled).
+    # When true and Device Flow produced Build OAuth, upload that credential to
+    # remote grok2api Build pool. Never calls remote Web→Build convert API.
     "grok2api_auto_add_build": False,
     "grok2api_remote_base": "",
     "grok2api_remote_app_key": "",
@@ -923,77 +922,6 @@ def add_build_credential_to_grok2api_remote(seed: dict, email="", log_callback=N
     return True
 
 
-def _convert_web_to_build(root: str | None = None, log_callback=None) -> dict | None:
-    """Call Go backend API to convert imported web accounts to Build.
-
-    POST /api/admin/v1/accounts/web/convert-to-build
-    Payload: {"all": True, "strategy": "missing"} — only converts accounts
-    that do not yet have a Build counterpart. Safe to call repeatedly.
-
-    Prefer local_build_device_flow when possible; this is the remote fallback.
-
-    Uses the same admin credentials as v3 import (_grok2api_v3_credentials).
-    Returns the parsed SSE complete payload, or None on failure.
-    """
-    _root, username, password = _grok2api_v3_credentials()
-    if root:
-        _root = str(root or "").strip().rstrip("/")
-    if not _root:
-        if log_callback:
-            log_callback("[Debug] 未配置 grok2api_remote_base，跳过 Web→Build 转换")
-        return None
-    try:
-        access = _grok2api_v3_login(_root, username, password, log_callback=log_callback)
-    except Exception as exc:
-        if log_callback:
-            log_callback(f"[Debug] Web→Build 转换登录失败: {exc}")
-        return None
-    import urllib3
-    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-    convert_url = f"{_root}/api/admin/v1/accounts/web/convert-to-build"
-    payload = {"all": True, "strategy": "missing"}
-    try:
-        resp = http_post(
-            convert_url,
-            headers={
-                "Authorization": f"Bearer {access}",
-                "Content-Type": "application/json",
-                "Accept": "text/event-stream, application/json",
-            },
-            json=payload,
-            timeout=120,
-            verify=False,
-            proxies={},
-        )
-    except Exception as exc:
-        if log_callback:
-            log_callback(f"[Debug] Web→Build 转换请求失败: {exc}")
-        return None
-    status = int(getattr(resp, "status_code", 0) or 0)
-    body = ""
-    try:
-        body = resp.text or ""
-    except Exception:
-        pass
-    if status >= 400:
-        if log_callback:
-            log_callback(f"[Debug] Web→Build 转换 HTTP {status}: {body[:200]}")
-        return None
-    result = _parse_go_import_sse(body)
-    if result:
-        created = int(result.get("created", 0))
-        synced = int(result.get("synced", 0))
-        if log_callback:
-            log_callback(
-                f"[+] Web→Build 转换完成: created={created} synced={synced}"
-                + (f" updated={result.get('updated')}" if result.get("updated") else "")
-            )
-    else:
-        if log_callback:
-            log_callback(f"[*] Web→Build 转换成功，无 SSE 数据（可能无待转换账号）")
-    return result
-
-
 def _grok2api_v3_credentials():
     """Return (root, username, password) for v3 admin API."""
     base = str(config.get("grok2api_remote_base", "") or "").strip()
@@ -1092,9 +1020,11 @@ def add_token_to_grok2api_remote_pool_v3(
       POST {root}/api/admin/v1/auth/login
       POST {root}/api/admin/v1/accounts/web/import  (multipart files/file)
 
-    skip_build_convert: when True, do not call remote Web→Build convert
-    (local Device Flow already produced Build OAuth and imported it).
+    Does not call remote Web→Build convert. Build credentials are only uploaded
+    via local Device Flow + add_build_credential_to_grok2api_remote.
+    skip_build_convert is accepted for call-site compatibility and ignored.
     """
+    del skip_build_convert  # retained for API compatibility; convert path removed
     token = _normalize_sso_token(raw_token)
     if not token:
         return False
@@ -1139,15 +1069,6 @@ def add_token_to_grok2api_remote_pool_v3(
     else:
         if log_callback:
             log_callback(f"[+] 已写入 grok2api v3 Web 池: {name} ({endpoint})")
-    # Remote convert only as fallback when local Device Flow did not import Build.
-    if config.get("grok2api_auto_add_build", False) and not skip_build_convert:
-        try:
-            _convert_web_to_build(root=root, log_callback=log_callback)
-        except Exception as conv_exc:
-            if log_callback:
-                log_callback(f"[Debug] Web→Build 转换异常（不影响账号导入）: {conv_exc}")
-    elif skip_build_convert and log_callback and config.get("grok2api_auto_add_build", False):
-        log_callback("[*] 已本地完成 Build，跳过远端 Web→Build 转换")
     return True
 
 
@@ -3896,10 +3817,10 @@ class GrokRegisterGUI:
         self.grok2api_remote_auto_var = tk.BooleanVar(value=bool(config.get("grok2api_auto_add_remote", False)))
         self.grok2api_remote_auto_check = tk_checkbutton(config_frame, variable=self.grok2api_remote_auto_var)
         add_field(self.grok2api_remote_auto_check, 7, 1, sticky=tk.W)
-        add_label(7, 2, "Web→Build:")
+        add_label(7, 2, "远端Build:")
         self.grok2api_build_auto_var = tk.BooleanVar(value=bool(config.get("grok2api_auto_add_build", False)))
         self.grok2api_build_auto_check = tk_checkbutton(
-            config_frame, text="远端/导入Build", variable=self.grok2api_build_auto_var
+            config_frame, text="导入Build凭据", variable=self.grok2api_build_auto_var
         )
         add_field(self.grok2api_build_auto_check, 7, 3, sticky=tk.W)
 
@@ -4185,7 +4106,7 @@ class GrokRegisterGUI:
         self.log(
             f"[*] grok2api: local={config.get('grok2api_auto_add_local')} "
             f"remote_web={config.get('grok2api_auto_add_remote')} "
-            f"web_to_build={config.get('grok2api_auto_add_build')} "
+            f"remote_build={config.get('grok2api_auto_add_build')} "
             f"local_device_flow={config.get('local_build_device_flow')} "
             f"local_mode={config.get('local_build_mode')} "
             f"bg_browser={config.get('register_browser_background')}"

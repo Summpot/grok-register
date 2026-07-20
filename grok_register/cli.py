@@ -468,7 +468,7 @@ def main() -> int:
     local_build = bool(cfg0.get("local_build_device_flow"))
     if g2a_remote or g2a_build or local_build:
         print(
-            f"[*] grok2api: remote_web={g2a_remote} web_to_build={g2a_build} "
+            f"[*] grok2api: remote_web={g2a_remote} remote_build={g2a_build} "
             f"local_device_flow={local_build} mode={cfg0.get('local_build_mode') or 'auto'} "
             f"base={cfg0.get('grok2api_remote_base') or '(empty)'}",
             flush=True,
