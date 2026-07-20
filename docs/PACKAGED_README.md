@@ -7,6 +7,6 @@ This package intentionally excludes local/private runtime data:
 - output/grok2api_tokens.json
 - .venv/
 - __pycache__/
-- gui_crash.log
+- crash.log
 
 Before use, copy config.example.json to config.json and fill in your own keys/endpoints.

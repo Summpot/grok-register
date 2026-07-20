@@ -15,7 +15,7 @@ CONFIG_EXAMPLE = PROJECT_ROOT / "config.example.json"
 OUTPUT_DIR = PROJECT_ROOT / "output"
 # Legacy path kept for any external references; turnstilePatch is no longer loaded.
 TURNSTILE_DIR = PROJECT_ROOT / "turnstilePatch"
-CRASH_LOG_FILE = PROJECT_ROOT / "gui_crash.log"
+CRASH_LOG_FILE = PROJECT_ROOT / "crash.log"
 TOKEN_JSON = PROJECT_ROOT / "token.json"
 
 

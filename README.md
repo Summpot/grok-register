@@ -1,14 +1,14 @@
 <div align="center">
 
-[![Grok Register — GUI and CLI registration + optional grok2api upload](assets/banner.png)](https://github.com/van7517/grok-register-mint)
+[![Grok Register — CLI registration + optional grok2api upload](assets/banner.png)](https://github.com/van7517/grok-register-mint)
 
 **Grok Register** — 面向 Windows 的 Grok 账号注册自动化工具（二次开发版）  
-支持 GUI / CLI、临时邮箱、多线程批量注册，以及可选写入 **grok2api**（Web 池；可选本地 Device Flow 后导入 Build）。
+支持 CLI、临时邮箱、多线程批量注册，以及可选写入 **grok2api**（Web 池；可选本地 Device Flow 后导入 Build）。
 
 <p>
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-blue.svg" alt="License: MIT"></a>
   <img src="https://img.shields.io/badge/Python-3.13-3776AB.svg" alt="Python 3.13">
-  <img src="https://img.shields.io/badge/Interface-GUI%20%2B%20CLI-success.svg" alt="GUI + CLI">
+  <img src="https://img.shields.io/badge/Interface-CLI-success.svg" alt="CLI">
   <img src="https://img.shields.io/badge/Browser-Chromium%2FChrome-4285F4.svg" alt="Chromium/Chrome">
   <img src="https://img.shields.io/badge/Upload-grok2api%20Web-orange.svg" alt="grok2api Web">
   <a href="https://github.com/AaronL725/grok-register"><img src="https://img.shields.io/badge/Upstream-AaronL725%2Fgrok--register-lightgrey.svg" alt="Upstream"></a>
@@ -26,7 +26,7 @@
 
 | | 上游原版 | 本仓库 |
 | --- | --- | --- |
-| 定位 | 注册自动化（GUI / CLI） | 注册 + 可选 **grok2api Web** 上传 |
+| 定位 | 注册自动化（GUI / CLI） | 注册 + 可选 **grok2api Web** 上传（**仅 CLI**） |
 | 推荐入口 | `grok_register_ttk.py` | **`register_cli.py`** |
 | Python | 文档曾写 3.9+ | **3.13**（`>=3.13,<3.14`） |
 | 上传 | 可选 | 本地/远端 grok2api（v3/legacy；默认关） |
@@ -61,7 +61,7 @@
 | 位置 | 内容 |
 | --- | --- |
 | 根目录 | 薄启动入口、`config.json`、依赖清单、`turnstilePatch/`、文档 |
-| `grok_register/` | **核心 Python 包**（GUI/CLI/邮箱/浏览器池/grok2api） |
+| `grok_register/` | **核心 Python 包**（CLI/邮箱/浏览器池/grok2api） |
 | `output/` | 运行产物：账号、token（gitignore） |
 | `scripts/` | 回填、校验、辅助启动 |
 | `docs/` | 本机/打包说明（主文档仍是 `README.md`） |
@@ -74,19 +74,16 @@
 ```powershell
 # 推荐（根目录兼容入口，内部转到包）
 uv run python -u register_cli.py --count 1 --threads 1
-uv run python grok_register_ttk.py
 
 # 等价包入口
 uv run python -m grok_register.cli --count 1 --threads 1
-uv run python -m grok_register.app
 ```
 
 ## 功能
 
-- GUI（Tkinter）与 CLI 两种运行方式
+- CLI 多线程批量注册
 - Cloudflare / DuckMail / YYDS 临时邮箱
 - Chrome / Chromium 真实浏览器注册流程（含 Turnstile 扩展 `turnstilePatch/`）
-- **多线程批量注册**
 - 成功账号实时写入 `output/accounts_*.txt` / `output/accounts_cli.txt`
 - 可选写入本地 / 远端 **grok2api Web** 池（**默认关闭**；Build 仅走本地 Device Flow 后导入）
 - 页面卡住检测、邮箱重试、浏览器复用与回收
@@ -95,7 +92,7 @@ uv run python -m grok_register.app
 
 - **Python 3.13**（`pyproject.toml` 要求 `>=3.13,<3.14`）
 - Google Chrome 或 Chromium
-- 桌面环境（GUI / CLI 都会启动真实浏览器）
+- 可运行浏览器自动化的环境（CLI 会启动真实浏览器）
 - 可访问：
   - `accounts.x.ai` / Grok 注册页
   - 你的临时邮箱 API
@@ -198,7 +195,7 @@ uv run python cf_mail_debug.py `
 | 字段 | 必须性 | 说明 |
 | --- | --- | --- |
 | `register_count` | 建议 | 默认目标数量；CLI 可用 `--count` 覆盖 |
-| `register_threads` | 建议 | GUI/部分逻辑读取；**CLI 真正并发以 `--threads` 为准** |
+| `register_threads` | 建议 | 默认并发参考；**CLI 真正并发以 `--threads` 为准** |
 | `register_browser_background` | 可选 | 默认 `true`：注册浏览器后台运行、不抢前台 |
 | `register_browser_background_mode` | 可选 | 默认 `headless`（Camoufox 无窗口，推荐）；`offscreen` 为有界面+屏外（可能闪一下） |
 | `register_browser_window_position` | 可选 | `offscreen` 模式用，默认 `-2400,100` |
@@ -303,26 +300,16 @@ uv run python cf_mail_debug.py `
 
 所有命令在项目根目录执行。
 
-### GUI
-
-```powershell
-uv run python grok_register_ttk.py
-# 或
-mise run gui
-```
-
-适合改配置、看日志；**批量更推荐 CLI**。
-
 ### CLI 单账号试跑（推荐先跑通）
 
 ```powershell
 uv run python -u register_cli.py --count 1 --threads 1
 ```
 
-### 旧 CLI 入口（兼容）
+### 交互式单线程 CLI（兼容）
 
 ```powershell
-uv run python grok_register_ttk.py cli
+uv run python -m grok_register.app
 ```
 
 进入后输入 `start` 开始。批量请用 `register_cli.py`。
@@ -479,11 +466,10 @@ uv run python -u register_cli.py `
 ```text
 .
 ├── register_cli.py          # 薄入口 → grok_register.cli
-├── grok_register_ttk.py     # 薄入口 → grok_register.app (GUI/旧 CLI)
 ├── cf_mail_debug.py         # 薄入口 → grok_register.cf_mail_debug
 ├── grok_register/           # 核心包
-│   ├── app.py               # GUI + 注册主逻辑 + grok2api
-│   ├── cli.py               # 多线程注册
+│   ├── app.py               # 注册主逻辑 + grok2api（CLI 共享）
+│   ├── cli.py               # 多线程注册 CLI
 │   ├── tab_pool.py
 │   ├── cf_mail_debug.py
 │   ├── paths.py             # 项目根 / output / config 路径
@@ -514,7 +500,7 @@ uv run python -u register_cli.py `
 
 ```powershell
 uv run python -m unittest discover -s tests -v
-uv run python -m py_compile register_cli.py grok_register_ttk.py cf_mail_debug.py grok_register/app.py grok_register/cli.py
+uv run python -m py_compile register_cli.py cf_mail_debug.py grok_register/app.py grok_register/cli.py
 # 或
 mise run check
 ```

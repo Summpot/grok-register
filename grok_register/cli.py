@@ -129,7 +129,7 @@ class DummyStop:
 def _ensure_browser(worker_id: int, force_recycle: bool = False):
     """Start browser if missing; optional full recycle.
 
-    Use thread-local browser from grok_register_ttk. TabPool had a separate
+    Use thread-local browser from grok_register.app. TabPool had a separate
     empty registry, so every account opened a new Chrome and leaked the old one.
     """
     if force_recycle:
