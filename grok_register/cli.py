@@ -279,10 +279,11 @@ def register_one(
             except Exception:
                 pass
 
-        if pool.get("bot_flagged") or not pool.get("ok", True):
+        if not pool.get("ok", True):
             log(
                 worker_id,
-                f"! 注册失败: bot_flag_source=1 ({email})，未导入 Web/Build",
+                f"! 注册失败: bot_flag_source=1 ({email})，未导入 Web/Build"
+                "（可设 allow_bot_flagged=true 强制继续）",
             )
             reg.mark_error(email or "", reason="bot_flag_source=1")
             _inc("reg_fail")
@@ -292,7 +293,10 @@ def register_one(
         os.makedirs(os.path.dirname(os.path.abspath(accounts_file)) or ".", exist_ok=True)
         with open(accounts_file, "a", encoding="utf-8") as f:
             f.write(line)
-        log(worker_id, f"+ 注册成功: {email}")
+        if pool.get("bot_flagged"):
+            log(worker_id, f"+ 注册成功(bot标记已允许): {email}")
+        else:
+            log(worker_id, f"+ 注册成功: {email}")
         reg.mark_used(email, password)
 
         job = {

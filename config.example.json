@@ -33,6 +33,7 @@
     "local_build_device_flow": false,
     "local_build_mode": "auto",
     "local_build_auth_dir": "./output/build_auths",
+    "allow_bot_flagged": false,
     "defaultDomains": "example.com",
     "email_provider": "cloudflare",
     "yyds_api_key": "",

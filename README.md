@@ -241,6 +241,7 @@ uv run python cf_mail_debug.py `
 - Web tier：`ssoBasic`→`basic`，`ssoSuper`→`super`，可用 `grok2api_v3_web_tier` 覆盖。
 - **legacy**：`grok2api_remote_base` 可填站点根或 `/admin/api`；优先 `/tokens/add`。
 - 打开远端：设 `grok2api_auto_add_remote: true`，并填 `remote_base` +（v3 密码 **或** legacy `app_key`）。
+- **bot 标记**：Device Flow 后若 Build `access_token` 含 `bot_flag_source=1`，默认视为失败且不上传；设 `allow_bot_flagged: true` 可仍保存/导入（部分场景账号仍可用）。
 
 ### 4. 代理（按网络情况）
 

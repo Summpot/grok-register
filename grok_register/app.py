@@ -145,6 +145,9 @@ DEFAULT_CONFIG = {
     # auto | http | browser  (auto: prefer browser page when available)
     "local_build_mode": "auto",
     "local_build_auth_dir": "./output/build_auths",
+    # When true, Build access_token with bot_flag_source=1 is still saved/uploaded
+    # and counted as success. Default false: reject as registration failure.
+    "allow_bot_flagged": False,
     "yyds_preferred_domains": "",
     "yyds_blocked_domains": "",
     "yyds_domain_selection": "random",
@@ -710,12 +713,13 @@ def convert_sso_to_build_local(
     Returns the OAuth seed dict on success, or None if disabled / failed.
 
     Special flags on the returned seed:
-      - ``_bot_flagged``: access_token JWT has bot_flag_source=1 → treat as
-        registration failure; nothing is saved or imported.
+      - ``_bot_flagged``: access_token JWT has bot_flag_source=1. By default
+        treated as registration failure (nothing saved/imported); when
+        ``allow_bot_flagged`` is true, still save/import and mark the flag.
       - ``_remote_build_imported``: Build OAuth uploaded to grok2api.
 
-    When Device Flow succeeds (and not bot-flagged), callers must NOT import
-    Grok Web for this account — only Build.
+    When Device Flow succeeds (and not rejected as bot-flagged), callers must
+    NOT import Grok Web for this account — only Build.
     """
     if not config.get("local_build_device_flow", False):
         return None
@@ -770,15 +774,22 @@ def convert_sso_to_build_local(
     seed["_bot_flagged"] = False
     seed["_remote_build_imported"] = False
 
-    # Reject bot-flagged Build tokens before any local save / remote import.
+    # Bot-flagged Build tokens: reject by default; allow when allow_bot_flagged=true.
     if access_token_has_bot_flag(seed.get("access_token")):
         seed["_bot_flagged"] = True
+        if not config.get("allow_bot_flagged", False):
+            if log_callback:
+                log_callback(
+                    "[!] access_token 含 bot_flag_source=1，视为注册失败，"
+                    "不保存/导入 Grok Build，也不导入 Grok Web"
+                    "（可设 allow_bot_flagged=true 强制继续）"
+                )
+            return seed
         if log_callback:
             log_callback(
-                "[!] access_token 含 bot_flag_source=1，视为注册失败，"
-                "不保存/导入 Grok Build，也不导入 Grok Web"
+                "[!] access_token 含 bot_flag_source=1，但 allow_bot_flagged=true，"
+                "继续保存/导入"
             )
-        return seed
 
     auth_dir = str(config.get("local_build_auth_dir", "") or "").strip()
     if not auth_dir:
@@ -845,9 +856,17 @@ def apply_post_register_pools(
     result["build_seed"] = build_seed
 
     if build_seed and build_seed.get("_bot_flagged"):
-        result["ok"] = False
         result["bot_flagged"] = True
+        if not config.get("allow_bot_flagged", False):
+            result["ok"] = False
+            result["skipped_web"] = True
+            return result
+        # Allowed: treat as Build success (already saved/imported above).
         result["skipped_web"] = True
+        if log_callback:
+            log_callback(
+                "[*] bot_flag_source=1 已允许：跳过 Grok Web 导入（仅 Grok Build）"
+            )
         return result
 
     if build_seed:
@@ -3843,27 +3862,38 @@ class GrokRegisterGUI:
         )
         add_field(self.local_build_mode_combo, 8, 3, sticky=tk.W)
 
-        add_label(9, 0, "grok2api 远端 Base:")
+        add_label(9, 0, "bot标记账号:")
+        self.allow_bot_flagged_var = tk.BooleanVar(
+            value=bool(config.get("allow_bot_flagged", False))
+        )
+        self.allow_bot_flagged_check = tk_checkbutton(
+            config_frame,
+            text="仍保存/上传(allow_bot_flagged)",
+            variable=self.allow_bot_flagged_var,
+        )
+        add_field(self.allow_bot_flagged_check, 9, 1, columnspan=3, sticky=tk.W)
+
+        add_label(10, 0, "grok2api 远端 Base:")
         self.grok2api_remote_base_var = tk.StringVar(value=str(config.get("grok2api_remote_base", "")))
         self.grok2api_remote_base_entry = tk_entry(config_frame, textvariable=self.grok2api_remote_base_var, width=72)
-        add_field(self.grok2api_remote_base_entry, 9, 1, columnspan=3)
+        add_field(self.grok2api_remote_base_entry, 10, 1, columnspan=3)
 
-        add_label(10, 0, "远端 mode/user:")
+        add_label(11, 0, "远端 mode/user:")
         self.grok2api_remote_mode_var = tk.StringVar(value=str(config.get("grok2api_remote_mode", "auto") or "auto"))
         self.grok2api_remote_mode_combo = tk_option_menu(
             config_frame, self.grok2api_remote_mode_var, ["auto", "v3", "legacy"], width=10
         )
-        add_field(self.grok2api_remote_mode_combo, 10, 1, sticky=tk.W)
+        add_field(self.grok2api_remote_mode_combo, 11, 1, sticky=tk.W)
         self.grok2api_remote_user_var = tk.StringVar(value=str(config.get("grok2api_remote_username", "admin") or "admin"))
         self.grok2api_remote_user_entry = tk_entry(config_frame, textvariable=self.grok2api_remote_user_var, width=28)
-        add_field(self.grok2api_remote_user_entry, 10, 2, columnspan=2)
+        add_field(self.grok2api_remote_user_entry, 11, 2, columnspan=2)
 
-        add_label(11, 0, "v3密码/legacy key:")
+        add_label(12, 0, "v3密码/legacy key:")
         self.grok2api_remote_key_var = tk.StringVar(
             value=str(config.get("grok2api_remote_password", "") or config.get("grok2api_remote_app_key", "") or "")
         )
         self.grok2api_remote_key_entry = tk_entry(config_frame, textvariable=self.grok2api_remote_key_var, width=72)
-        add_field(self.grok2api_remote_key_entry, 11, 1, columnspan=3)
+        add_field(self.grok2api_remote_key_entry, 12, 1, columnspan=3)
 
         adv_frame = tk.LabelFrame(
             main_frame,
@@ -4056,6 +4086,7 @@ class GrokRegisterGUI:
         config["local_build_mode"] = (
             self.local_build_mode_var.get() or "auto"
         ).strip() or "auto"
+        config["allow_bot_flagged"] = bool(self.allow_bot_flagged_var.get())
         config["grok2api_remote_base"] = self.grok2api_remote_base_var.get().strip()
         config["grok2api_remote_mode"] = (self.grok2api_remote_mode_var.get() or "auto").strip() or "auto"
         config["grok2api_remote_username"] = (self.grok2api_remote_user_var.get() or "admin").strip() or "admin"
@@ -4109,6 +4140,7 @@ class GrokRegisterGUI:
             f"remote_build={config.get('grok2api_auto_add_build')} "
             f"local_device_flow={config.get('local_build_device_flow')} "
             f"local_mode={config.get('local_build_mode')} "
+            f"allow_bot={config.get('allow_bot_flagged')} "
             f"bg_browser={config.get('register_browser_background')}"
         )
         if int(config.get("register_threads") or 1) > 1:
@@ -4221,12 +4253,13 @@ class GrokRegisterGUI:
                     pool = apply_post_register_pools(
                         sso, email=email, log_callback=self.log
                     )
-                    if pool.get("bot_flagged") or not pool.get("ok", True):
+                    if not pool.get("ok", True):
                         self.fail_count += 1
                         retry_count_for_slot = 0
                         i += 1
                         self.log(
                             f"[-] 注册失败: bot_flag_source=1 ({email})，未导入 Web/Build"
+                            "（可设 allow_bot_flagged=true 强制继续）"
                         )
                     else:
                         self.results.append(
@@ -4245,7 +4278,12 @@ class GrokRegisterGUI:
                         self.success_count += 1
                         retry_count_for_slot = 0
                         i += 1
-                        self.log(f"[+] 注册成功: {email}")
+                        if pool.get("bot_flagged"):
+                            self.log(
+                                f"[+] 注册成功(bot标记已允许): {email}"
+                            )
+                        else:
+                            self.log(f"[+] 注册成功: {email}")
                         if (
                             self.success_count > 0
                             and self.success_count % MEMORY_CLEANUP_INTERVAL == 0
@@ -4407,12 +4445,13 @@ def run_registration_cli(count):
                     else:
                         cli_log(f"[!] NSFW 未开启，继续保存账号: {nsfw_msg}")
                 pool = apply_post_register_pools(sso, email=email, log_callback=cli_log)
-                if pool.get("bot_flagged") or not pool.get("ok", True):
+                if not pool.get("ok", True):
                     fail_count += 1
                     retry_count_for_slot = 0
                     i += 1
                     cli_log(
                         f"[-] 注册失败: bot_flag_source=1 ({email})，未导入 Web/Build"
+                        "（可设 allow_bot_flagged=true 强制继续）"
                     )
                     cli_log(f"[*] 当前统计: 成功 {success_count} | 失败 {fail_count}")
                 else:
@@ -4425,7 +4464,10 @@ def run_registration_cli(count):
                     success_count += 1
                     retry_count_for_slot = 0
                     i += 1
-                    cli_log(f"[+] 注册成功: {email}")
+                    if pool.get("bot_flagged"):
+                        cli_log(f"[+] 注册成功(bot标记已允许): {email}")
+                    else:
+                        cli_log(f"[+] 注册成功: {email}")
                     cli_log(f"[*] 当前统计: 成功 {success_count} | 失败 {fail_count}")
                     if (
                         success_count > 0
