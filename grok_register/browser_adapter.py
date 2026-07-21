@@ -84,12 +84,28 @@ def human_type_delay_ms() -> int:
     return random.randint(35, 115)
 
 
+def _gauss_clamp(mu: float, sigma: float, lo: float, hi: float) -> float:
+    """Gaussian sample clamped into [lo, hi]."""
+    if hi < lo:
+        lo, hi = hi, lo
+    for _ in range(8):
+        v = random.gauss(mu, sigma)
+        if lo <= v <= hi:
+            return v
+    return max(lo, min(hi, mu))
+
+
 # ── Turnstile: shadow-pierce bbox + mouse click (Camoufox recommended) ──
 #
 # Turnstile checkbox lives in a cross-origin iframe, often under open/closed
 # shadow roots. frame_locator('#checkbox') frequently finds nothing even when
 # the box is visible. Camoufox docs solve this with disable_coop + mouse.click
 # at the widget coordinates.
+#
+# Bot-score notes:
+#   - Prefer ONE patient click + long wait over rapid re-clicks
+#   - Allow managed-mode auto-solve before touching the widget
+#   - Mouse path should look like hover-aim-click, not teleport+force click
 
 _TURNSTILE_BBOX_JS = """
 () => {
@@ -179,29 +195,86 @@ def _checkbox_point_from_box(box: dict[str, Any]) -> tuple[float, float]:
     w = float(box.get("width") or 0)
     h = float(box.get("height") or 0)
     # Checkbox is a ~28px circle near the left edge, vertically centered.
-    cx = x + min(28.0, max(14.0, w * 0.10)) + random.uniform(-2.5, 2.5)
-    cy = y + h * 0.5 + random.uniform(-3.0, 3.0)
+    # Sample near the center of that circle (not a fixed pixel) for less
+    # "always same coordinate" fingerprinting.
+    base_cx = x + min(30.0, max(15.0, w * 0.095))
+    base_cy = y + h * 0.50
+    cx = _gauss_clamp(base_cx, 2.4, x + 8.0, x + min(42.0, max(18.0, w * 0.22)))
+    cy = _gauss_clamp(base_cy, 2.0, y + h * 0.28, y + h * 0.72)
     return cx, cy
 
 
+def _box_click_priority(box: dict[str, Any]) -> tuple[int, float, float]:
+    """Rank Turnstile candidates: classic checkbox widget first, full-page last."""
+    kind = str(box.get("kind") or "")
+    w = float(box.get("width") or 0)
+    h = float(box.get("height") or 0)
+    score = 0
+    # Managed checkbox widget is typically ~300x65
+    if 240 <= w <= 340 and 45 <= h <= 100:
+        score += 20
+    elif 60 <= w <= 120 and 45 <= h <= 100:
+        # compact checkbox-only frame
+        score += 18
+    elif w >= 400 or h >= 200:
+        # large challenge / interstitial — click only as last resort
+        score -= 10
+    if kind == "iframe":
+        score += 6
+    elif kind == "widget":
+        score += 4
+    elif kind == "host":
+        score += 1
+    return (-score, float(box.get("y") or 0), float(box.get("x") or 0))
+
+
 def mouse_click_xy(pw_page: Any, x: float, y: float) -> None:
-    """Human-ish mouse move + click at viewport coordinates."""
-    # Start from a nearby random offset if possible, then ease in.
+    """Human-ish multi-segment mouse move + hover + click at viewport coords."""
+    # Start from a plausible on-page position (not teleporting from 0,0).
     try:
-        sx = max(0.0, x + random.uniform(-80, 40))
-        sy = max(0.0, y + random.uniform(-40, 40))
-        pw_page.mouse.move(sx, sy, steps=random.randint(4, 10))
-        human_pause(0.04, 0.12)
+        vp = getattr(pw_page, "viewport_size", None) or {}
+        vw = float(vp.get("width") or 1000)
+        vh = float(vp.get("height") or 800)
+        sx = _gauss_clamp(vw * 0.42, vw * 0.12, 24.0, max(40.0, vw - 24.0))
+        sy = _gauss_clamp(vh * 0.48, vh * 0.14, 40.0, max(60.0, vh - 40.0))
+    except Exception:
+        sx = max(0.0, x + random.uniform(-140, -30))
+        sy = max(0.0, y + random.uniform(-90, 50))
+
+    # Intermediate aim point near the checkbox, then slight overshoot/correct.
+    mid_x = x + random.uniform(-28, 22)
+    mid_y = y + random.uniform(-20, 18)
+    over_x = x + random.uniform(-5, 7)
+    over_y = y + random.uniform(-4, 5)
+
+    try:
+        pw_page.mouse.move(sx, sy, steps=random.randint(3, 7))
+        human_pause(0.05, 0.16)
     except Exception:
         pass
-    pw_page.mouse.move(x, y, steps=random.randint(10, 24))
-    human_pause(0.06, 0.18)
+
+    pw_page.mouse.move(mid_x, mid_y, steps=random.randint(14, 32))
+    human_pause(0.05, 0.16)
+    pw_page.mouse.move(over_x, over_y, steps=random.randint(7, 16))
+    human_pause(0.04, 0.12)
+    pw_page.mouse.move(x, y, steps=random.randint(4, 10))
+    # Hover / aim dwell — humans rarely click on the same frame they arrive.
+    human_pause(0.14, 0.42)
+    try:
+        jx = x + random.uniform(-1.3, 1.3)
+        jy = y + random.uniform(-1.1, 1.1)
+        pw_page.mouse.move(jx, jy, steps=random.randint(1, 3))
+        human_pause(0.04, 0.12)
+        x, y = jx, jy
+    except Exception:
+        pass
+
     # delay = hold time before mouseup (ms)
     try:
-        pw_page.mouse.click(x, y, delay=random.randint(45, 140))
+        pw_page.mouse.click(x, y, delay=random.randint(55, 175))
     except TypeError:
         pw_page.mouse.click(x, y)
-    human_pause(0.12, 0.35)
+    human_pause(0.18, 0.48)
 
 
 def find_turnstile_boxes(pw_page: Any) -> list[dict[str, Any]]:
@@ -276,32 +349,12 @@ def find_turnstile_boxes(pw_page: Any) -> list[dict[str, Any]]:
         seen.add(key)
         deduped.append(b)
 
-    rank = {"iframe": 0, "widget": 1, "host": 2}
-    deduped.sort(
-        key=lambda b: (
-            rank.get(str(b.get("kind")), 9),
-            float(b.get("y") or 0),
-            float(b.get("x") or 0),
-        )
-    )
+    deduped.sort(key=_box_click_priority)
     return deduped
 
 
-def click_turnstile_checkbox(pw_page: Any, *, log: Any | None = None) -> bool:
-    """Attempt to click the Cloudflare Turnstile checkbox.
-
-    Strategy (in order):
-      1. Mouse click at checkbox coordinates from shadow-piercing bbox
-         (Camoufox official pattern for disable_coop)
-      2. Playwright frame API: page.frames + locator('#checkbox')
-      3. frame_locator / main-page iframe locator click
-
-    Returns True if at least one click strategy ran without hard failure.
-    """
-    clicked = False
-    log_fn = log if callable(log) else None
-
-    # Ensure any candidate is scrolled into view first (main document only).
+def _scroll_turnstile_into_view(pw_page: Any) -> None:
+    """Scroll Turnstile host into view; small pause for layout settle."""
     try:
         pw_page.evaluate(
             """() => {
@@ -313,15 +366,20 @@ def click_turnstile_checkbox(pw_page: Any, *, log: Any | None = None) -> bool:
                 ];
                 for (const s of sels) {
                     const el = document.querySelector(s);
-                    if (el) { el.scrollIntoView({block:'center', inline:'center'}); return true; }
+                    if (el) {
+                        el.scrollIntoView({block:'center', inline:'center', behavior:'instant'});
+                        return true;
+                    }
                 }
-                // shadow walk scroll
                 function walk(root) {
                     if (!root || !root.querySelectorAll) return false;
                     for (const el of root.querySelectorAll('iframe, div.cf-turnstile, [data-sitekey]')) {
                         const src = String(el.src || el.getAttribute('src') || el.className || '');
                         if (/cloudflare|turnstile|cf-turnstile|data-sitekey/i.test(src + el.outerHTML.slice(0,200))) {
-                            try { el.scrollIntoView({block:'center', inline:'center'}); return true; } catch(e) {}
+                            try {
+                                el.scrollIntoView({block:'center', inline:'center', behavior:'instant'});
+                                return true;
+                            } catch(e) {}
                         }
                     }
                     for (const el of root.querySelectorAll('*')) {
@@ -332,16 +390,35 @@ def click_turnstile_checkbox(pw_page: Any, *, log: Any | None = None) -> bool:
                 return walk(document);
             }"""
         )
-        human_pause(0.15, 0.35)
+        human_pause(0.18, 0.45)
     except Exception:
         pass
 
-    # 1) Coordinate mouse click (most reliable with Camoufox)
+
+def click_turnstile_checkbox(
+    pw_page: Any,
+    *,
+    log: Any | None = None,
+    allow_force: bool = False,
+) -> bool:
+    """Attempt to click the Cloudflare Turnstile checkbox once.
+
+    Strategy (in order):
+      1. Mouse click at checkbox coordinates from shadow-piercing bbox
+         (Camoufox official pattern for disable_coop) — preferred
+      2. Playwright frame locator click without force (real pointer events)
+      3. force=True only if allow_force (last resort; more synthetic)
+
+    Returns True if at least one click strategy ran without hard failure.
+    """
+    log_fn = log if callable(log) else None
+    _scroll_turnstile_into_view(pw_page)
+
+    # 1) Coordinate mouse click (most reliable + most human with Camoufox)
     boxes = find_turnstile_boxes(pw_page)
     if boxes:
-        # Prefer first iframe/widget; if that fails, try next distinct box
         tried_pts: set[tuple[int, int]] = set()
-        for box in boxes[:3]:
+        for box in boxes[:2]:
             try:
                 cx, cy = _checkbox_point_from_box(box)
                 key = (int(cx // 5), int(cy // 5))
@@ -354,124 +431,127 @@ def click_turnstile_checkbox(pw_page: Any, *, log: Any | None = None) -> bool:
                         f"box={box.get('kind')}:{box.get('width'):.0f}x{box.get('height'):.0f}"
                     )
                 mouse_click_xy(pw_page, cx, cy)
-                clicked = True
-                # One solid click is enough; avoid multi-widget spam
                 return True
             except Exception as exc:
                 if log_fn:
                     log_fn(f"turnstile mouse click failed: {exc}")
 
-    # 2) Direct frame handles — only Cloudflare/turnstile frames, never main doc body
-    try:
-        for fr in list(getattr(pw_page, "frames", []) or []):
-            try:
-                url = (fr.url or "").lower()
-            except Exception:
-                url = ""
-            is_cf = any(
-                k in url
-                for k in ("cloudflare", "turnstile", "challenges", "cf-chl", "cdn-cgi")
-            )
-            # Skip top-level page frame unless URL itself is a challenge page
-            try:
-                if fr == pw_page.main_frame and not is_cf:
-                    continue
-            except Exception:
+    # 2) Frame / locator clicks — prefer non-force (real hit-testing)
+    def _try_frame_click(force: bool) -> bool:
+        try:
+            for fr in list(getattr(pw_page, "frames", []) or []):
+                try:
+                    url = (fr.url or "").lower()
+                except Exception:
+                    url = ""
+                is_cf = any(
+                    k in url
+                    for k in ("cloudflare", "turnstile", "challenges", "cf-chl", "cdn-cgi")
+                )
+                try:
+                    if fr == pw_page.main_frame and not is_cf:
+                        continue
+                except Exception:
+                    if not is_cf:
+                        continue
                 if not is_cf:
                     continue
-            if not is_cf:
-                # Non-CF child frame: only attempt real checkbox selectors
-                sels = (
-                    "#checkbox",
-                    'input[type="checkbox"]',
-                    ".mark",
-                    '[role="checkbox"]',
-                )
-            else:
-                sels = (
+                for sel in (
                     "#checkbox",
                     'input[type="checkbox"]',
                     ".mark",
                     '[role="checkbox"]',
                     "label.cb-lb",
-                    "label",
-                )
-            for sel in sels:
-                try:
-                    loc = fr.locator(sel)
-                    if loc.count() <= 0:
-                        continue
-                    target = loc.first
+                ):
                     try:
-                        if not target.is_visible(timeout=400):
+                        loc = fr.locator(sel)
+                        if loc.count() <= 0:
                             continue
+                        target = loc.first
+                        try:
+                            if not target.is_visible(timeout=500):
+                                continue
+                        except Exception:
+                            pass
+                        human_pause(0.12, 0.32)
+                        target.click(timeout=3000, force=force)
+                        if log_fn:
+                            log_fn(
+                                f"turnstile frame click sel={sel!r} "
+                                f"force={force} url={url[:80]}"
+                            )
+                        return True
                     except Exception:
-                        pass
-                    human_pause(0.1, 0.25)
-                    target.click(timeout=3000, force=True)
-                    clicked = True
+                        continue
+        except Exception:
+            pass
+
+        try:
+            frame = pw_page.frame_locator(
+                'iframe[src*="challenges.cloudflare.com"], iframe[src*="turnstile"]'
+            )
+            for sel in (
+                "#checkbox",
+                'input[type="checkbox"]',
+                ".mark",
+                '[role="checkbox"]',
+            ):
+                try:
+                    cb = frame.locator(sel)
+                    if cb.count() <= 0:
+                        continue
+                    human_pause(0.12, 0.32)
+                    cb.first.click(timeout=3000, force=force)
                     if log_fn:
-                        log_fn(f"turnstile frame click sel={sel!r} url={url[:80]}")
+                        log_fn(
+                            f"turnstile frame_locator click sel={sel!r} force={force}"
+                        )
                     return True
                 except Exception:
                     continue
-    except Exception:
-        pass
+        except Exception:
+            pass
+        return False
 
-    # 3) frame_locator checkbox (when accessible)
+    if _try_frame_click(force=False):
+        return True
+
+    # 3) Locator bounding_box → mouse
     try:
-        frame = pw_page.frame_locator(
-            'iframe[src*="challenges.cloudflare.com"], iframe[src*="turnstile"]'
+        widget = pw_page.locator(
+            'iframe[src*="challenges.cloudflare.com"], iframe[src*="turnstile"], '
+            "div.cf-turnstile, [data-sitekey]"
         )
-        for sel in ("#checkbox", 'input[type="checkbox"]', ".mark", '[role="checkbox"]'):
+        n = widget.count()
+        for i in range(min(n, 3)):
+            cand = widget.nth(i)
             try:
-                cb = frame.locator(sel)
-                if cb.count() > 0:
-                    human_pause(0.1, 0.25)
-                    cb.first.click(timeout=3000, force=True)
-                    clicked = True
-                    if log_fn:
-                        log_fn(f"turnstile frame_locator click sel={sel!r}")
-                    return True
+                if not cand.is_visible(timeout=400):
+                    continue
+                bb = cand.bounding_box()
+                if not bb or bb.get("width", 0) < 12:
+                    continue
+                box = {
+                    "x": bb["x"],
+                    "y": bb["y"],
+                    "width": bb["width"],
+                    "height": bb["height"],
+                }
+                cx, cy = _checkbox_point_from_box(box)
+                mouse_click_xy(pw_page, cx, cy)
+                if log_fn:
+                    log_fn(f"turnstile locator bbox click ({cx:.0f},{cy:.0f})")
+                return True
             except Exception:
                 continue
     except Exception:
         pass
 
-    # 4) Locator bounding_box → mouse (pierces some open shadow via CSS)
-    try:
-        widget = pw_page.locator(
-            'iframe[src*="challenges.cloudflare.com"], iframe[src*="turnstile"], div.cf-turnstile, [data-sitekey]'
-        )
-        n = widget.count()
-        for i in range(min(n, 4)):
-            cand = widget.nth(i)
-            try:
-                if not cand.is_visible(timeout=300):
-                    continue
-                bb = cand.bounding_box()
-                if not bb or bb.get("width", 0) < 12:
-                    continue
-                cx = bb["x"] + min(28.0, bb["width"] * 0.1) + random.uniform(-2, 2)
-                cy = bb["y"] + bb["height"] * 0.5 + random.uniform(-2, 2)
-                mouse_click_xy(pw_page, cx, cy)
-                clicked = True
-                if log_fn:
-                    log_fn(f"turnstile locator bbox click ({cx:.0f},{cy:.0f})")
-                return True
-            except Exception:
-                try:
-                    cand.click(timeout=2000, force=True, position={"x": 25, "y": 30})
-                    clicked = True
-                    if log_fn:
-                        log_fn("turnstile locator position click")
-                    return True
-                except Exception:
-                    continue
-    except Exception:
-        pass
+    # 4) force click only as last resort
+    if allow_force and _try_frame_click(force=True):
+        return True
 
-    return clicked
+    return False
 
 
 def turnstile_token_len(pw_page: Any) -> int:
@@ -486,6 +566,201 @@ def turnstile_token_len(pw_page: Any) -> int:
         return len(str(token or "").strip())
     except Exception:
         return 0
+
+
+def turnstile_token_value(pw_page: Any) -> str:
+    """Full cf-turnstile-response value, or empty string."""
+    try:
+        token = pw_page.evaluate(
+            """() => {
+                const el = document.querySelector('input[name="cf-turnstile-response"]');
+                return (el && el.value) || '';
+            }"""
+        )
+        return str(token or "").strip()
+    except Exception:
+        return ""
+
+
+def turnstile_widget_present(pw_page: Any) -> bool:
+    """True when Turnstile input/iframe/widget is in the DOM."""
+    try:
+        return bool(
+            pw_page.evaluate(
+                """() => {
+                    return !!(
+                        document.querySelector('input[name="cf-turnstile-response"]')
+                        || document.querySelector(
+                            'iframe[src*="turnstile"], iframe[src*="challenges.cloudflare.com"], '
+                            + 'div.cf-turnstile, [data-sitekey], script[src*="turnstile"]'
+                        )
+                    );
+                }"""
+            )
+        )
+    except Exception:
+        return False
+
+
+def wait_for_turnstile_widget(
+    pw_page: Any,
+    *,
+    timeout: float = 12.0,
+    sleep_fn: Any | None = None,
+    should_cancel: Any | None = None,
+) -> list[dict[str, Any]]:
+    """Poll until a stable Turnstile bbox appears (or timeout)."""
+    sleeper = sleep_fn if callable(sleep_fn) else (lambda s: time.sleep(s))
+    deadline = time.time() + max(0.5, timeout)
+    last: list[dict[str, Any]] = []
+    stable_hits = 0
+    while time.time() < deadline:
+        if callable(should_cancel) and should_cancel():
+            break
+        boxes = find_turnstile_boxes(pw_page)
+        if boxes:
+            # Require two consecutive non-empty reads so we don't click a
+            # half-laid-out iframe (common bot signal).
+            if last and abs(float(boxes[0].get("width") or 0) - float(last[0].get("width") or 0)) < 4:
+                stable_hits += 1
+            else:
+                stable_hits = 1
+            last = boxes
+            if stable_hits >= 2:
+                return boxes
+        else:
+            stable_hits = 0
+            last = []
+        sleeper(random.uniform(0.22, 0.45))
+    return last
+
+
+def solve_turnstile_patient(
+    pw_page: Any,
+    *,
+    log: Any | None = None,
+    sleep_fn: Any | None = None,
+    should_cancel: Any | None = None,
+    max_clicks: int = 4,
+    timeout: float = 55.0,
+    auto_solve_wait: tuple[float, float] = (1.1, 2.8),
+    post_click_wait: tuple[float, float] = (2.6, 4.8),
+    min_token_len: int = 80,
+) -> str:
+    """Patient Turnstile solve: auto-solve window → few human clicks → backoff.
+
+    Designed to reduce bot_flag risk vs the old tight re-click loop:
+      1. Wait for widget to stabilize
+      2. Give managed mode a chance to pass without any click
+      3. Click once with humanized mouse path
+      4. Wait several seconds for token
+      5. Re-click only after cooldown; escalate force only on last attempts
+
+    Returns the response token string. Raises RuntimeError on timeout.
+    """
+    log_fn = log if callable(log) else None
+    sleeper = sleep_fn if callable(sleep_fn) else (lambda s: time.sleep(s))
+
+    def _cancelled() -> bool:
+        return bool(callable(should_cancel) and should_cancel())
+
+    def _log(msg: str) -> None:
+        if log_fn:
+            log_fn(msg)
+
+    deadline = time.time() + max(8.0, timeout)
+    clicks_done = 0
+    # First click uses force only as last resort inside click helper
+    force_after = max(1, max_clicks - 1)
+
+    # 0) If already solved, return immediately
+    token = turnstile_token_value(pw_page)
+    if len(token) >= min_token_len:
+        return token
+
+    # 1) Widget ready
+    boxes = wait_for_turnstile_widget(
+        pw_page,
+        timeout=min(14.0, max(4.0, timeout * 0.3)),
+        sleep_fn=sleeper,
+        should_cancel=should_cancel,
+    )
+    if boxes and log_fn:
+        b0 = boxes[0]
+        _log(
+            f"turnstile widget ready kind={b0.get('kind')} "
+            f"size={float(b0.get('width') or 0):.0f}x{float(b0.get('height') or 0):.0f}"
+        )
+
+    # 2) Natural / managed auto-solve window (no click yet)
+    auto_lo, auto_hi = auto_solve_wait
+    auto_deadline = time.time() + random.uniform(auto_lo, auto_hi)
+    while time.time() < min(auto_deadline, deadline):
+        if _cancelled():
+            raise RuntimeError("Turnstile cancelled")
+        token = turnstile_token_value(pw_page)
+        if len(token) >= min_token_len:
+            _log(f"turnstile auto-solved token_len={len(token)}")
+            return token
+        sleeper(random.uniform(0.28, 0.55))
+
+    # 3) Click loop with patient post-click waits
+    while time.time() < deadline and clicks_done < max_clicks:
+        if _cancelled():
+            raise RuntimeError("Turnstile cancelled")
+
+        token = turnstile_token_value(pw_page)
+        if len(token) >= min_token_len:
+            _log(f"turnstile solved token_len={len(token)}")
+            return token
+
+        allow_force = clicks_done >= force_after
+        _log(
+            f"turnstile click attempt {clicks_done + 1}/{max_clicks}"
+            + (" (force fallback enabled)" if allow_force else "")
+        )
+        try:
+            ok = click_turnstile_checkbox(
+                pw_page, log=log_fn, allow_force=allow_force
+            )
+        except Exception as exc:
+            ok = False
+            _log(f"turnstile click error: {exc}")
+
+        clicks_done += 1 if ok else 0
+        if not ok:
+            # Widget may still be loading; short wait then retry
+            sleeper(random.uniform(0.7, 1.3))
+            clicks_done += 1  # count failed attempt to avoid infinite spin
+            continue
+
+        # Patient wait after a real click — do NOT re-click every second
+        post_lo, post_hi = post_click_wait
+        # Slightly longer wait after later clicks (challenge may be harder)
+        scale = 1.0 + 0.15 * max(0, clicks_done - 1)
+        wait_until = time.time() + random.uniform(post_lo, post_hi) * scale
+        while time.time() < min(wait_until, deadline):
+            if _cancelled():
+                raise RuntimeError("Turnstile cancelled")
+            token = turnstile_token_value(pw_page)
+            if len(token) >= min_token_len:
+                # Brief settle pause after success (look less "instant submit")
+                sleeper(random.uniform(0.25, 0.7))
+                _log(f"turnstile solved after click token_len={len(token)}")
+                return token
+            sleeper(random.uniform(0.35, 0.7))
+
+        # Between re-clicks: extra human hesitation
+        if clicks_done < max_clicks and time.time() < deadline:
+            sleeper(random.uniform(0.6, 1.5))
+
+    token = turnstile_token_value(pw_page)
+    if len(token) >= min_token_len:
+        return token
+    raise RuntimeError(
+        f"Turnstile token not obtained after {clicks_done} click(s) "
+        f"(token_len={len(token)})"
+    )
 
 
 # ── Error compatibility ───────────────────────────────────────────────

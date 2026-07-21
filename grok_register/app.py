@@ -61,7 +61,9 @@ from grok_register.browser_adapter import (
     PageDisconnectedError,
     click_turnstile_checkbox,
     find_turnstile_boxes,
+    solve_turnstile_patient,
     turnstile_token_len,
+    turnstile_token_value,
 )
 from curl_cffi import requests as curl_requests
 import requests as std_requests
@@ -3184,12 +3186,14 @@ def fill_code_and_submit(
     raise Exception("验证码已获取，但自动填写/提交失败")
 
 
-def getTurnstileToken(log_callback=None, cancel_callback=None):
-    """Wait for Cloudflare Turnstile by mouse-clicking the visible checkbox.
+def getTurnstileToken(log_callback=None, cancel_callback=None, timeout=55):
+    """Wait for Cloudflare Turnstile with a patient, low-click solve loop.
 
-    Camoufox-recommended path: disable_coop + coordinate mouse.click on the
-    widget (Turnstile sits in cross-origin iframe / shadow DOM, so frame_locator
-    often cannot see #checkbox even when the box is clearly visible).
+    Camoufox path: disable_coop + coordinate mouse.click on the widget.
+    Unlike the old ~45 rapid re-click loop, this:
+      - waits for widget layout to stabilize
+      - allows managed auto-solve before any click
+      - issues few humanized clicks with multi-second post-click waits
     """
     # thread-local page/browser (multi-thread safe)
     browser, page = _ensure_thread_browser(log_callback=log_callback)
@@ -3197,77 +3201,87 @@ def getTurnstileToken(log_callback=None, cancel_callback=None):
         raise Exception("页面未就绪，无法执行 Turnstile")
 
     pw_page = page._p
-    last_diag = 0.0
+    cancel_hit = {"v": False}
 
     def _log(msg: str) -> None:
-        if log_callback:
-            log_callback(msg)
+        if not log_callback:
+            return
+        # Surface solver internals with consistent prefix
+        if msg.startswith("[") or msg.startswith("turnstile"):
+            if msg.startswith("turnstile"):
+                log_callback(f"[*] {msg}")
+            else:
+                log_callback(msg)
+        else:
+            log_callback(f"[*] {msg}")
 
-    for attempt in range(0, 45):
-        raise_if_cancelled(cancel_callback)
-
-        n = turnstile_token_len(pw_page)
-        if n >= 80:
-            # read full token for return
-            try:
-                token = pw_page.evaluate(
-                    """() => {
-                        var el = document.querySelector('input[name="cf-turnstile-response"]');
-                        return (el && el.value) || '';
-                    }"""
-                )
-                token = str(token or "").strip()
-            except Exception:
-                token = ""
-            if len(token) >= 80:
-                _log(f"[*] Turnstile 已通过，token长度={len(token)}")
-                return token
-
-        # Coordinate / frame mouse click (primary)
-        def _click_log(msg: str) -> None:
-            if attempt % 4 == 0 or "mouse click @" in msg:
-                _log(f"[*] {msg}")
-
+    def _sleep(seconds: float) -> None:
         try:
-            ok = click_turnstile_checkbox(pw_page, log=_click_log)
-            if ok and attempt % 5 == 0:
-                _log("[*] 已尝试点击 Turnstile 复选框，等待通过...")
-        except Exception as exc:
-            if attempt % 6 == 0:
-                _log(f"[Debug] Turnstile 点击异常: {exc}")
+            sleep_with_cancel(seconds, cancel_callback)
+        except Exception:
+            cancel_hit["v"] = True
+            raise
 
-        now = time.time()
-        if log_callback and now - last_diag >= 4.0:
-            last_diag = now
+    def _should_cancel() -> bool:
+        if cancel_hit["v"]:
+            return True
+        if not cancel_callback:
+            return False
+        try:
+            raise_if_cancelled(cancel_callback)
+            return False
+        except Exception:
+            cancel_hit["v"] = True
+            return True
+
+    # Already solved?
+    existing = turnstile_token_value(pw_page)
+    if len(existing) >= 80:
+        _log(f"Turnstile 已通过，token长度={len(existing)}")
+        return existing
+
+    try:
+        token = solve_turnstile_patient(
+            pw_page,
+            log=_log,
+            sleep_fn=_sleep,
+            should_cancel=_should_cancel,
+            max_clicks=4,
+            timeout=float(timeout or 55),
+            auto_solve_wait=(1.2, 2.9),
+            post_click_wait=(2.8, 5.0),
+            min_token_len=80,
+        )
+    except RegistrationCancelled:
+        raise
+    except Exception as exc:
+        if cancel_hit["v"] or "cancelled" in str(exc).lower():
+            raise RegistrationCancelled("用户停止注册") from exc
+        # One diagnostic snapshot on failure
+        try:
             boxes = find_turnstile_boxes(pw_page)
+            n = turnstile_token_len(pw_page)
             if boxes:
                 b0 = boxes[0]
                 _log(
-                    f"[Debug] Turnstile 可见部件 n={len(boxes)} "
-                    f"kind={b0.get('kind')} size={b0.get('width'):.0f}x{b0.get('height'):.0f} "
-                    f"@({b0.get('x'):.0f},{b0.get('y'):.0f}) token_len={n}"
+                    f"[Debug] Turnstile 失败时部件 n={len(boxes)} "
+                    f"kind={b0.get('kind')} "
+                    f"size={float(b0.get('width') or 0):.0f}x{float(b0.get('height') or 0):.0f} "
+                    f"token_len={n}"
                 )
             else:
-                # Fall back: list iframes for diagnosis
-                try:
-                    info = pw_page.evaluate(
-                        """() => {
-                            const ifr = Array.from(document.querySelectorAll('iframe')).slice(0, 6).map(f => ({
-                                src: String(f.src||'').slice(0,120),
-                                w: f.getBoundingClientRect().width,
-                                h: f.getBoundingClientRect().height,
-                            }));
-                            const frames = (window.frames && window.frames.length) || 0;
-                            return {ifr, frames, hasInput: !!document.querySelector('input[name="cf-turnstile-response"]')};
-                        }"""
-                    )
-                    _log(f"[Debug] 未解析到 Turnstile bbox，diag={info} token_len={n}")
-                except Exception as de:
-                    _log(f"[Debug] 未解析到 Turnstile bbox token_len={n} err={de}")
+                _log(f"[Debug] Turnstile 失败且无 bbox token_len={n} err={exc}")
+        except Exception:
+            pass
+        raise Exception(f"Turnstile 获取 token 失败: {exc}") from exc
 
-        _human_pause_cancel(0.7, 1.3, cancel_callback)
-
-    raise Exception("Turnstile 获取 token 失败")
+    token = str(token or "").strip()
+    if len(token) < 80:
+        raise Exception("Turnstile 获取 token 失败")
+    _log(f"Turnstile 已通过，token长度={len(token)}")
+    # Small post-success dwell before caller submits the form
+    _human_pause_cancel(0.35, 0.9, cancel_callback)
+    return token
 
 
 def build_profile():
@@ -3377,31 +3391,36 @@ def fill_profile_and_submit(timeout=120, log_callback=None, cancel_callback=None
             form_filled_once = True
             if log_callback:
                 log_callback(f"[*] 资料已填写: {given_name} {family_name}")
-            _human_pause_cancel(0.35, 0.8, cancel_callback)
+            # Read form before engaging Turnstile — looks less scripted
+            _human_pause_cancel(0.7, 1.6, cancel_callback)
 
-        # Wait for natural Turnstile solve (native click only, no token injection)
+        # Patient Turnstile solve (few human clicks; no token injection)
         if _cf_present(page):
             token_len = _cf_token_len(page)
             if token_len < 80:
                 now = time.time()
-                if log_callback and now - last_cf_retry_at >= 3:
-                    log_callback(f"[*] 等待 Cloudflare 人机验证... token长度={token_len}")
-                if now - last_cf_retry_at >= 1.5:
+                # Outer retry only after a full patient solve attempt (~55s)
+                if now - last_cf_retry_at >= 8.0:
                     if log_callback:
-                        log_callback("[*] 原生点击 Turnstile...")
+                        log_callback(
+                            f"[*] 等待 Cloudflare 人机验证... token长度={token_len}"
+                        )
+                        log_callback("[*] 耐心求解 Turnstile（少点击/长等待）...")
                     try:
                         getTurnstileToken(
-                            log_callback=log_callback, cancel_callback=cancel_callback
+                            log_callback=log_callback,
+                            cancel_callback=cancel_callback,
+                            timeout=55,
                         )
                     except Exception as cf_exc:
                         if log_callback:
                             log_callback(f"[Debug] Turnstile 触发失败: {cf_exc}")
                     last_cf_retry_at = time.time()
-                sleep_with_cancel(0.5, cancel_callback)
+                sleep_with_cancel(0.6, cancel_callback)
                 continue
 
-        # Submit via Playwright-native click
-        _human_pause_cancel(0.3, 0.7, cancel_callback)
+        # Brief pause after CF pass before submit
+        _human_pause_cancel(0.55, 1.2, cancel_callback)
         submitted = None
         try:
             submitted = page.click_by_text(submit_labels, role="button")
@@ -3479,13 +3498,15 @@ return titleHit;
                             log_callback(
                                 f"[Debug] 最终页状态: final-page-wait-cf, token长度={token_len}"
                             )
-                        if now - last_cf_retry_at >= 2:
+                        # Avoid stacking rapid full solvers on the final page
+                        if now - last_cf_retry_at >= 10:
                             if log_callback:
-                                log_callback("[*] 最终页原生点击 Turnstile...")
+                                log_callback("[*] 最终页耐心求解 Turnstile...")
                             try:
                                 getTurnstileToken(
                                     log_callback=log_callback,
                                     cancel_callback=cancel_callback,
+                                    timeout=50,
                                 )
                             except Exception as cf_exc:
                                 if log_callback:
