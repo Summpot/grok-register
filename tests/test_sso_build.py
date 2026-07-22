@@ -13,6 +13,7 @@ from grok_register.sso_build import (
     access_token_has_bot_flag,
     build_grok2api_import_document,
     build_verification_uri_complete,
+    convert_sso_to_build,
     normalize_sso_token,
     safe_xai_url,
     save_build_auth,
@@ -123,14 +124,8 @@ class SSOBuildHelpersTests(unittest.TestCase):
 
 
 class SSOBuildFlowTests(unittest.TestCase):
-    def test_convert_happy_path(self):
-        # Sequence of _do calls inside convert():
-        # 1 GET accounts
-        # 2 POST device/code
-        # 3 GET verification complete
-        # 4 POST verify
-        # 5 POST approve
-        # 6+ POST token (poll)
+    def test_browser_convert_happy_path(self):
+        # Browser path: mint + poll over HTTP; verify/approve via page.
         device_body = json.dumps(
             {
                 "device_code": "dev-1",
@@ -149,67 +144,48 @@ class SSOBuildFlowTests(unittest.TestCase):
                 "expires_in": 3600,
             }
         ).encode()
-        verify_page = (
-            b'<form action="https://auth.x.ai/oauth2/device/verify" method="POST">'
-            b'<input name="user_code" value="ABCD-1234"/>'
-            b"<button>Continue</button></form>"
-        )
-        consent_page = (
-            b'<form action="https://auth.x.ai/oauth2/device/approve" method="POST">'
-            b'<input name="user_code" value="ABCD-1234"/>'
-            b'<input name="action" value=""/>'
-            b"<button>Deny</button><button>Allow</button></form>"
-        )
 
         call_plan = []
 
         def fake_request(method, url, headers=None, data=None):
             call_plan.append((method, url, data, dict(headers or {})))
-            # accounts validate
             if url.rstrip("/") == "https://accounts.x.ai":
                 return DummyResponse(200, b"ok")
             if url.endswith("/oauth2/device/code"):
                 return DummyResponse(200, device_body)
-            if "accounts.x.ai/oauth2/device" in url and method == "GET":
-                return DummyResponse(200, verify_page)
-            if url.endswith("/oauth2/device/verify"):
-                return DummyResponse(
-                    302,
-                    b"",
-                    headers={"Location": "https://auth.x.ai/oauth2/device/consent"},
-                )
-            if url.endswith("/oauth2/device/consent"):
-                return DummyResponse(200, consent_page)
-            if url.endswith("/oauth2/device/approve"):
-                return DummyResponse(
-                    302, b"", headers={"Location": "https://auth.x.ai/oauth2/device/done"}
-                )
-            if url.endswith("/oauth2/device/done"):
-                return DummyResponse(200, b"done")
             if url.endswith("/oauth2/token"):
                 return DummyResponse(200, token_body)
             return DummyResponse(404, b"missing")
 
+        page = MagicMock()
+        page.url = "https://auth.x.ai/oauth2/device/done"
+        page.get = MagicMock()
+        page.cookies = MagicMock(return_value=[])
+        page.set = MagicMock()
+
         flow = SSOBuildFlow("sso-token-value", user_agent="test-agent", proxies={})
         with patch.object(flow, "_request", side_effect=fake_request):
-            with patch("grok_register.sso_build.time.sleep", return_value=None):
-                seed = flow.convert(email="user@example.com")
+            with patch.object(flow, "_browser_device_flow_steps", return_value=True):
+                with patch.object(flow, "_page_is_device_done", return_value=True):
+                    with patch("grok_register.sso_build.time.sleep", return_value=None):
+                        seed = flow.convert_with_browser(page, email="user@example.com")
 
         self.assertEqual(seed["access_token"], "access-xyz")
         self.assertEqual(seed["refresh_token"], "refresh-xyz")
         self.assertEqual(seed["email"], "user@example.com")
         self.assertEqual(seed["provider"], "grok_build")
         self.assertIn("workspaces:read", seed["scope"])
+        page.get.assert_called_once()
+        self.assertTrue(
+            page.get.call_args[0][0].startswith("https://accounts.x.ai/oauth2/device")
+        )
         self.assertTrue(any(u.endswith("/oauth2/device/code") for _, u, _, _ in call_plan))
         self.assertTrue(any(u.endswith("/oauth2/token") for _, u, _, _ in call_plan))
 
-        # Device code + token requests must send grok-build referrer/scopes/headers.
         code_calls = [c for c in call_plan if c[1].endswith("/oauth2/device/code")]
         self.assertTrue(code_calls)
         code_data = code_calls[0][2] or ""
         self.assertIn("referrer=grok-build", code_data)
-        self.assertIn("workspaces%3Aread", code_data.replace("%3a", "%3A"))
-        # urlencode uses %3A for ':'
         self.assertTrue(
             "workspaces%3Aread" in code_data or "workspaces:read" in code_data
         )
@@ -223,8 +199,47 @@ class SSOBuildFlowTests(unittest.TestCase):
         token_data = token_calls[0][2] or ""
         self.assertIn("device_code=dev-1", token_data)
         self.assertIn(f"client_id={SSO_BUILD_CLIENT_ID}", token_data)
-        self.assertIn("grant_type=", token_data)
-        self.assertIn("device_code", token_data)
+
+    def test_browser_steps_failure_does_not_http_fallback(self):
+        device_body = json.dumps(
+            {
+                "device_code": "dev-1",
+                "user_code": "ABCD-1234",
+                "verification_uri": "https://accounts.x.ai/oauth2/device",
+                "verification_uri_complete": "https://accounts.x.ai/oauth2/device?user_code=ABCD-1234",
+                "interval": 1,
+                "expires_in": 600,
+            }
+        ).encode()
+
+        def fake_request(method, url, headers=None, data=None):
+            if url.rstrip("/") == "https://accounts.x.ai":
+                return DummyResponse(200, b"ok")
+            if url.endswith("/oauth2/device/code"):
+                return DummyResponse(200, device_body)
+            return DummyResponse(404, b"missing")
+
+        page = MagicMock()
+        page.url = "https://accounts.x.ai/oauth2/device?user_code=ABCD-1234"
+        page.get = MagicMock()
+        page.cookies = MagicMock(return_value=[])
+        page.set = MagicMock()
+
+        flow = SSOBuildFlow("sso-token-value")
+        with patch.object(flow, "_request", side_effect=fake_request):
+            with patch.object(flow, "_page_is_device_done", return_value=False):
+                with patch.object(flow, "_browser_device_flow_steps", return_value=False):
+                    with patch.object(flow, "_browser_page_phase", return_value="unknown"):
+                        with self.assertRaises(SSOBuildError) as ctx:
+                            flow.convert_with_browser(page, email="user@example.com")
+        self.assertIn("browser Device Flow steps failed", str(ctx.exception))
+        # Must never have polled token after browser failure.
+        # (fake_request would 404 token; exception is raised first)
+
+    def test_convert_sso_to_build_requires_page(self):
+        with self.assertRaises(SSOBuildError) as ctx:
+            convert_sso_to_build("sso-token", page=None, mode="http")
+        self.assertIn("requires an active page", str(ctx.exception))
 
     def test_start_device_builds_complete_uri_when_missing(self):
         device_body = json.dumps(
@@ -310,23 +325,90 @@ class SSOBuildFlowTests(unittest.TestCase):
             ok = flow._browser_submit_allow(page, "ABCD-1234")
         self.assertFalse(ok)
 
-    def test_verify_http_rejects_auth_bounce(self):
+    def test_format_browser_diag_includes_key_fields(self):
         flow = SSOBuildFlow("sso-token-value")
-        device = {
-            "device_code": "dev",
-            "user_code": "ABCD-1234",
-            "verification_uri_complete": "https://accounts.x.ai/oauth2/device?user_code=ABCD-1234",
-        }
+        text = flow._format_browser_diag(
+            {
+                "phase": "user_code",
+                "url": "https://accounts.x.ai/oauth2/device?user_code=ABCD-1234",
+                "ready_state": "complete",
+                "title": "Authorize",
+                "forms": [
+                    {
+                        "i": 0,
+                        "method": "post",
+                        "action": "https://auth.x.ai/oauth2/device/verify",
+                        "inputs": [{"name": "user_code", "type": "text", "disabled": False}],
+                    }
+                ],
+                "buttons": [{"text": "Continue", "disabled": False, "visible": True}],
+                "code_input": {
+                    "name": "user_code",
+                    "valueLen": 9,
+                    "valuePreview": "AB…34",
+                    "matchesExpected": True,
+                    "disabled": False,
+                    "readOnly": False,
+                },
+                "errors": ["invalid code"],
+                "body_snippet": "Enter device code Continue",
+            },
+            label="still on user-code after Continue",
+        )
+        self.assertIn("still on user-code after Continue", text)
+        self.assertIn("phase=user_code", text)
+        self.assertIn("device/verify", text)
+        self.assertIn("Continue", text)
+        self.assertIn("match_expected=True", text)
+        self.assertIn("invalid code", text)
 
-        def fake_do(method, endpoint, form, api_client=False):
-            if method == "GET":
-                return 200, "https://accounts.x.ai/sign-in?redirect=oauth2", b"login"
-            return 200, endpoint, b""
+    def test_continue_stuck_logs_diag(self):
+        flow = SSOBuildFlow("sso-token-value")
+        page = MagicMock()
+        page.url = "https://accounts.x.ai/oauth2/device?user_code=ABCD-1234"
+        page.run_js = MagicMock(
+            return_value={
+                "ok": True,
+                "via": "continue_click",
+                "codeValueLen": 9,
+                "codeMatches": True,
+                "url": page.url,
+            }
+        )
+        logs: list[str] = []
 
-        with patch.object(flow, "_do", side_effect=fake_do):
-            with self.assertRaises(SSOBuildError) as ctx:
-                flow._verify_and_approve_http(device)
-        self.assertTrue(ctx.exception.unauthorized)
+        with patch.object(flow, "_wait_browser_phase", return_value="user_code"):
+            with patch.object(
+                flow,
+                "_collect_browser_diag",
+                return_value={
+                    "phase": "user_code",
+                    "url": page.url,
+                    "ready_state": "complete",
+                    "title": "t",
+                    "forms": [],
+                    "buttons": [{"text": "Continue", "disabled": False, "visible": True}],
+                    "code_input": {
+                        "name": "user_code",
+                        "valueLen": 9,
+                        "valuePreview": "AB…34",
+                        "matchesExpected": True,
+                        "disabled": False,
+                        "readOnly": False,
+                    },
+                    "errors": [],
+                    "body_snippet": "Enter device code",
+                },
+            ):
+                ok = flow._browser_submit_continue(
+                    page, "ABCD-1234", log_callback=logs.append
+                )
+
+        self.assertFalse(ok)
+        joined = "\n".join(logs)
+        self.assertIn("still on user-code after Continue", joined)
+        self.assertIn("via=continue_click", joined)
+        self.assertIn("phase_after", joined)
 
 
 if __name__ == "__main__":

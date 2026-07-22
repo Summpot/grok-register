@@ -2,7 +2,7 @@
 
 import json
 import unittest
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 from grok_register import app
 
@@ -50,12 +50,14 @@ class AllowBotFlaggedTests(unittest.TestCase):
         )
         seed = _bot_seed()
         logs = []
+        page = MagicMock()
         with patch("grok_register.sso_build.convert_sso_to_build", return_value=dict(seed)):
             with patch("grok_register.sso_build.save_build_auth") as save_mock:
                 with patch.object(app, "add_build_credential_to_grok2api_remote") as up_mock:
                     out = app.convert_sso_to_build_local(
                         "sso-token",
                         email="bot@example.com",
+                        page=page,
                         log_callback=logs.append,
                     )
         self.assertIsNotNone(out)
@@ -75,6 +77,7 @@ class AllowBotFlaggedTests(unittest.TestCase):
         )
         seed = _bot_seed()
         logs = []
+        page = MagicMock()
         with patch("grok_register.sso_build.convert_sso_to_build", return_value=dict(seed)):
             with patch("grok_register.sso_build.save_build_auth", return_value="fake.json") as save_mock:
                 with patch.object(
@@ -83,6 +86,7 @@ class AllowBotFlaggedTests(unittest.TestCase):
                     out = app.convert_sso_to_build_local(
                         "sso-token",
                         email="bot@example.com",
+                        page=page,
                         log_callback=logs.append,
                     )
         self.assertIsNotNone(out)

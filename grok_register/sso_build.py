@@ -1,18 +1,14 @@
 """Local Grok Web SSO → Build OAuth conversion via xAI Device Flow.
 
 Aligned with grok-build (`xai-grok-shell` `auth/device_code.rs` +
-`auth/config.rs` default OAuth2 client contract):
+`auth/config.rs` default OAuth2 client contract).
 
-  1. Validate SSO cookie against accounts.x.ai
+Browser-only (HTTP auto verify/approve no longer works against the live IdP):
+
+  1. Validate SSO cookie against accounts.x.ai (HTTP)
   2. POST auth.x.ai/oauth2/device/code  (Grok CLI client_id + scopes + referrer)
-  3. Open verification_uri_complete (accounts.x.ai), POST device/verify + approve
-     using the session SSO cookie (automation; grok-build does this in a browser)
-  4. Poll oauth2/token for access_token + refresh_token
-
-Two modes:
-  - http    : pure HTTP with Cookie: sso=… for verify/approve
-  - browser : use the registration Camoufox page for verify/approve steps
-              (Device start + token poll still HTTP, matching grok-build)
+  3. Open verification_uri_complete in the registration browser; Continue + Allow
+  4. Poll oauth2/token for access_token + refresh_token (HTTP)
 """
 
 from __future__ import annotations
@@ -46,8 +42,6 @@ SSO_BUILD_CLIENT_SURFACE = "cli"
 SSO_ISSUER = "https://auth.x.ai"
 SSO_ACCOUNTS_URL = "https://accounts.x.ai/"
 SSO_DEVICE_URL = f"{SSO_ISSUER}/oauth2/device/code"
-SSO_VERIFY_URL = f"{SSO_ISSUER}/oauth2/device/verify"
-SSO_APPROVE_URL = f"{SSO_ISSUER}/oauth2/device/approve"
 SSO_TOKEN_URL = f"{SSO_ISSUER}/oauth2/token"
 
 DEFAULT_USER_AGENT = (
@@ -245,7 +239,11 @@ class _CookieJar:
 
 
 class SSOBuildFlow:
-    """HTTP Device Flow converter aligned with grok-build device_code.rs."""
+    """Browser Device Flow converter aligned with grok-build device_code.rs.
+
+    Device code mint + token poll are HTTP; verify/approve require a live page
+    (pure HTTP SSO auto-approve is no longer accepted by the IdP).
+    """
 
     def __init__(
         self,
@@ -267,22 +265,6 @@ class SSOBuildFlow:
         self.client_surface = (client_surface or SSO_BUILD_CLIENT_SURFACE).strip() or "cli"
         self.cookies = _CookieJar({"sso": token, "sso-rw": token})
 
-    def convert(self, *, email: str = "", name: str = "") -> dict[str, Any]:
-        status, final_url, _body = self._do("GET", SSO_ACCOUNTS_URL, None)
-        if status == 401 or url_is_auth_bounce(final_url):
-            raise SSOBuildError("Grok Web SSO rejected", status=status, unauthorized=True)
-        if status < 200 or status >= 400:
-            raise SSOBuildError(f"validate SSO failed HTTP {status}", status=status)
-
-        device = self._start_device()
-        self._verify_and_approve_http(device)
-        token = self._poll_token(
-            device["device_code"],
-            interval=float(device.get("interval") or DEFAULT_DEVICE_POLL_INTERVAL_SECS),
-            expires_in=float(device.get("expires_in") or MIN_DEVICE_CODE_EXPIRY_FALLBACK_SECS),
-        )
-        return self._seed_from_token(token, email=email, name=name)
-
     def convert_with_browser(
         self,
         page,
@@ -291,7 +273,10 @@ class SSOBuildFlow:
         name: str = "",
         log_callback: Callable[[str], None] | None = None,
     ) -> dict[str, Any]:
-        """Use registration browser for verify/approve; HTTP for start + token poll."""
+        """Browser for verify/approve; HTTP for device start + token poll."""
+        if page is None:
+            raise SSOBuildError("browser Device Flow requires an active page")
+
         self._ensure_browser_sso_cookies(page)
         status, final_url, _body = self._do("GET", SSO_ACCOUNTS_URL, None)
         if status == 401 or url_is_auth_bounce(final_url):
@@ -309,15 +294,7 @@ class SSOBuildFlow:
         try:
             page.get(verify_url, timeout=45)
         except Exception as exc:
-            if log_callback:
-                log_callback(f"[Debug] browser open verify failed, HTTP fallback: {exc}")
-            self._verify_and_approve_http(device)
-            token = self._poll_token(
-                device["device_code"],
-                interval=float(device.get("interval") or DEFAULT_DEVICE_POLL_INTERVAL_SECS),
-                expires_in=float(device.get("expires_in") or MIN_DEVICE_CODE_EXPIRY_FALLBACK_SECS),
-            )
-            return self._seed_from_token(token, email=email, name=name)
+            raise SSOBuildError(f"browser open verify failed: {exc}") from exc
 
         # Pull any new cookies set by the auth pages
         self._import_browser_cookies(page)
@@ -330,10 +307,30 @@ class SSOBuildFlow:
                 page, device["user_code"], log_callback=log_callback
             )
             if not ok:
-                if log_callback:
-                    log_callback("[*] Device Flow: browser steps missed, HTTP verify+approve")
-                self._import_browser_cookies(page)
-                self._verify_and_approve_http(device)
+                phase = self._browser_page_phase(page)
+                url = self._page_url(page)
+                diag = self._log_browser_diag(
+                    page,
+                    expected_user_code=str(device.get("user_code") or ""),
+                    log_callback=log_callback,
+                    label="final failure",
+                    extra={"user_code": device.get("user_code"), "phase": phase},
+                )
+                err_bits = []
+                errors = diag.get("errors") if isinstance(diag.get("errors"), list) else []
+                if errors:
+                    err_bits.append(f"page_errors={errors[:3]!r}")
+                code = diag.get("code_input") if isinstance(diag.get("code_input"), dict) else None
+                if code is not None:
+                    err_bits.append(
+                        f"code_match={code.get('matchesExpected')} "
+                        f"code_len={code.get('valueLen')}"
+                    )
+                detail = (", " + ", ".join(err_bits)) if err_bits else ""
+                raise SSOBuildError(
+                    f"browser Device Flow steps failed "
+                    f"(phase={phase}, url={url[:160]}{detail})"
+                )
 
         if log_callback:
             log_callback("[*] Device Flow: polling OAuth token")
@@ -415,63 +412,6 @@ class SSOBuildFlow:
             "interval": interval,
             "expires_in": expires_in,
         }
-
-    def _verify_and_approve_http(self, device: dict[str, Any]) -> None:
-        complete = device["verification_uri_complete"]
-        status, final_url, body = self._do("GET", complete, None)
-        if status < 200 or status >= 400:
-            raise SSOBuildError(
-                f"open Device Flow verify page failed HTTP {status}", status=status
-            )
-        if url_is_auth_bounce(final_url):
-            raise SSOBuildError(
-                f"open Device Flow verify bounced to auth: {final_url}",
-                unauthorized=True,
-            )
-
-        verify_url = self._extract_form_action(body, "device/verify") or SSO_VERIFY_URL
-        if not safe_xai_url(verify_url):
-            verify_url = SSO_VERIFY_URL
-
-        status, final_url, body = self._do(
-            "POST", verify_url, {"user_code": device["user_code"]}
-        )
-        if status < 200 or status >= 400:
-            raise SSOBuildError(
-                f"SSO auto-verify Device Flow failed HTTP {status}", status=status
-            )
-        if url_is_auth_bounce(final_url):
-            raise SSOBuildError(
-                f"SSO auto-verify bounced to auth: {final_url}",
-                unauthorized=True,
-            )
-        if self._url_is_device_done(final_url):
-            return
-
-        # Some deployments land on consent HTML without "consent" in the URL.
-        approve_url = self._extract_form_action(body, "device/approve") or SSO_APPROVE_URL
-        if not safe_xai_url(approve_url):
-            approve_url = SSO_APPROVE_URL
-
-        status, final_url, _ = self._do(
-            "POST",
-            approve_url,
-            {
-                "user_code": device["user_code"],
-                "action": "allow",
-                "principal_type": "User",
-                "principal_id": "",
-            },
-        )
-        if status < 200 or status >= 400:
-            raise SSOBuildError(
-                f"SSO auto-approve Device Flow failed HTTP {status}", status=status
-            )
-        if url_is_auth_bounce(final_url):
-            raise SSOBuildError(
-                f"SSO auto-approve Device Flow failed url={final_url}",
-                unauthorized=True,
-            )
 
     def _poll_token(
         self,
@@ -616,6 +556,255 @@ class SSOBuildFlow:
         except Exception:
             return ""
 
+    def _collect_browser_diag(
+        self,
+        page,
+        *,
+        expected_user_code: str = "",
+    ) -> dict[str, Any]:
+        """Snapshot Device Flow page state for Continue/Allow failure diagnosis."""
+        diag: dict[str, Any] = {
+            "url": self._page_url(page),
+            "phase": "unknown",
+            "ready_state": "",
+            "title": "",
+            "forms": [],
+            "buttons": [],
+            "code_input": None,
+            "errors": [],
+            "body_snippet": "",
+            "js_error": "",
+        }
+        try:
+            diag["phase"] = self._browser_page_phase(page)
+        except Exception as exc:
+            diag["phase_error"] = str(exc)
+
+        expected_js = json.dumps(str(expected_user_code or ""))
+        js = f"""
+const expected = {expected_js};
+const normalize = (s) => (s || '').replace(/\\s+/g, ' ').trim();
+const out = {{
+  readyState: document.readyState || '',
+  title: document.title || '',
+  url: location.href || '',
+  forms: [],
+  buttons: [],
+  codeInput: null,
+  errors: [],
+  bodySnippet: '',
+}};
+
+try {{
+  out.forms = Array.from(document.querySelectorAll('form')).slice(0, 6).map((f, i) => {{
+    const inputs = Array.from(f.querySelectorAll('input, button, select, textarea')).slice(0, 12).map((el) => {{
+      const tag = (el.tagName || '').toLowerCase();
+      const type = (el.getAttribute('type') || el.type || tag || '').toLowerCase();
+      const name = el.getAttribute('name') || el.name || '';
+      let value = '';
+      try {{ value = String(el.value != null ? el.value : ''); }} catch (e) {{ value = ''; }}
+      if (name === 'user_code' && value.length > 4) {{
+        value = value.slice(0, 2) + '…' + value.slice(-2) + `(len=${{value.length}})`;
+      }} else if (value.length > 40) {{
+        value = value.slice(0, 40) + '…';
+      }}
+      const text = normalize(el.innerText || el.textContent || el.value || '').slice(0, 40);
+      return {{
+        tag, type, name, value, text,
+        disabled: !!(el.disabled || el.getAttribute('disabled') != null),
+        visible: !!(el.offsetParent !== null || (el.getClientRects && el.getClientRects().length)),
+      }};
+    }});
+    return {{
+      i,
+      action: f.getAttribute('action') || '',
+      method: (f.getAttribute('method') || 'get').toLowerCase(),
+      id: f.id || '',
+      inputs,
+    }};
+  }});
+
+  out.buttons = Array.from(
+    document.querySelectorAll('button, input[type="submit"], a[role="button"]')
+  ).slice(0, 12).map((b) => {{
+    const text = normalize(b.innerText || b.textContent || b.value || '').slice(0, 48);
+    return {{
+      text,
+      type: (b.getAttribute('type') || b.type || '').toLowerCase(),
+      disabled: !!(b.disabled || b.getAttribute('disabled') != null || b.getAttribute('aria-disabled') === 'true'),
+      ariaBusy: b.getAttribute('aria-busy') || '',
+      visible: !!(b.offsetParent !== null || (b.getClientRects && b.getClientRects().length)),
+    }};
+  }});
+
+  let codeInput = document.querySelector(
+    'input[name="user_code"], input[autocomplete="one-time-code"]'
+  );
+  if (!codeInput) {{
+    codeInput = Array.from(document.querySelectorAll('input')).find((el) => {{
+      const id = (el.id || '').toLowerCase();
+      const name = (el.name || '').toLowerCase();
+      const ph = (el.placeholder || '').toLowerCase();
+      return id.includes('code') || name.includes('code') || ph.includes('code') || ph.includes('device');
+    }}) || null;
+  }}
+  if (codeInput) {{
+    let val = '';
+    try {{ val = String(codeInput.value || ''); }} catch (e) {{ val = ''; }}
+    const match = expected ? (normalize(val).toUpperCase() === normalize(expected).toUpperCase()) : null;
+    out.codeInput = {{
+      name: codeInput.name || codeInput.getAttribute('name') || '',
+      id: codeInput.id || '',
+      valueLen: val.length,
+      valuePreview: val ? (val.slice(0, 2) + '…' + val.slice(-2)) : '',
+      matchesExpected: match,
+      disabled: !!codeInput.disabled,
+      readOnly: !!codeInput.readOnly,
+    }};
+  }}
+
+  const errNodes = Array.from(document.querySelectorAll(
+    '[role="alert"], [aria-live], .text-destructive, .text-danger, .text-red-500, ' +
+    'p.text-muted, p[class*="danger"], p[class*="error"], [data-testid*="error"]'
+  )).slice(0, 8);
+  out.errors = errNodes.map((el) => normalize(el.innerText || el.textContent || '')).filter(Boolean).slice(0, 8);
+
+  // Also pick short non-empty paragraphs near the form (validation hints).
+  const near = Array.from(document.querySelectorAll('form p, form span, form div[class*="error"]'))
+    .map((el) => normalize(el.innerText || el.textContent || ''))
+    .filter((t) => t && t.length < 120)
+    .slice(0, 6);
+  for (const t of near) {{
+    if (!out.errors.includes(t)) out.errors.push(t);
+  }}
+  out.errors = out.errors.slice(0, 8);
+
+  try {{
+    const bodyText = normalize(document.body && document.body.innerText ? document.body.innerText : '');
+    out.bodySnippet = bodyText.slice(0, 220);
+  }} catch (e) {{
+    out.bodySnippet = '';
+  }}
+}} catch (e) {{
+  out.jsError = String(e && e.message ? e.message : e);
+}}
+return out;
+"""
+        try:
+            raw = page.run_js(js)
+        except Exception as exc:
+            diag["js_error"] = str(exc)
+            return diag
+
+        if not isinstance(raw, dict):
+            diag["js_error"] = f"unexpected diag payload type={type(raw).__name__}"
+            return diag
+
+        diag["ready_state"] = str(raw.get("readyState") or "")
+        diag["title"] = str(raw.get("title") or "")[:120]
+        if raw.get("url"):
+            diag["url"] = str(raw.get("url") or diag["url"])
+        diag["forms"] = raw.get("forms") if isinstance(raw.get("forms"), list) else []
+        diag["buttons"] = raw.get("buttons") if isinstance(raw.get("buttons"), list) else []
+        diag["code_input"] = raw.get("codeInput") if isinstance(raw.get("codeInput"), dict) else None
+        diag["errors"] = raw.get("errors") if isinstance(raw.get("errors"), list) else []
+        diag["body_snippet"] = str(raw.get("bodySnippet") or "")[:220]
+        if raw.get("jsError"):
+            diag["js_error"] = str(raw.get("jsError"))
+        return diag
+
+    def _format_browser_diag(self, diag: dict[str, Any], *, label: str = "") -> str:
+        """One-line-friendly multi-line debug string for logs."""
+        parts: list[str] = []
+        head = "[Debug] Device Flow diag"
+        if label:
+            head += f" ({label})"
+        parts.append(head)
+        parts.append(
+            f"  phase={diag.get('phase') or '?'} ready={diag.get('ready_state') or '?'} "
+            f"title={str(diag.get('title') or '')[:60]!r}"
+        )
+        parts.append(f"  url={str(diag.get('url') or '')[:180]}")
+        if diag.get("js_error"):
+            parts.append(f"  js_error={diag.get('js_error')}")
+        code = diag.get("code_input")
+        if isinstance(code, dict):
+            parts.append(
+                "  code_input="
+                f"name={code.get('name')!r} len={code.get('valueLen')} "
+                f"preview={code.get('valuePreview')!r} "
+                f"match_expected={code.get('matchesExpected')} "
+                f"disabled={code.get('disabled')} readonly={code.get('readOnly')}"
+            )
+        else:
+            parts.append("  code_input=<none>")
+        forms = diag.get("forms") if isinstance(diag.get("forms"), list) else []
+        parts.append(f"  forms={len(forms)}")
+        for form in forms[:4]:
+            if not isinstance(form, dict):
+                continue
+            inputs = form.get("inputs") if isinstance(form.get("inputs"), list) else []
+            names = []
+            for inp in inputs[:8]:
+                if not isinstance(inp, dict):
+                    continue
+                names.append(
+                    f"{inp.get('name') or inp.get('tag') or '?'}:"
+                    f"{inp.get('type') or ''}{'!' if inp.get('disabled') else ''}"
+                )
+            parts.append(
+                f"    form[{form.get('i')}] method={form.get('method')} "
+                f"action={str(form.get('action') or '')[:100]!r} "
+                f"fields=[{', '.join(names)}]"
+            )
+        buttons = diag.get("buttons") if isinstance(diag.get("buttons"), list) else []
+        if buttons:
+            btn_bits = []
+            for b in buttons[:8]:
+                if not isinstance(b, dict):
+                    continue
+                flags = []
+                if b.get("disabled"):
+                    flags.append("disabled")
+                if not b.get("visible"):
+                    flags.append("hidden")
+                if b.get("ariaBusy"):
+                    flags.append(f"busy={b.get('ariaBusy')}")
+                flag_s = f"({','.join(flags)})" if flags else ""
+                btn_bits.append(f"{str(b.get('text') or '')[:24]!r}{flag_s}")
+            parts.append(f"  buttons=[{', '.join(btn_bits)}]")
+        errors = diag.get("errors") if isinstance(diag.get("errors"), list) else []
+        if errors:
+            parts.append(f"  errors={errors[:5]!r}")
+        snippet = str(diag.get("body_snippet") or "").strip()
+        if snippet:
+            parts.append(f"  body≈{snippet[:160]!r}")
+        return "\n".join(parts)
+
+    def _log_browser_diag(
+        self,
+        page,
+        *,
+        expected_user_code: str = "",
+        log_callback: Callable[[str], None] | None = None,
+        label: str = "",
+        extra: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        diag = self._collect_browser_diag(page, expected_user_code=expected_user_code)
+        if extra:
+            diag = {**diag, **{f"extra_{k}": v for k, v in extra.items()}}
+        if log_callback:
+            msg = self._format_browser_diag(diag, label=label)
+            if extra:
+                extra_bits = " ".join(f"{k}={v!r}" for k, v in extra.items())
+                msg += f"\n  extra: {extra_bits}"
+            # Cookie presence (session jar, not browser) helps SSO bounce cases.
+            jar = self.cookies.as_dict()
+            has_sso = bool(jar.get("sso") or jar.get("sso-rw"))
+            msg += f"\n  http_cookie_jar: sso={has_sso} keys={sorted(jar.keys())[:12]}"
+            log_callback(msg)
+        return diag
+
     @staticmethod
     def _url_is_device_done(url: str) -> bool:
         text = str(url or "").lower()
@@ -631,28 +820,6 @@ class SSOBuildFlow:
 
     def _page_is_device_done(self, page) -> bool:
         return self._url_is_device_done(self._page_url(page))
-
-    @staticmethod
-    def _extract_form_action(body: bytes | str | None, path_fragment: str) -> str:
-        """Pull form action URL containing path_fragment from an HTML body."""
-        if body is None:
-            return ""
-        try:
-            text = body.decode("utf-8", errors="replace") if isinstance(body, (bytes, bytearray)) else str(body)
-        except Exception:
-            return ""
-        if not text or path_fragment not in text:
-            return ""
-        # Prefer absolute actions that include the fragment.
-        patterns = (
-            rf'''action=["'](https?://[^"']*{re.escape(path_fragment)}[^"']*)["']''',
-            rf'''action=["']([^"']*{re.escape(path_fragment)}[^"']*)["']''',
-        )
-        for pat in patterns:
-            match = re.search(pat, text, flags=re.I)
-            if match:
-                return str(match.group(1) or "").strip()
-        return ""
 
     def _browser_page_phase(self, page) -> str:
         """Classify current Device Flow UI.
@@ -768,7 +935,16 @@ return 'unknown';
         # Step 1: user code page → Continue (never Allow here)
         if phase == "user_code":
             if log_callback:
-                log_callback("[*] Device Flow: user-code page → Continue")
+                log_callback(
+                    f"[*] Device Flow: user-code page → Continue "
+                    f"(code={user_code!r}, url={self._page_url(page)[:120]})"
+                )
+                self._log_browser_diag(
+                    page,
+                    expected_user_code=user_code,
+                    log_callback=log_callback,
+                    label="before Continue",
+                )
             if not self._browser_submit_continue(
                 page, user_code, log_callback=log_callback
             ):
@@ -783,6 +959,18 @@ return 'unknown';
             if phase == "done":
                 return True
             if phase != "consent":
+                if log_callback:
+                    log_callback(
+                        f"[Debug] Device Flow: after Continue still not consent "
+                        f"(phase={phase}, expected user_code={user_code!r})"
+                    )
+                    self._log_browser_diag(
+                        page,
+                        expected_user_code=user_code,
+                        log_callback=log_callback,
+                        label="stuck after Continue",
+                        extra={"expected_phase": "consent", "actual_phase": phase},
+                    )
                 return False
 
         # Step 2: consent page → Allow only
@@ -795,6 +983,13 @@ return 'unknown';
 
         if log_callback:
             log_callback(f"[Debug] Device Flow unknown page phase={phase}")
+            self._log_browser_diag(
+                page,
+                expected_user_code=user_code,
+                log_callback=log_callback,
+                label="unknown phase",
+                extra={"phase": phase},
+            )
         return False
 
     def _browser_submit_continue(
@@ -812,11 +1007,23 @@ return 'unknown';
         js = f"""
 const userCode = {user_code_js};
 const normalize = (s) => (s || '').replace(/\\s+/g, ' ').trim().toLowerCase();
+const snapshotButtons = () => Array.from(
+  document.querySelectorAll('button, input[type="submit"], a[role="button"]')
+).slice(0, 10).map((b) => ({{
+  text: normalize(b.innerText || b.textContent || b.value || '').slice(0, 40),
+  disabled: !!(b.disabled || b.getAttribute('disabled') != null),
+  type: (b.getAttribute('type') || b.type || '').toLowerCase(),
+}}));
+const formMeta = (f) => f ? {{
+  action: f.getAttribute('action') || '',
+  method: (f.getAttribute('method') || 'get').toLowerCase(),
+  inputNames: Array.from(f.querySelectorAll('input')).map((i) => i.name || '').filter(Boolean).slice(0, 8),
+}} : null;
 
 // Refuse to act on consent form — that is the next page.
 const approveForm = document.querySelector('form[action*="device/approve"]');
 if (approveForm) {{
-  return {{ ok: false, reason: 'already_on_consent' }};
+  return {{ ok: false, reason: 'already_on_consent', form: formMeta(approveForm), buttons: snapshotButtons(), url: location.href }};
 }}
 
 const forms = Array.from(document.querySelectorAll('form'));
@@ -837,27 +1044,96 @@ const setField = (root, name, value) => {{
     root.appendChild(input);
   }}
   input.value = value;
+  try {{
+    input.dispatchEvent(new Event('input', {{ bubbles: true }}));
+    input.dispatchEvent(new Event('change', {{ bubbles: true }}));
+  }} catch (e) {{}}
+  return input ? String(input.value || '') : '';
 }};
 
 if (form) {{
-  if (userCode) setField(form, 'user_code', userCode);
+  let filled = '';
+  if (userCode) filled = setField(form, 'user_code', userCode);
+  const codeEl = form.querySelector('input[name="user_code"]');
+  const codeValue = codeEl ? String(codeEl.value || '') : filled;
   const buttons = Array.from(form.querySelectorAll('button, input[type="submit"]'));
+  const buttonTexts = buttons.map((b) => normalize(b.innerText || b.textContent || b.value || ''));
   const cont = buttons.find((b) => {{
     const t = normalize(b.innerText || b.textContent || b.value || '');
     return t === 'continue' || t === '继续' || t === '确认' || t === 'next' || t === '下一步';
   }});
   // Do not click Allow/Deny if somehow present.
   if (cont) {{
+    const disabled = !!(cont.disabled || cont.getAttribute('disabled') != null);
+    if (disabled) {{
+      return {{
+        ok: false,
+        reason: 'continue_disabled',
+        via: 'continue_click',
+        form: formMeta(form),
+        codeValueLen: codeValue.length,
+        codeMatches: codeValue.toUpperCase() === String(userCode || '').toUpperCase(),
+        buttonTexts,
+        buttons: snapshotButtons(),
+        url: location.href,
+      }};
+    }}
     cont.click();
-    return {{ ok: true, via: 'continue_click' }};
+    return {{
+      ok: true,
+      via: 'continue_click',
+      form: formMeta(form),
+      codeValueLen: codeValue.length,
+      codeMatches: codeValue.toUpperCase() === String(userCode || '').toUpperCase(),
+      buttonTexts,
+      url: location.href,
+    }};
   }}
   // Single submit on verify form is Continue.
   if (buttons.length === 1) {{
+    if (buttons[0].disabled) {{
+      return {{
+        ok: false,
+        reason: 'single_submit_disabled',
+        form: formMeta(form),
+        buttonTexts,
+        buttons: snapshotButtons(),
+        url: location.href,
+      }};
+    }}
     buttons[0].click();
-    return {{ ok: true, via: 'single_submit' }};
+    return {{
+      ok: true,
+      via: 'single_submit',
+      form: formMeta(form),
+      codeValueLen: codeValue.length,
+      codeMatches: codeValue.toUpperCase() === String(userCode || '').toUpperCase(),
+      buttonTexts,
+      url: location.href,
+    }};
   }}
-  form.submit();
-  return {{ ok: true, via: 'verify_form_submit' }};
+  try {{
+    form.submit();
+    return {{
+      ok: true,
+      via: 'verify_form_submit',
+      form: formMeta(form),
+      codeValueLen: codeValue.length,
+      codeMatches: codeValue.toUpperCase() === String(userCode || '').toUpperCase(),
+      buttonTexts,
+      url: location.href,
+    }};
+  }} catch (e) {{
+    return {{
+      ok: false,
+      reason: 'form_submit_threw',
+      error: String(e && e.message ? e.message : e),
+      form: formMeta(form),
+      buttonTexts,
+      buttons: snapshotButtons(),
+      url: location.href,
+    }};
+  }}
 }}
 
 // No form: click a page-level Continue button (SPA).
@@ -876,22 +1152,57 @@ if (contBtn) {{
       return id.includes('code') || name.includes('code');
     }}) || null;
   }}
+  let codeValue = '';
   if (codeInput && userCode) {{
     codeInput.focus();
     codeInput.value = userCode;
     codeInput.dispatchEvent(new Event('input', {{ bubbles: true }}));
     codeInput.dispatchEvent(new Event('change', {{ bubbles: true }}));
+    codeValue = String(codeInput.value || '');
+  }}
+  if (contBtn.disabled || contBtn.getAttribute('disabled') != null) {{
+    return {{
+      ok: false,
+      reason: 'page_continue_disabled',
+      via: 'page_continue_click',
+      codeValueLen: codeValue.length,
+      formCount: forms.length,
+      buttons: snapshotButtons(),
+      url: location.href,
+    }};
   }}
   contBtn.click();
-  return {{ ok: true, via: 'page_continue_click' }};
+  return {{
+    ok: true,
+    via: 'page_continue_click',
+    codeValueLen: codeValue.length,
+    codeMatches: codeValue.toUpperCase() === String(userCode || '').toUpperCase(),
+    formCount: forms.length,
+    buttons: snapshotButtons(),
+    url: location.href,
+  }};
 }}
-return {{ ok: false, reason: 'no_continue_control' }};
+return {{
+  ok: false,
+  reason: 'no_continue_control',
+  formCount: forms.length,
+  formActions: forms.map((f) => f.getAttribute('action') || '').slice(0, 4),
+  buttons: snapshotButtons(),
+  url: location.href,
+}};
 """
         try:
             result = page.run_js(js)
         except Exception as exc:
             if log_callback:
                 log_callback(f"[Debug] browser Continue JS failed: {exc}")
+                self._log_browser_diag(
+                    page,
+                    expected_user_code=user_code,
+                    log_callback=log_callback,
+                    label="Continue JS exception",
+                    extra={"error": str(exc)},
+                )
             return False
 
         if isinstance(result, dict) and result.get("reason") == "already_on_consent":
@@ -901,13 +1212,33 @@ return {{ ok: false, reason: 'no_continue_control' }};
         if not isinstance(result, dict) or not result.get("ok"):
             if log_callback:
                 reason = result.get("reason") if isinstance(result, dict) else result
-                log_callback(f"[Debug] browser Continue missed: {reason}")
+                via = result.get("via") if isinstance(result, dict) else None
+                log_callback(
+                    f"[Debug] browser Continue missed: reason={reason!r} via={via!r} "
+                    f"raw={result!r}"
+                )
+                self._log_browser_diag(
+                    page,
+                    expected_user_code=user_code,
+                    log_callback=log_callback,
+                    label="Continue click missed",
+                    extra={
+                        "reason": reason,
+                        "via": via,
+                        "result": result if isinstance(result, dict) else str(result),
+                    },
+                )
             return False
 
+        via = str(result.get("via") or "ok")
         if log_callback:
             log_callback(
-                f"[*] Device Flow: Continue submitted ({result.get('via') or 'ok'})"
+                f"[*] Device Flow: Continue submitted (via={via}, "
+                f"code_len={result.get('codeValueLen')}, "
+                f"code_match={result.get('codeMatches')}, "
+                f"url={(result.get('url') or self._page_url(page))[:100]})"
             )
+        url_before = self._page_url(page)
         # Wait until we leave the pure user-code page.
         phase = self._wait_browser_phase(
             page,
@@ -916,8 +1247,44 @@ return {{ ok: false, reason: 'no_continue_control' }};
             log_callback=log_callback,
             label="after Continue",
         )
-        return phase in ("consent", "done")
+        if phase in ("consent", "done"):
+            if log_callback:
+                log_callback(
+                    f"[*] Device Flow: left user-code page → phase={phase} "
+                    f"(was url={url_before[:100]})"
+                )
+            return True
 
+        if log_callback:
+            log_callback(
+                f"[Debug] browser Continue did not leave user-code page "
+                f"(via={via}, phase_after={phase}, "
+                f"url_before={url_before[:120]}, url_after={self._page_url(page)[:120]})"
+            )
+            self._log_browser_diag(
+                page,
+                expected_user_code=user_code,
+                log_callback=log_callback,
+                label="still on user-code after Continue",
+                extra={
+                    "via": via,
+                    "phase_after": phase,
+                    "url_before": url_before,
+                    "submit_result": {
+                        k: result.get(k)
+                        for k in (
+                            "via",
+                            "codeValueLen",
+                            "codeMatches",
+                            "buttonTexts",
+                            "form",
+                            "reason",
+                        )
+                        if k in result
+                    },
+                },
+            )
+        return False
     def _browser_submit_allow(
         self,
         page,
@@ -1162,34 +1529,34 @@ def convert_sso_to_build(
     user_agent: str = DEFAULT_USER_AGENT,
     proxies: dict | None = None,
     page=None,
-    mode: str = "auto",
+    mode: str = "browser",
     log_callback: Callable[[str], None] | None = None,
 ) -> dict[str, Any]:
-    """Convert Web SSO → Build OAuth seed dict.
+    """Convert Web SSO → Build OAuth seed dict (browser verify/approve only).
 
-    mode:
-      - auto    : browser if page given, else http
-      - http    : pure HTTP with SSO cookie auto verify/approve
-      - browser : require page for verify/approve
+    ``mode`` is accepted for backward compatibility; only ``browser`` is
+    supported. HTTP auto-approve was removed because the IdP no longer accepts it.
     """
+    mode = str(mode or "browser").strip().lower() or "browser"
+    if mode in ("http", "auto"):
+        if log_callback:
+            log_callback(
+                f"[*] Device Flow: mode={mode} is deprecated; using browser only"
+            )
+        mode = "browser"
+    if mode != "browser":
+        raise SSOBuildError(f"unsupported Device Flow mode: {mode} (only browser)")
+    if page is None:
+        raise SSOBuildError("browser Device Flow requires an active page")
+
     flow = SSOBuildFlow(
         sso_token,
         user_agent=user_agent,
         proxies=proxies,
     )
-    mode = str(mode or "auto").strip().lower()
-    if mode == "browser":
-        if page is None:
-            raise SSOBuildError("browser mode requires an active page")
-        return flow.convert_with_browser(page, email=email, name=name, log_callback=log_callback)
-    if mode == "auto" and page is not None:
-        try:
-            return flow.convert_with_browser(page, email=email, name=name, log_callback=log_callback)
-        except Exception as exc:
-            if log_callback:
-                log_callback(f"[Debug] browser Device Flow failed, HTTP fallback: {exc}")
-            return flow.convert(email=email, name=name)
-    return flow.convert(email=email, name=name)
+    return flow.convert_with_browser(
+        page, email=email, name=name, log_callback=log_callback
+    )
 
 
 def build_grok2api_import_document(seed: dict[str, Any]) -> dict[str, Any]:

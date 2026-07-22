@@ -130,10 +130,8 @@ DEFAULT_CONFIG = {
     # v3 web tier: auto | basic | super | heavy
     "grok2api_v3_web_tier": "auto",
     # Local Web SSO → Build OAuth Device Flow (aligned with grok-build device_code).
-    # Runs right after registration SSO is obtained; does not need remote grok2api.
+    # Browser-only verify/approve via the registration page; no HTTP fallback.
     "local_build_device_flow": False,
-    # auto | http | browser  (auto: prefer browser page when available)
-    "local_build_mode": "auto",
     "local_build_auth_dir": "./output/build_auths",
     # When true, Build access_token with bot_flag_source=1 is still saved/uploaded
     # and counted as success. Default false: reject as registration failure.
@@ -730,18 +728,23 @@ def convert_sso_to_build_local(
             log_callback(f"[Debug] local Device Flow import failed: {exc}")
         return None
 
-    mode = str(config.get("local_build_mode", "auto") or "auto").strip().lower() or "auto"
     ua = str(config.get("user_agent", "") or "").strip()
     proxies = get_proxies()
     active_page = page
-    if active_page is None and mode in ("auto", "browser"):
+    if active_page is None:
         try:
             active_page = _get_page()
         except Exception:
             active_page = None
+    if active_page is None:
+        if log_callback:
+            log_callback(
+                "[!] 本地 Device Flow 需要注册浏览器 page（仅 browser 模式，无 HTTP 回退）"
+            )
+        return None
 
     if log_callback:
-        log_callback(f"[*] 本地 Web→Build Device Flow 开始 (mode={mode})")
+        log_callback("[*] 本地 Web→Build Device Flow 开始 (mode=browser)")
     try:
         seed = convert_sso_to_build(
             token,
@@ -749,7 +752,7 @@ def convert_sso_to_build_local(
             user_agent=ua,
             proxies=proxies,
             page=active_page,
-            mode=mode,
+            mode="browser",
             log_callback=log_callback,
         )
     except SSOBuildError as exc:
