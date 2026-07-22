@@ -144,6 +144,24 @@ DEFAULT_CONFIG = {
     # JSONL → output/reg_stats.jsonl; analyze: python -m grok_register.reg_stats
     "reg_stats_enabled": True,
     "reg_stats_file": "output/reg_stats.jsonl",
+    # Slow human-like pacing (extra dwells + scale on short pauses). Params logged.
+    "register_pace_enabled": True,
+    "register_pace_scale": 1.6,
+    # Named stage extra waits [lo, hi] seconds (sampled uniformly, then * scale).
+    "register_pace_after_email_s": [0.7, 1.6],
+    "register_pace_after_code_s": [0.6, 1.4],
+    "register_pace_profile_read_s": [1.5, 3.2],
+    "register_pace_post_turnstile_s": [0.9, 2.0],
+    "register_pace_pre_submit_s": [1.0, 2.2],
+    "register_pace_post_sso_s": [1.2, 2.8],
+    "register_pace_device_flow_pre_s": [1.0, 2.4],
+    "register_pace_between_accounts_s": [12.0, 28.0],
+    # Longer Turnstile auto-solve window before first click [lo, hi] seconds.
+    "register_pace_turnstile_auto_s": [2.5, 5.0],
+    "register_pace_turnstile_post_click_s": [3.5, 6.5],
+    # Comma-separated base domains never used for new mail (suffix match).
+    # Temporarily block ohmyaitrash.cloud (high bot_flag rate in telemetry).
+    "email_blocked_domains": "ohmyaitrash.cloud",
     "yyds_preferred_domains": "",
     "yyds_blocked_domains": "",
     "yyds_domain_selection": "random",
@@ -404,15 +422,48 @@ def cloudflare_apply_auth_params(params=None):
     return merged
 
 
+def email_blocked_domain_list() -> list[str]:
+    """Configured blocked base domains (suffix match), lowercased."""
+    return [x.lower() for x in split_config_list(config.get("email_blocked_domains", ""))]
+
+
+def is_email_domain_blocked(domain: str | None) -> bool:
+    """True when domain equals or is a subdomain of a blocked base domain."""
+    d = str(domain or "").strip().lower().lstrip("@")
+    if not d:
+        return False
+    for blocked in email_blocked_domain_list():
+        if not blocked:
+            continue
+        if d == blocked or d.endswith("." + blocked):
+            return True
+    return False
+
+
 def cloudflare_next_default_domain():
-    """按配置轮换选择 Cloudflare 临时邮箱域名。"""
+    """按配置轮换选择 Cloudflare 临时邮箱域名（跳过 email_blocked_domains）。"""
     global _cf_domain_index
-    domains = [x.strip() for x in str(config.get("defaultDomains", "") or "").split(",") if x.strip()]
+    domains = [
+        x.strip()
+        for x in str(config.get("defaultDomains", "") or "").split(",")
+        if x.strip()
+    ]
     if not domains:
         return ""
-    domain = domains[_cf_domain_index % len(domains)]
-    _cf_domain_index += 1
-    return domain
+    allowed = [d for d in domains if not is_email_domain_blocked(d)]
+    if not allowed:
+        raise Exception(
+            "所有 defaultDomains 均被 email_blocked_domains 禁用，"
+            f"blocked={email_blocked_domain_list()!r}"
+        )
+    # Advance index across full list so remove/re-add domains keeps rotation stable,
+    # but only return non-blocked entries.
+    for _ in range(len(domains) * 2):
+        domain = domains[_cf_domain_index % len(domains)]
+        _cf_domain_index += 1
+        if not is_email_domain_blocked(domain):
+            return domain
+    return allowed[0]
 
 
 def cloudflare_is_admin_create_path(path):
@@ -767,6 +818,17 @@ def convert_sso_to_build_local(
 
     if log_callback:
         log_callback("[*] 本地 Web→Build Device Flow 开始 (mode=browser)")
+    try:
+        pace_stage(
+            "register_pace_device_flow_pre_s",
+            1.0,
+            2.4,
+            None,
+            name="device_flow_pre",
+            log_callback=log_callback,
+        )
+    except Exception:
+        pass
     try:
         seed = convert_sso_to_build(
             token,
@@ -1402,11 +1464,108 @@ def create_browser_options(*, unique_profile: bool = False, profile_tag: str = "
     return options
 
 
-def _human_pause_cancel(lo: float = 0.18, hi: float = 0.55, cancel_callback=None) -> None:
-    """Random pause that still respects cancel_callback."""
+def register_pace_enabled() -> bool:
+    value = config.get("register_pace_enabled", True)
+    if isinstance(value, str):
+        return value.strip().lower() in ("1", "true", "yes", "on")
+    return bool(value)
+
+
+def register_pace_scale() -> float:
+    """Overall multiplier for short human pauses and named pace stages."""
+    try:
+        scale = float(config.get("register_pace_scale", 1.6) or 1.6)
+    except Exception:
+        scale = 1.6
+    try:
+        perf = float(PERF_FLAGS.get("sleep_scale", 1.0) or 1.0)
+    except Exception:
+        perf = 1.0
+    # When pace is off, still honor PERF sleep_scale (CLI --fast uses 0.15).
+    if not register_pace_enabled():
+        return max(0.05, perf)
+    return max(0.05, scale * perf)
+
+
+def _parse_pace_range(key: str, default_lo: float, default_hi: float) -> tuple[float, float]:
+    raw = config.get(key, None)
+    if raw is None:
+        return default_lo, default_hi
+    if isinstance(raw, (list, tuple)) and len(raw) >= 2:
+        try:
+            lo, hi = float(raw[0]), float(raw[1])
+            if hi < lo:
+                lo, hi = hi, lo
+            return lo, hi
+        except Exception:
+            return default_lo, default_hi
+    if isinstance(raw, str) and "," in raw:
+        parts = [p.strip() for p in raw.split(",")]
+        try:
+            lo, hi = float(parts[0]), float(parts[1])
+            if hi < lo:
+                lo, hi = hi, lo
+            return lo, hi
+        except Exception:
+            return default_lo, default_hi
+    if isinstance(raw, (int, float)):
+        v = float(raw)
+        return v, v
+    return default_lo, default_hi
+
+
+def _human_pause_cancel(
+    lo: float = 0.18,
+    hi: float = 0.55,
+    cancel_callback=None,
+    *,
+    name: str = "pause",
+) -> float:
+    """Random pause that still respects cancel_callback; records pace params."""
     if hi < lo:
         lo, hi = hi, lo
-    sleep_with_cancel(random.uniform(lo, hi), cancel_callback)
+    scale = register_pace_scale()
+    lo_s, hi_s = lo * scale, hi * scale
+    actual = random.uniform(lo_s, hi_s)
+    try:
+        from grok_register.reg_stats import record_pace
+
+        record_pace(
+            name,
+            actual,
+            lo=lo,
+            hi=hi,
+            lo_scaled=lo_s,
+            hi_scaled=hi_s,
+            scale=scale,
+        )
+    except Exception:
+        pass
+    sleep_with_cancel(actual, cancel_callback)
+    return actual
+
+
+def pace_stage(
+    key: str,
+    default_lo: float,
+    default_hi: float,
+    cancel_callback=None,
+    *,
+    name: str | None = None,
+    log_callback=None,
+) -> float:
+    """Named configurable dwell used to slow the registration pipeline."""
+    if not register_pace_enabled():
+        # Still a tiny jitter so logs/timings stay consistent when disabled.
+        return _human_pause_cancel(0.05, 0.15, cancel_callback, name=name or key)
+    lo, hi = _parse_pace_range(key, default_lo, default_hi)
+    label = name or key.replace("register_pace_", "").replace("_s", "")
+    if log_callback:
+        try:
+            log_callback(f"[*] pace {label}: {lo:.1f}-{hi:.1f}s ×{register_pace_scale():.2f}")
+        except Exception:
+            pass
+    return _human_pause_cancel(lo, hi, cancel_callback, name=label)
 
 
 def _build_request_kwargs(**kwargs):
@@ -1736,10 +1895,13 @@ def yyds_pick_domain(api_key=None, jwt=None):
     if not domains:
         raise Exception("YYDS 娌℃湁杩斿洖浠讳綍鍙敤鍩熷悕")
     blocked = set(split_config_list(config.get("yyds_blocked_domains", "")))
+    blocked.update(email_blocked_domain_list())
     blocked.update(_yyds_runtime_blocked_domains)
     verified = [
         d for d in domains
-        if d.get("isVerified") and str(d.get("domain", "")).strip().lower() not in blocked
+        if d.get("isVerified")
+        and str(d.get("domain", "")).strip().lower() not in blocked
+        and not is_email_domain_blocked(str(d.get("domain", "")).strip())
     ]
     preferred = split_config_list(config.get("yyds_preferred_domains", ""))
     if preferred:
@@ -3601,6 +3763,13 @@ return '';
             if log_callback:
                 detail = f" ({clicked})" if isinstance(clicked, str) else ""
                 log_callback(f"[*] 已填写邮箱并提交: {email}{detail}")
+            pace_stage(
+                "register_pace_after_email_s",
+                0.7,
+                1.6,
+                cancel_callback,
+                name="after_email",
+            )
             return email, dev_token
         sleep_with_cancel(0.5, cancel_callback)
 
@@ -3713,7 +3882,13 @@ def fill_code_and_submit(
         # OTP often auto-submits; treat filled+optional click as success
         if log_callback:
             log_callback(f"[*] 已填写验证码并提交: {code}")
-        _human_pause_cancel(1.0, 1.8, cancel_callback)
+        pace_stage(
+            "register_pace_after_code_s",
+            0.6,
+            1.4,
+            cancel_callback,
+            name="after_code",
+        )
         return code
 
     raise Exception("验证码已获取，但自动填写/提交失败")
@@ -3773,6 +3948,46 @@ def getTurnstileToken(log_callback=None, cancel_callback=None, timeout=55):
         _log(f"Turnstile 已通过，token长度={len(existing)}")
         return existing
 
+    # Pace: longer auto-solve / post-click windows (logged via reg_stats.pace)
+    auto_lo, auto_hi = _parse_pace_range("register_pace_turnstile_auto_s", 1.2, 2.9)
+    post_lo, post_hi = _parse_pace_range("register_pace_turnstile_post_click_s", 2.8, 5.0)
+    if register_pace_enabled():
+        scale = register_pace_scale()
+        auto_lo, auto_hi = auto_lo * scale, auto_hi * scale
+        post_lo, post_hi = post_lo * scale, post_hi * scale
+        try:
+            from grok_register.reg_stats import record_pace, update_attempt
+
+            update_attempt(
+                pace_config={
+                    "scale": scale,
+                    "turnstile_auto_s": [round(auto_lo, 3), round(auto_hi, 3)],
+                    "turnstile_post_click_s": [round(post_lo, 3), round(post_hi, 3)],
+                }
+            )
+            record_pace(
+                "turnstile_windows",
+                0.0,
+                lo=auto_lo,
+                hi=auto_hi,
+                lo_scaled=auto_lo,
+                hi_scaled=auto_hi,
+                scale=scale,
+                extra={
+                    "post_lo": round(post_lo, 3),
+                    "post_hi": round(post_hi, 3),
+                },
+            )
+        except Exception:
+            pass
+        _log(
+            f"Turnstile pace windows auto={auto_lo:.1f}-{auto_hi:.1f}s "
+            f"post_click={post_lo:.1f}-{post_hi:.1f}s"
+        )
+    else:
+        auto_lo, auto_hi = 1.2, 2.9
+        post_lo, post_hi = 2.8, 5.0
+
     try:
         token = solve_turnstile_patient(
             pw_page,
@@ -3781,8 +3996,8 @@ def getTurnstileToken(log_callback=None, cancel_callback=None, timeout=55):
             should_cancel=_should_cancel,
             max_clicks=4,
             timeout=float(timeout or 55),
-            auto_solve_wait=(1.2, 2.9),
-            post_click_wait=(2.8, 5.0),
+            auto_solve_wait=(auto_lo, auto_hi),
+            post_click_wait=(post_lo, post_hi),
             min_token_len=80,
         )
     except RegistrationCancelled:
@@ -3937,7 +4152,14 @@ def fill_profile_and_submit(timeout=120, log_callback=None, cancel_callback=None
             except Exception:
                 pass
             # Read form before engaging Turnstile — looks less scripted
-            _human_pause_cancel(0.7, 1.6, cancel_callback)
+            pace_stage(
+                "register_pace_profile_read_s",
+                1.5,
+                3.2,
+                cancel_callback,
+                name="profile_read",
+                log_callback=log_callback,
+            )
 
         # Patient Turnstile solve (few human clicks; no token injection)
         if _cf_present(page):
@@ -3961,11 +4183,24 @@ def fill_profile_and_submit(timeout=120, log_callback=None, cancel_callback=None
                         if log_callback:
                             log_callback(f"[Debug] Turnstile 触发失败: {cf_exc}")
                     last_cf_retry_at = time.time()
+                    pace_stage(
+                        "register_pace_post_turnstile_s",
+                        0.9,
+                        2.0,
+                        cancel_callback,
+                        name="post_turnstile",
+                    )
                 sleep_with_cancel(0.6, cancel_callback)
                 continue
 
         # Brief pause after CF pass before submit
-        _human_pause_cancel(0.55, 1.2, cancel_callback)
+        pace_stage(
+            "register_pace_pre_submit_s",
+            1.0,
+            2.2,
+            cancel_callback,
+            name="pre_submit",
+        )
         submitted = None
         try:
             submitted = page.click_by_text(submit_labels, role="button")
@@ -4116,6 +4351,14 @@ return titleHit;
                 if name == "sso" and value:
                     if log_callback:
                         log_callback("[*] 已获取到 sso cookie")
+                    pace_stage(
+                        "register_pace_post_sso_s",
+                        1.2,
+                        2.8,
+                        cancel_callback,
+                        name="post_sso",
+                        log_callback=log_callback,
+                    )
                     return value
         except PageDisconnectedError:
             refresh_active_page()
@@ -4149,7 +4392,9 @@ def cli_log(message):
 
 def run_registration_cli(count):
     controller = CliStopController()
-    success_count = 0
+    build_clean_count = 0
+    build_bot_count = 0
+    web_only_count = 0
     fail_count = 0
     retry_count_for_slot = 0
     max_slot_retry = 3
@@ -4160,6 +4405,14 @@ def run_registration_cli(count):
     )
     cli_log(f"[*] 终端模式启动，目标数量: {count}")
     cli_log(f"[*] 成功账号将实时保存到: {accounts_output_file}")
+    try:
+        cli_log(
+            f"[*] pace enabled={register_pace_enabled()} "
+            f"scale={register_pace_scale():.2f} "
+            f"blocked_domains={email_blocked_domain_list()}"
+        )
+    except Exception:
+        pass
     try:
         start_browser(log_callback=cli_log)
         cli_log("[*] 浏览器已启动")
@@ -4285,21 +4538,30 @@ def run_registration_cli(count):
                     else:
                         cli_log(f"[!] NSFW 未开启，继续保存账号: {nsfw_msg}")
                 pool = apply_post_register_pools(sso, email=email, log_callback=cli_log)
+                seed = pool.get("build_seed") or {}
+                access_token = seed.get("access_token") if isinstance(seed, dict) else None
+                has_build = bool(str(access_token or "").strip())
                 if not pool.get("ok", True):
                     fail_count += 1
+                    build_bot_count += 1
                     retry_count_for_slot = 0
                     i += 1
                     _finish(
-                        "bot_flag",
+                        "build_bot",
                         reason="bot_flag_source=1",
                         bot_flagged=True,
-                        access_token=(pool.get("build_seed") or {}).get("access_token"),
+                        has_build_token=True,
+                        access_token=access_token,
                     )
                     cli_log(
-                        f"[-] 注册失败: bot_flag_source=1 ({email})，未导入 Web/Build"
+                        f"[-] build_bot: bot_flag_source=1 ({email})，未导入 Web/Build"
                         "（可设 allow_bot_flagged=true 强制继续）"
                     )
-                    cli_log(f"[*] 当前统计: 成功 {success_count} | 失败 {fail_count}")
+                    cli_log(
+                        f"[*] 当前: build_clean={build_clean_count} "
+                        f"build_bot={build_bot_count} web_only={web_only_count} "
+                        f"error={fail_count}"
+                    )
                 else:
                     try:
                         line = f"{email}----{profile.get('password','')}----{sso}\n"
@@ -4307,28 +4569,40 @@ def run_registration_cli(count):
                             f.write(line)
                     except Exception as file_exc:
                         cli_log(f"[Debug] 保存账号文件失败: {file_exc}")
-                    success_count += 1
                     retry_count_for_slot = 0
                     i += 1
+                    if pool.get("bot_flagged"):
+                        result_class = "build_bot"
+                        build_bot_count += 1
+                        cli_log(f"[+] build_bot(已允许): {email}")
+                    elif has_build:
+                        result_class = "build_clean"
+                        build_clean_count += 1
+                        cli_log(f"[+] build_clean: {email}")
+                    else:
+                        result_class = "web_only"
+                        web_only_count += 1
+                        cli_log(f"[+] web_only: {email}")
                     _finish(
-                        "success",
+                        result_class,
                         reason="bot_flag_allowed" if pool.get("bot_flagged") else "",
                         bot_flagged=bool(pool.get("bot_flagged")),
-                        access_token=(pool.get("build_seed") or {}).get("access_token"),
+                        has_build_token=has_build,
+                        access_token=access_token,
                     )
-                    if pool.get("bot_flagged"):
-                        cli_log(f"[+] 注册成功(bot标记已允许): {email}")
-                    else:
-                        cli_log(f"[+] 注册成功: {email}")
-                    cli_log(f"[*] 当前统计: 成功 {success_count} | 失败 {fail_count}")
+                    cli_log(
+                        f"[*] 当前: build_clean={build_clean_count} "
+                        f"build_bot={build_bot_count} web_only={web_only_count} "
+                        f"error={fail_count}"
+                    )
                     if (
-                        success_count > 0
-                        and success_count % MEMORY_CLEANUP_INTERVAL == 0
+                        build_clean_count > 0
+                        and build_clean_count % MEMORY_CLEANUP_INTERVAL == 0
                         and i < count
                     ):
                         cleanup_runtime_memory(
                             log_callback=cli_log,
-                            reason=f"已成功 {success_count} 个账号，执行定期清理",
+                            reason=f"已 build_clean {build_clean_count} 个账号，执行定期清理",
                         )
             except RegistrationCancelled:
                 cli_log("[!] 注册被停止")
@@ -4377,7 +4651,17 @@ def run_registration_cli(count):
                 start_browser(log_callback=cli_log)
             else:
                 restart_browser(log_callback=cli_log)
-            sleep_with_cancel(1, controller.should_stop)
+            try:
+                pace_stage(
+                    "register_pace_between_accounts_s",
+                    12.0,
+                    28.0,
+                    controller.should_stop,
+                    name="between_accounts",
+                    log_callback=cli_log,
+                )
+            except Exception:
+                sleep_with_cancel(1, controller.should_stop)
     except KeyboardInterrupt:
         controller.stop()
         cli_log("[!] 收到 Ctrl+C，正在停止并清理")
@@ -4385,7 +4669,11 @@ def run_registration_cli(count):
         cli_log(f"[!] 任务异常: {exc}")
     finally:
         cleanup_runtime_memory(log_callback=cli_log, reason="任务结束")
-        cli_log(f"[*] 任务结束。成功 {success_count} | 失败 {fail_count}")
+        cli_log(
+            f"[*] 任务结束。build_clean={build_clean_count} "
+            f"build_bot={build_bot_count} web_only={web_only_count} "
+            f"error={fail_count}"
+        )
 
 
 def main_cli():

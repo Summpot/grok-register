@@ -61,6 +61,7 @@ class RegStatsTests(unittest.TestCase):
                 "duration_ms": 3500,
             }
         )
+        reg_stats.record_pace("profile_read", 2.1, lo=1.5, hi=3.2, scale=1.6)
         rec = reg_stats.finish_attempt(
             "bot_flag",
             reason="bot_flag_source=1",
@@ -68,16 +69,53 @@ class RegStatsTests(unittest.TestCase):
             access_token=_make_jwt({"bot_flag_source": 1, "sub": "uid-1"}),
         )
         self.assertIsNotNone(rec)
-        self.assertEqual(rec["outcome"], "bot_flag")
+        self.assertEqual(rec["outcome"], "build_bot")
+        self.assertEqual(rec["result_class"], "build_bot")
         self.assertEqual(rec["email_domain"], "example.com")
         self.assertEqual(rec["proxy"], "1.2.3.4:8080")  # no credentials
         self.assertEqual(rec["jwt_claims"].get("bot_flag_source"), 1)
         self.assertEqual(rec["turnstile_summary"]["method"], "click")
         self.assertEqual(rec["mouse_summary"]["clicks"], 1)
+        self.assertGreater(rec["pace_summary"]["total_s"], 0)
         self.assertTrue(self.path.is_file())
         rows = reg_stats.load_records(self.path)
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]["attempt_id"], rec["attempt_id"])
+
+    def test_classify_and_normalize(self):
+        self.assertEqual(
+            reg_stats.classify_result(has_build_token=True, bot_flagged=False),
+            "build_clean",
+        )
+        self.assertEqual(
+            reg_stats.classify_result(has_build_token=True, bot_flagged=True),
+            "build_bot",
+        )
+        self.assertEqual(reg_stats.classify_result(has_build_token=False), "web_only")
+        self.assertEqual(
+            reg_stats.normalize_outcome({"outcome": "bot_flag"}),
+            "build_bot",
+        )
+        self.assertEqual(
+            reg_stats.normalize_outcome(
+                {"outcome": "success", "jwt_claims": {"sub": "x"}}
+            ),
+            "build_clean",
+        )
+        self.assertEqual(
+            reg_stats.normalize_outcome({"outcome": "success"}),
+            "web_only",
+        )
+
+    def test_finish_build_clean(self):
+        reg_stats.begin_attempt(worker_id=1)
+        rec = reg_stats.finish_attempt(
+            "success",
+            access_token=_make_jwt({"sub": "u1", "bot_flag_source": 0}),
+            has_build_token=True,
+            bot_flagged=False,
+        )
+        self.assertEqual(rec["outcome"], "build_clean")
 
     def test_disabled_is_noop(self):
         reg_stats.set_enabled(False)
@@ -107,7 +145,7 @@ class RegStatsTests(unittest.TestCase):
     def test_analyze_bot_flag_rates(self):
         records = [
             {
-                "outcome": "success",
+                "outcome": "build_clean",
                 "email_domain": "good.com",
                 "proxy": "10.0.0.1:1",
                 "duration_ms": 10000,
@@ -117,9 +155,10 @@ class RegStatsTests(unittest.TestCase):
                     "force_used": False,
                 },
                 "mouse_summary": {"last_click_delay_ms": 80, "last_steps_mid": 18},
+                "pace_summary": {"total_s": 8.0},
             },
             {
-                "outcome": "success",
+                "outcome": "success",  # legacy → web_only (no jwt)
                 "email_domain": "good.com",
                 "proxy": "10.0.0.1:1",
                 "duration_ms": 12000,
@@ -131,7 +170,7 @@ class RegStatsTests(unittest.TestCase):
                 "mouse_summary": {"last_click_delay_ms": 100, "last_steps_mid": 22},
             },
             {
-                "outcome": "bot_flag",
+                "outcome": "bot_flag",  # legacy → build_bot
                 "reason": "bot_flag_source=1",
                 "email_domain": "bad.com",
                 "proxy": "10.0.0.2:1",
@@ -144,7 +183,7 @@ class RegStatsTests(unittest.TestCase):
                 "mouse_summary": {"last_click_delay_ms": 60, "last_steps_mid": 15},
             },
             {
-                "outcome": "bot_flag",
+                "outcome": "build_bot",
                 "reason": "bot_flag_source=1",
                 "email_domain": "bad.com",
                 "proxy": "10.0.0.2:1",
@@ -159,14 +198,16 @@ class RegStatsTests(unittest.TestCase):
         ]
         report = reg_stats.analyze_records(records)
         self.assertEqual(report["total"], 4)
-        self.assertEqual(report["by_outcome"]["bot_flag"], 2)
-        self.assertAlmostEqual(report["bot_flag_rate"], 0.5)
-        bot_f = report["feature_compare"]["bot_flag"]
-        ok_f = report["feature_compare"]["success"]
+        self.assertEqual(report["build_bot"], 2)
+        self.assertEqual(report["build_clean"], 1)
+        self.assertEqual(report["web_only"], 1)
+        self.assertAlmostEqual(report["build_token_bot_rate"], 2 / 3, places=2)
+        bot_f = report["feature_compare"]["build_bot"]
+        ok_f = report["feature_compare"]["build_clean"]
         self.assertGreater(bot_f["avg_clicks"], ok_f["avg_clicks"])
         text = reg_stats.format_analysis(report)
-        self.assertIn("bot_flag", text)
-        self.assertTrue(any("点击" in h or "bot_flag" in h for h in report["hints"]))
+        self.assertIn("build_clean", text)
+        self.assertTrue(any("Build" in h or "build_" in h for h in report["hints"]))
 
     def test_mouse_click_records_when_attempt_active(self):
         from grok_register.browser_adapter import mouse_click_xy

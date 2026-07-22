@@ -249,12 +249,22 @@ uv run python cf_mail_debug.py `
 - **legacy**：`grok2api_remote_base` 可填站点根或 `/admin/api`；优先 `/tokens/add`。
 - 打开远端：设 `grok2api_auto_add_remote: true`，并填 `remote_base` +（v3 密码 **或** legacy `app_key`）。
 - **bot 标记**：Device Flow 后若 Build `access_token` 含 `bot_flag_source=1`，默认视为失败且不上传；设 `allow_bot_flagged: true` 可仍保存/导入（部分场景账号仍可用）。
-- **注册参数采集**（分析 bot_flag / 失败原因）：默认开启，每次尝试写入 `output/reg_stats.jsonl`（含 Turnstile 鼠标路径随机数、点击次数、代理 host、邮箱域名、JWT 安全 claims 子集等，**不含**密码/完整 token）。
+- **注册参数采集**（分析 bot_flag / 失败原因）：默认开启，每次尝试写入 `output/reg_stats.jsonl`（含 Turnstile 鼠标路径随机数、pace 时延参数、点击次数、代理 host、邮箱域名、JWT 安全 claims 子集等，**不含**密码/完整 token）。
+- **成功口径**（primary）：
+  - `build_clean`：拿到无 `bot_flag` 的 Build token（真正成功）
+  - `build_bot`：Build token 含 `bot_flag_source=1`
+  - `web_only`：有 SSO / 可能写账号文件，但无干净 Build token
+- **放慢节奏**（`register_pace_*`）：阶段 dwell + 账号间隔；参数写入 `pace` / `pace_summary`。
+- **禁用邮箱域**：`email_blocked_domains`（后缀匹配），默认暂时禁用 `ohmyaitrash.cloud`。
 
 ```json
 {
   "reg_stats_enabled": true,
-  "reg_stats_file": "output/reg_stats.jsonl"
+  "reg_stats_file": "output/reg_stats.jsonl",
+  "register_pace_enabled": true,
+  "register_pace_scale": 1.6,
+  "register_pace_between_accounts_s": [12, 28],
+  "email_blocked_domains": "ohmyaitrash.cloud"
 }
 ```
 

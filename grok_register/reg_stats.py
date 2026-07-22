@@ -231,11 +231,15 @@ def begin_attempt(**meta: Any) -> dict[str, Any] | None:
         "stages": {},
         "turnstile": [],
         "mouse": [],
+        "pace": [],
+        "pace_config": {},
         "timings_ms": {},
         "jwt_claims": {},
         "outcome": "",
+        "result_class": "",
         "reason": "",
         "bot_flagged": False,
+        "has_build_token": False,
         "error": "",
         "meta": {},
     }
@@ -283,10 +287,134 @@ def update_attempt(**fields: Any) -> None:
             attempt["jwt_claims"] = v
         elif k == "access_token":
             attempt["jwt_claims"] = safe_jwt_claims(str(v or ""))
-        elif k in attempt and k not in ("turnstile", "mouse", "stages", "timings_ms", "t0"):
+            attempt["has_build_token"] = bool(str(v or "").strip())
+        elif k == "pace_config" and isinstance(v, dict):
+            attempt["pace_config"] = dict(v)
+        elif k == "has_build_token":
+            attempt["has_build_token"] = bool(v)
+        elif k in attempt and k not in (
+            "turnstile",
+            "mouse",
+            "pace",
+            "stages",
+            "timings_ms",
+            "t0",
+        ):
             attempt[k] = v
         else:
             attempt["meta"][k] = v
+
+
+def record_pace(
+    name: str,
+    actual_s: float,
+    *,
+    lo: float | None = None,
+    hi: float | None = None,
+    lo_scaled: float | None = None,
+    hi_scaled: float | None = None,
+    scale: float | None = None,
+    extra: dict[str, Any] | None = None,
+) -> None:
+    """Record one paced sleep (name + sampled seconds + config window)."""
+    attempt = current_attempt()
+    if not attempt:
+        return
+    events = attempt.setdefault("pace", [])
+    if len(events) >= 80:
+        return
+    entry: dict[str, Any] = {
+        "name": str(name or "pause")[:64],
+        "actual_s": round(float(actual_s or 0.0), 4),
+        "t_ms": int((time.time() - float(attempt.get("t0") or time.time())) * 1000),
+    }
+    if lo is not None:
+        entry["lo"] = round(float(lo), 4)
+    if hi is not None:
+        entry["hi"] = round(float(hi), 4)
+    if lo_scaled is not None:
+        entry["lo_scaled"] = round(float(lo_scaled), 4)
+    if hi_scaled is not None:
+        entry["hi_scaled"] = round(float(hi_scaled), 4)
+    if scale is not None:
+        entry["scale"] = round(float(scale), 4)
+    if extra and isinstance(extra, dict):
+        entry.update({str(k)[:40]: v for k, v in extra.items() if v is not None})
+    events.append(entry)
+    # Aggregate timing bucket
+    try:
+        tm = attempt.setdefault("timings_ms", {})
+        key = f"pace_{entry['name']}_ms"
+        tm[key] = int(tm.get(key, 0) or 0) + int(float(actual_s or 0) * 1000)
+        tm["pace_total_ms"] = int(tm.get("pace_total_ms", 0) or 0) + int(
+            float(actual_s or 0) * 1000
+        )
+    except Exception:
+        pass
+
+
+def classify_result(
+    *,
+    bot_flagged: bool = False,
+    has_build_token: bool = False,
+    error: bool = False,
+    cancelled: bool = False,
+    retry: bool = False,
+) -> str:
+    """Primary result classes for metrics.
+
+    - build_clean: Build access_token without bot_flag
+    - build_bot: Build token with bot_flag_source=1 (rejected or allowed)
+    - web_only: SSO path succeeded without a Build token
+    - error / cancelled / retry: non-success terminal states
+    """
+    if cancelled:
+        return "cancelled"
+    if retry:
+        return "retry"
+    if error:
+        return "error"
+    if bot_flagged:
+        return "build_bot"
+    if has_build_token:
+        return "build_clean"
+    return "web_only"
+
+
+def normalize_outcome(record: dict[str, Any]) -> str:
+    """Map historical + new outcomes onto build_clean / build_bot / web_only / …"""
+    if not isinstance(record, dict):
+        return "unknown"
+    explicit = str(record.get("result_class") or "").strip()
+    if explicit in (
+        "build_clean",
+        "build_bot",
+        "web_only",
+        "error",
+        "retry",
+        "cancelled",
+    ):
+        return explicit
+    outcome = str(record.get("outcome") or "").strip()
+    if outcome in (
+        "build_clean",
+        "build_bot",
+        "web_only",
+        "error",
+        "retry",
+        "cancelled",
+    ):
+        return outcome
+    if outcome == "bot_flag" or record.get("bot_flagged"):
+        return "build_bot"
+    jc = record.get("jwt_claims") or {}
+    if isinstance(jc, dict) and jc.get("bot_flag_source") in (1, "1", True):
+        return "build_bot"
+    if outcome == "success":
+        if record.get("has_build_token") or (isinstance(jc, dict) and jc):
+            return "build_clean"
+        return "web_only"
+    return outcome or "unknown"
 
 
 def mark_stage(name: str, *, status: str = "ok", **extra: Any) -> None:
@@ -365,30 +493,77 @@ def finish_attempt(
     bot_flagged: bool | None = None,
     error: str = "",
     access_token: str | None = None,
+    has_build_token: bool | None = None,
     extra: dict[str, Any] | None = None,
 ) -> dict[str, Any] | None:
-    """Finalize and persist the current attempt. Clears thread-local state."""
+    """Finalize and persist the current attempt. Clears thread-local state.
+
+    Preferred outcomes: build_clean | build_bot | web_only | error | retry | cancelled.
+    Legacy aliases (success / bot_flag) are normalized into result_class.
+    """
     attempt = current_attempt()
     if not attempt:
         return None
     try:
         if access_token:
             attempt["jwt_claims"] = safe_jwt_claims(access_token)
-        attempt["outcome"] = str(outcome or "unknown")
-        attempt["reason"] = str(reason or "")[:240]
+            attempt["has_build_token"] = True
+            # Infer bot flag from JWT when caller forgot the flag.
+            jc = attempt.get("jwt_claims") or {}
+            if isinstance(jc, dict) and jc.get("bot_flag_source") in (1, "1", True):
+                attempt["bot_flagged"] = True
+        if has_build_token is not None:
+            attempt["has_build_token"] = bool(has_build_token)
+        elif access_token is not None:
+            attempt["has_build_token"] = bool(str(access_token or "").strip())
+
         if bot_flagged is not None:
             attempt["bot_flagged"] = bool(bot_flagged)
-        elif outcome == "bot_flag":
+        elif outcome in ("bot_flag", "build_bot"):
             attempt["bot_flagged"] = True
+
+        raw_outcome = str(outcome or "unknown")
+        # Auto-classify when caller still uses legacy labels or leaves it open.
+        if raw_outcome in ("success", "ok", ""):
+            classified = classify_result(
+                bot_flagged=bool(attempt.get("bot_flagged")),
+                has_build_token=bool(attempt.get("has_build_token")),
+            )
+        elif raw_outcome == "bot_flag":
+            classified = "build_bot"
+        elif raw_outcome in (
+            "build_clean",
+            "build_bot",
+            "web_only",
+            "error",
+            "retry",
+            "cancelled",
+        ):
+            classified = raw_outcome
+        else:
+            classified = classify_result(
+                bot_flagged=bool(attempt.get("bot_flagged")),
+                has_build_token=bool(attempt.get("has_build_token")),
+                error=raw_outcome == "error" or bool(error),
+                cancelled=raw_outcome == "cancelled",
+                retry=raw_outcome == "retry",
+            )
+            if classified == "web_only" and raw_outcome not in ("", "success", "ok"):
+                classified = raw_outcome
+
+        attempt["outcome"] = classified
+        attempt["result_class"] = classified
+        attempt["reason"] = str(reason or "")[:240]
         if error:
             attempt["error"] = str(error)[:400]
         if extra and isinstance(extra, dict):
             attempt.setdefault("meta", {}).update(extra)
         t0 = float(attempt.get("t0") or time.time())
         attempt["duration_ms"] = int((time.time() - t0) * 1000)
-        # Summarize turnstile for quick filtering
+        # Summarize turnstile / mouse / pace for quick filtering
         attempt["turnstile_summary"] = _summarize_turnstile(attempt.get("turnstile") or [])
         attempt["mouse_summary"] = _summarize_mouse(attempt.get("mouse") or [])
+        attempt["pace_summary"] = _summarize_pace(attempt.get("pace") or [])
         record = _public_record(attempt)
         _append_jsonl(record)
         return record
@@ -448,6 +623,33 @@ def _summarize_mouse(samples: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
+def _summarize_pace(events: list[dict[str, Any]]) -> dict[str, Any]:
+    if not events:
+        return {"events": 0, "total_s": 0.0}
+    by_name: dict[str, list[float]] = defaultdict(list)
+    total = 0.0
+    for e in events:
+        try:
+            s = float(e.get("actual_s") or 0.0)
+        except Exception:
+            s = 0.0
+        total += s
+        by_name[str(e.get("name") or "pause")].append(s)
+    named = {
+        name: {
+            "n": len(vals),
+            "total_s": round(sum(vals), 3),
+            "mean_s": round(sum(vals) / len(vals), 3) if vals else 0.0,
+        }
+        for name, vals in by_name.items()
+    }
+    return {
+        "events": len(events),
+        "total_s": round(total, 3),
+        "by_name": named,
+    }
+
+
 def _public_record(attempt: dict[str, Any]) -> dict[str, Any]:
     """Strip internal fields before disk write."""
     out = dict(attempt)
@@ -497,7 +699,7 @@ def load_records(path: str | Path | None = None) -> list[dict[str, Any]]:
 
 
 def analyze_records(records: list[dict[str, Any]]) -> dict[str, Any]:
-    """Aggregate outcomes and correlate features with bot_flag vs success."""
+    """Aggregate by build_clean / build_bot / web_only (legacy outcomes normalized)."""
     by_outcome: Counter[str] = Counter()
     by_domain: dict[str, Counter[str]] = defaultdict(Counter)
     by_proxy: dict[str, Counter[str]] = defaultdict(Counter)
@@ -507,10 +709,11 @@ def analyze_records(records: list[dict[str, Any]]) -> dict[str, Any]:
     mouse_delay: dict[str, list[float]] = defaultdict(list)
     mouse_steps: dict[str, list[float]] = defaultdict(list)
     force_rate: dict[str, list[int]] = defaultdict(list)
+    pace_total: dict[str, list[float]] = defaultdict(list)
     reasons: Counter[str] = Counter()
 
     for r in records:
-        outcome = str(r.get("outcome") or "unknown")
+        outcome = normalize_outcome(r)
         by_outcome[outcome] += 1
         if r.get("reason"):
             reasons[str(r.get("reason"))[:120]] += 1
@@ -543,32 +746,47 @@ def analyze_records(records: list[dict[str, Any]]) -> dict[str, Any]:
             except Exception:
                 pass
         force_rate[outcome].append(1 if ts.get("force_used") else 0)
+        ps = r.get("pace_summary") or {}
+        if ps.get("total_s") is not None:
+            try:
+                pace_total[outcome].append(float(ps["total_s"]))
+            except Exception:
+                pass
 
     def _avg(xs: list[float] | list[int]) -> float | None:
         if not xs:
             return None
         return round(sum(xs) / len(xs), 2)
 
-    def _rate_map(counter_map: dict[str, Counter[str]], key: str = "bot_flag") -> list[dict[str, Any]]:
+    def _rate_map(counter_map: dict[str, Counter[str]]) -> list[dict[str, Any]]:
         rows = []
         for name, c in counter_map.items():
             total = sum(c.values())
             if total <= 0:
                 continue
-            bot = c.get(key, 0)
-            ok = c.get("success", 0)
+            clean = c.get("build_clean", 0)
+            bot = c.get("build_bot", 0)
+            web = c.get("web_only", 0)
+            build_n = clean + bot
             rows.append(
                 {
                     "key": name,
                     "n": total,
-                    "success": ok,
+                    "build_clean": clean,
+                    "build_bot": bot,
+                    "web_only": web,
+                    "build_clean_rate": round(clean / total, 3),
+                    "build_bot_rate": round(bot / total, 3),
+                    "build_token_bot_rate": round(bot / build_n, 3) if build_n else None,
+                    # legacy aliases for older scripts
+                    "success": clean,
                     "bot_flag": bot,
+                    "success_rate": round(clean / total, 3),
                     "bot_rate": round(bot / total, 3),
-                    "success_rate": round(ok / total, 3),
-                    "other": total - ok - bot,
+                    "other": total - clean - bot - web,
                 }
             )
-        rows.sort(key=lambda x: (-x["n"], -x["bot_rate"]))
+        rows.sort(key=lambda x: (-x["n"], -(x["build_bot_rate"] or 0)))
         return rows
 
     feature_compare = {}
@@ -580,14 +798,28 @@ def analyze_records(records: list[dict[str, Any]]) -> dict[str, Any]:
             "avg_click_delay_ms": _avg(mouse_delay.get(outcome, [])),
             "avg_steps_mid": _avg(mouse_steps.get(outcome, [])),
             "force_used_rate": _avg(force_rate.get(outcome, [])),
+            "avg_pace_total_s": _avg(pace_total.get(outcome, [])),
         }
 
     total = sum(by_outcome.values())
+    clean = by_outcome.get("build_clean", 0)
+    bot = by_outcome.get("build_bot", 0)
+    web = by_outcome.get("web_only", 0)
+    build_n = clean + bot
     return {
         "total": total,
         "by_outcome": dict(by_outcome),
-        "success_rate": round(by_outcome.get("success", 0) / total, 3) if total else 0.0,
-        "bot_flag_rate": round(by_outcome.get("bot_flag", 0) / total, 3) if total else 0.0,
+        # Primary metrics (Build-centric)
+        "build_clean": clean,
+        "build_bot": bot,
+        "web_only": web,
+        "build_clean_rate": round(clean / total, 3) if total else 0.0,
+        "build_bot_rate": round(bot / total, 3) if total else 0.0,
+        "web_only_rate": round(web / total, 3) if total else 0.0,
+        "build_token_bot_rate": round(bot / build_n, 3) if build_n else None,
+        # Legacy fields (map to new classes for compatibility)
+        "success_rate": round(clean / total, 3) if total else 0.0,
+        "bot_flag_rate": round(bot / total, 3) if total else 0.0,
         "top_reasons": reasons.most_common(15),
         "by_email_domain": _rate_map(by_domain)[:20],
         "by_proxy": _rate_map(by_proxy)[:20],
@@ -604,66 +836,69 @@ def _analysis_hints(
     by_domain: dict[str, Counter[str]],
 ) -> list[str]:
     hints: list[str] = []
-    bot_n = by_outcome.get("bot_flag", 0)
-    ok_n = by_outcome.get("success", 0)
-    if bot_n == 0:
-        hints.append("暂无 bot_flag 样本；继续采集后再对比 success vs bot_flag 特征。")
+    bot_n = by_outcome.get("build_bot", 0)
+    clean_n = by_outcome.get("build_clean", 0)
+    web_n = by_outcome.get("web_only", 0)
+    build_n = bot_n + clean_n
+    if build_n == 0:
+        hints.append("暂无 Build token 样本；检查 local_build_device_flow / Device Flow。")
         return hints
-    bot_f = feature_compare.get("bot_flag") or {}
-    ok_f = feature_compare.get("success") or {}
+    if bot_n == 0:
+        hints.append(
+            f"暂无 build_bot；build_clean={clean_n} web_only={web_n}。"
+        )
+        return hints
+    bot_f = feature_compare.get("build_bot") or {}
+    ok_f = feature_compare.get("build_clean") or {}
+    if ok_f.get("avg_duration_ms") is not None and bot_f.get("avg_duration_ms") is not None:
+        if ok_f["avg_duration_ms"] > bot_f["avg_duration_ms"] + 3000:
+            hints.append(
+                f"build_clean 平均更慢"
+                f"（{ok_f['avg_duration_ms']:.0f}ms vs bot {bot_f['avg_duration_ms']:.0f}ms），"
+                "继续放慢节奏可能有帮助。"
+            )
+    if ok_f.get("avg_pace_total_s") is not None and bot_f.get("avg_pace_total_s") is not None:
+        if ok_f["avg_pace_total_s"] > bot_f["avg_pace_total_s"] + 1.0:
+            hints.append(
+                f"build_clean 主动 pace 更长"
+                f"（{ok_f['avg_pace_total_s']}s vs {bot_f['avg_pace_total_s']}s）。"
+            )
     if ok_f.get("avg_clicks") is not None and bot_f.get("avg_clicks") is not None:
         if bot_f["avg_clicks"] > ok_f["avg_clicks"] + 0.4:
             hints.append(
-                f"bot_flag 平均 Turnstile 点击次数更高"
-                f"（{bot_f['avg_clicks']} vs success {ok_f['avg_clicks']}），"
-                "可尝试更耐心等待 auto-solve、减少 re-click。"
+                f"build_bot 平均 Turnstile 点击更高"
+                f"（{bot_f['avg_clicks']} vs {ok_f['avg_clicks']}）。"
             )
-        elif bot_f["avg_clicks"] + 0.4 < ok_f["avg_clicks"]:
-            hints.append(
-                f"bot_flag 平均点击更少（{bot_f['avg_clicks']} vs {ok_f['avg_clicks']}），"
-                "点击次数可能不是主因，关注代理/域名/时延。"
-            )
-    if ok_f.get("force_used_rate") is not None and bot_f.get("force_used_rate") is not None:
-        if bot_f["force_used_rate"] > ok_f["force_used_rate"] + 0.15:
-            hints.append(
-                "bot_flag 更常使用 force 点击；可关闭/延后 force fallback。"
-            )
-    # method rates
-    method_rates = []
-    for method, c in by_ts_method.items():
-        total = sum(c.values())
-        if total < 3:
-            continue
-        method_rates.append((method, c.get("bot_flag", 0) / total, total))
-    method_rates.sort(key=lambda x: -x[1])
-    if method_rates and method_rates[0][1] >= 0.4:
-        m, rate, n = method_rates[0]
-        hints.append(f"Turnstile method={m!r} bot_flag 率偏高 ({rate:.0%}, n={n})。")
+    token_bot_rate = bot_n / build_n
+    hints.append(
+        f"Build token bot 率={token_bot_rate:.0%} "
+        f"(build_bot={bot_n} / build_clean={clean_n})；web_only={web_n}。"
+    )
     # domain
     domain_rates = []
     for dom, c in by_domain.items():
         total = sum(c.values())
         if total < 3:
             continue
-        domain_rates.append((dom, c.get("bot_flag", 0) / total, total))
+        domain_rates.append((dom, c.get("build_bot", 0) / total, total))
     domain_rates.sort(key=lambda x: -x[1])
     if domain_rates and domain_rates[0][1] >= 0.5:
         d, rate, n = domain_rates[0]
-        hints.append(f"邮箱域名 {d} bot_flag 率偏高 ({rate:.0%}, n={n})，可考虑换域。")
-    if not hints:
-        hints.append(
-            f"已有 bot_flag={bot_n} / success={ok_n}；"
-            "查看 by_proxy / by_email_domain / feature_compare 找最强相关维度。"
-        )
+        hints.append(f"邮箱域名 {d} build_bot 率偏高 ({rate:.0%}, n={n})。")
     return hints
 
 
 def format_analysis(report: dict[str, Any]) -> str:
     lines = [
         "=== Registration attempt analysis ===",
-        f"total={report.get('total', 0)}  "
-        f"success_rate={report.get('success_rate')}  "
-        f"bot_flag_rate={report.get('bot_flag_rate')}",
+        f"total={report.get('total', 0)}",
+        f"  build_clean={report.get('build_clean')}  "
+        f"rate={report.get('build_clean_rate')}  "
+        f"(primary success metric)",
+        f"  build_bot={report.get('build_bot')}  "
+        f"rate={report.get('build_bot_rate')}  "
+        f"token_bot_rate={report.get('build_token_bot_rate')}",
+        f"  web_only={report.get('web_only')}  rate={report.get('web_only_rate')}",
         f"by_outcome: {report.get('by_outcome')}",
         "",
         "-- feature_compare (avg metrics by outcome) --",
@@ -674,22 +909,25 @@ def format_analysis(report: dict[str, Any]) -> str:
     lines.append("-- by_turnstile_method (top) --")
     for row in (report.get("by_turnstile_method") or [])[:8]:
         lines.append(
-            f"  {row['key']}: n={row['n']} bot_rate={row['bot_rate']} "
-            f"success_rate={row['success_rate']}"
+            f"  {row['key']}: n={row['n']} clean={row['build_clean']} "
+            f"bot={row['build_bot']} web={row['web_only']} "
+            f"token_bot_rate={row['build_token_bot_rate']}"
         )
     lines.append("")
     lines.append("-- by_email_domain (top) --")
     for row in (report.get("by_email_domain") or [])[:8]:
         lines.append(
-            f"  {row['key']}: n={row['n']} bot_rate={row['bot_rate']} "
-            f"success_rate={row['success_rate']}"
+            f"  {row['key']}: n={row['n']} clean={row['build_clean']} "
+            f"bot={row['build_bot']} web={row['web_only']} "
+            f"token_bot_rate={row['build_token_bot_rate']}"
         )
     lines.append("")
     lines.append("-- by_proxy (top) --")
     for row in (report.get("by_proxy") or [])[:8]:
         lines.append(
-            f"  {row['key']}: n={row['n']} bot_rate={row['bot_rate']} "
-            f"success_rate={row['success_rate']}"
+            f"  {row['key']}: n={row['n']} clean={row['build_clean']} "
+            f"bot={row['build_bot']} web={row['web_only']} "
+            f"token_bot_rate={row['build_token_bot_rate']}"
         )
     if report.get("top_reasons"):
         lines.append("")

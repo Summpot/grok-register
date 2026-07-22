@@ -87,8 +87,13 @@ def log(worker_id: int | str, msg: str) -> None:
 
 _stats_lock = threading.Lock()
 _stats = {
-    "reg_success": 0,
+    # Primary: clean Build token without bot_flag
+    "build_clean": 0,
+    "build_bot": 0,
+    "web_only": 0,
     "reg_fail": 0,
+    # Legacy alias: counts build_clean only (not web_only)
+    "reg_success": 0,
 }
 
 
@@ -378,30 +383,47 @@ def _register_one_body(
             except Exception:
                 pass
 
+        seed = pool.get("build_seed") or {}
+        access_token = seed.get("access_token") if isinstance(seed, dict) else None
+        has_build = bool(str(access_token or "").strip())
+
         if not pool.get("ok", True):
             log(
                 worker_id,
-                f"! 注册失败: bot_flag_source=1 ({email})，未导入 Web/Build"
+                f"! build_bot: bot_flag_source=1 ({email})，未导入 Web/Build"
                 "（可设 allow_bot_flagged=true 强制继续）",
             )
             reg.mark_error(email or "", reason="bot_flag_source=1")
+            _inc("build_bot")
             _inc("reg_fail")
             stats_finish(
-                "bot_flag",
+                "build_bot",
                 reason="bot_flag_source=1",
                 bot_flagged=True,
-                access_token=(pool.get("build_seed") or {}).get("access_token"),
+                has_build_token=True,
+                access_token=access_token,
             )
             return None
+
+        # Classified success: build_clean | web_only | build_bot(allowed)
+        if pool.get("bot_flagged"):
+            result_class = "build_bot"
+            _inc("build_bot")
+            log(worker_id, f"+ build_bot(已允许): {email}")
+        elif has_build:
+            result_class = "build_clean"
+            _inc("build_clean")
+            _inc("reg_success")
+            log(worker_id, f"+ build_clean: {email}")
+        else:
+            result_class = "web_only"
+            _inc("web_only")
+            log(worker_id, f"+ web_only (无干净 Build token): {email}")
 
         line = f"{email}----{password}----{sso}\n"
         os.makedirs(os.path.dirname(os.path.abspath(accounts_file)) or ".", exist_ok=True)
         with open(accounts_file, "a", encoding="utf-8") as f:
             f.write(line)
-        if pool.get("bot_flagged"):
-            log(worker_id, f"+ 注册成功(bot标记已允许): {email}")
-        else:
-            log(worker_id, f"+ 注册成功: {email}")
         reg.mark_used(email, password)
 
         job = {
@@ -410,16 +432,17 @@ def _register_one_body(
             "sso": sso,
             "profile": profile,
             "idx": idx,
-            "build": bool(pool.get("build_seed")),
+            "build": has_build,
+            "result_class": result_class,
             "skipped_web": bool(pool.get("skipped_web")),
         }
 
-        _inc("reg_success")
         stats_finish(
-            "success",
+            result_class,
             reason="bot_flag_allowed" if pool.get("bot_flagged") else "",
             bot_flagged=bool(pool.get("bot_flagged")),
-            access_token=(pool.get("build_seed") or {}).get("access_token"),
+            has_build_token=has_build,
+            access_token=access_token,
         )
         return job
     except Exception as exc:
@@ -501,6 +524,21 @@ def _register_worker(
             # register_one already counted fail on exception path
             pass
 
+        # Between-account dwell (pace) — reduces bursty same-IP patterns
+        if not _cancel_event.is_set():
+            try:
+                if reg.register_pace_enabled():
+                    reg.pace_stage(
+                        "register_pace_between_accounts_s",
+                        12.0,
+                        28.0,
+                        lambda: _cancel_event.is_set(),
+                        name="between_accounts",
+                        log_callback=lambda m: log(worker_id, m),
+                    )
+            except Exception:
+                pass
+
     # worker exit: free browser + this thread's Playwright driver
     try:
         reg.stop_browser()
@@ -528,8 +566,13 @@ def main() -> int:
     )
     parser.add_argument("--threads", type=int, default=1, help="注册并发线程数（1-10）")
     parser.add_argument("--accounts-file", default=str(OUTPUT_DIR / "accounts_cli.txt"))
-    parser.add_argument("--fast", action="store_true", default=True, help="快速模式（默认开）：压缩 sleep、关截图")
-    parser.add_argument("--no-fast", action="store_true", help="关闭快速模式")
+    parser.add_argument(
+        "--fast",
+        action="store_true",
+        default=False,
+        help="快速模式（默认关）：压缩 sleep、关截图；与 register_pace 冲突时仍会降低 sleep_scale",
+    )
+    parser.add_argument("--no-fast", action="store_true", help="关闭快速模式（默认）")
     parser.add_argument("--no-browser-reuse", action="store_true", help="每号强制 quit 浏览器")
     parser.add_argument("--browser-recycle-every", type=int, default=25, help="复用 N 次后完整回收")
     parser.add_argument("--cookie-snapshot", action="store_true", help="注册成功写 cookie 快照（默认关，fast）")
@@ -540,7 +583,12 @@ def main() -> int:
     threads = max(1, min(args.threads, 10))
     fast = bool(args.fast) and not bool(args.no_fast)
 
-    # perf knobs
+    # perf knobs — default slow (pace); --fast shrinks sleep_scale
+    pace_on = True
+    try:
+        pace_on = bool(reg.register_pace_enabled())
+    except Exception:
+        pace_on = True
     reg.configure_perf(
         fast=fast,
         sleep_scale=0.15 if fast else 1.0,
@@ -550,6 +598,18 @@ def main() -> int:
         browser_reuse=not args.no_browser_reuse,
         browser_recycle_every=max(1, int(args.browser_recycle_every)),
     )
+    try:
+        scale = reg.register_pace_scale()
+        print(
+            f"[*] pace enabled={pace_on} scale={scale:.2f} "
+            f"(between_accounts + stage dwells; stats→reg_stats.jsonl)",
+            flush=True,
+        )
+        blocked = reg.email_blocked_domain_list()
+        if blocked:
+            print(f"[*] email_blocked_domains={blocked}", flush=True)
+    except Exception as exc:
+        print(f"[*] pace/domain init: {exc}", flush=True)
 
     # 断点续跑
     done_count = 0
@@ -685,10 +745,14 @@ def main() -> int:
     with _stats_lock:
         s = dict(_stats)
     print(
-        f"=== 完成: 注册成功 {s.get('reg_success', 0)}, 注册失败 {s.get('reg_fail', 0)} ===",
+        f"=== 完成: build_clean={s.get('build_clean', 0)} "
+        f"build_bot={s.get('build_bot', 0)} "
+        f"web_only={s.get('web_only', 0)} "
+        f"error={s.get('reg_fail', 0)} "
+        f"(reg_success=build_clean={s.get('reg_success', 0)}) ===",
         flush=True,
     )
-    return 0 if s.get("reg_success", 0) > 0 else 1
+    return 0 if s.get("build_clean", 0) > 0 or s.get("reg_success", 0) > 0 else 1
 
 
 if __name__ == "__main__":
