@@ -129,7 +129,7 @@ DEFAULT_CONFIG = {
     "grok2api_remote_password": "",
     # v3 web tier: auto | basic | super | heavy
     "grok2api_v3_web_tier": "auto",
-    # Local Web SSO → Build OAuth Device Flow (port of grok2api sso_build.go).
+    # Local Web SSO → Build OAuth Device Flow (aligned with grok-build device_code).
     # Runs right after registration SSO is obtained; does not need remote grok2api.
     "local_build_device_flow": False,
     # auto | http | browser  (auto: prefer browser page when available)

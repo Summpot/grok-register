@@ -1,16 +1,18 @@
 """Local Grok Web SSO → Build OAuth conversion via xAI Device Flow.
 
-Port of grok2api backend/internal/infra/provider/web/sso_build.go:
+Aligned with grok-build (`xai-grok-shell` `auth/device_code.rs` +
+`auth/config.rs` default OAuth2 client contract):
 
   1. Validate SSO cookie against accounts.x.ai
-  2. POST auth.x.ai/oauth2/device/code  (Grok CLI client_id)
-  3. Open verification_uri_complete, POST device/verify, POST device/approve
+  2. POST auth.x.ai/oauth2/device/code  (Grok CLI client_id + scopes + referrer)
+  3. Open verification_uri_complete (accounts.x.ai), POST device/verify + approve
+     using the session SSO cookie (automation; grok-build does this in a browser)
   4. Poll oauth2/token for access_token + refresh_token
 
 Two modes:
-  - http    : pure HTTP with Cookie: sso=… (default, same as grok2api)
+  - http    : pure HTTP with Cookie: sso=… for verify/approve
   - browser : use the registration Camoufox page for verify/approve steps
-              (Device start + token poll still HTTP)
+              (Device start + token poll still HTTP, matching grok-build)
 """
 
 from __future__ import annotations
@@ -22,27 +24,44 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
-from urllib.parse import urlencode, urljoin, urlparse
+from urllib.parse import parse_qsl, urlencode, urljoin, urlparse, urlunparse
 
 from curl_cffi import requests as curl_requests
 import requests as std_requests
 
+# Frozen OAuth2 client contract — keep in sync with grok-build
+# crates/codegen/xai-grok-shell/src/auth/config.rs (default_oauth2_scopes).
 SSO_BUILD_CLIENT_ID = "b1a00492-073a-47ea-816f-4c329264a828"
 SSO_BUILD_SCOPE = (
     "openid profile email offline_access "
-    "grok-cli:access api:access conversations:read conversations:write"
+    "grok-cli:access api:access "
+    "conversations:read conversations:write "
+    "workspaces:read workspaces:write"
 )
+SSO_BUILD_REFERRER = "grok-build"
+# Identity headers sent by grok-build device_code.rs (metrics + provider routing).
+SSO_BUILD_CLIENT_VERSION = "0.2.109"
+SSO_BUILD_CLIENT_SURFACE = "cli"
+
+SSO_ISSUER = "https://auth.x.ai"
 SSO_ACCOUNTS_URL = "https://accounts.x.ai/"
-SSO_DEVICE_URL = "https://auth.x.ai/oauth2/device/code"
-SSO_VERIFY_URL = "https://auth.x.ai/oauth2/device/verify"
-SSO_APPROVE_URL = "https://auth.x.ai/oauth2/device/approve"
-SSO_TOKEN_URL = "https://auth.x.ai/oauth2/token"
+SSO_DEVICE_URL = f"{SSO_ISSUER}/oauth2/device/code"
+SSO_VERIFY_URL = f"{SSO_ISSUER}/oauth2/device/verify"
+SSO_APPROVE_URL = f"{SSO_ISSUER}/oauth2/device/approve"
+SSO_TOKEN_URL = f"{SSO_ISSUER}/oauth2/token"
+
 DEFAULT_USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36"
 )
 MAX_BODY = 2 << 20
 DEFAULT_IMPERSONATE = "chrome136"
+# device_code.rs: DEFAULT_DEVICE_POLL_INTERVAL_SECS / DEVICE_SLOW_DOWN_INCREMENT
+DEFAULT_DEVICE_POLL_INTERVAL_SECS = 5
+DEVICE_SLOW_DOWN_INCREMENT_SECS = 5
+# device_code.rs: MIN_DEVICE_CODE_EXPIRY_FALLBACK_SECS (floor poll window)
+MIN_DEVICE_CODE_EXPIRY_FALLBACK_SECS = 10 * 60
+DEVICE_GRANT_TYPE = "urn:ietf:params:oauth:grant-type:device_code"
 
 
 class SSOBuildError(RuntimeError):
@@ -64,14 +83,56 @@ def normalize_sso_token(value: str | None) -> str:
 
 
 def safe_xai_url(raw: str) -> bool:
+    """True for https://*.x.ai (and localhost http for local auth parity)."""
     try:
         parsed = urlparse(str(raw or "").strip())
     except Exception:
         return False
-    if parsed.scheme != "https" or parsed.username or parsed.password:
+    if parsed.username or parsed.password:
         return False
     host = (parsed.hostname or "").lower()
-    return host == "x.ai" or host.endswith(".x.ai")
+    if parsed.scheme == "https":
+        return host == "x.ai" or host.endswith(".x.ai")
+    # grok-build validate_verification_uri also allows local loopback http
+    if parsed.scheme == "http" and host in ("localhost", "127.0.0.1"):
+        return True
+    return False
+
+
+def valid_user_code(code: str) -> bool:
+    """device_code.rs: user_code must be [A-Za-z0-9-]."""
+    text = str(code or "").strip()
+    if not text:
+        return False
+    return all(c.isalnum() or c == "-" for c in text)
+
+
+def build_verification_uri_complete(
+    verification_uri: str,
+    user_code: str,
+    verification_uri_complete: str = "",
+) -> str:
+    """Prefer server complete URI; else embed user_code like grok-build TUI."""
+    complete = str(verification_uri_complete or "").strip()
+    if complete and safe_xai_url(complete):
+        return complete
+    base = str(verification_uri or "").strip()
+    code = str(user_code or "").strip()
+    if not base or not code or not safe_xai_url(base):
+        return ""
+    parsed = urlparse(base)
+    query = dict(parse_qsl(parsed.query, keep_blank_values=True))
+    if "user_code" not in query:
+        query["user_code"] = code
+    return urlunparse(parsed._replace(query=urlencode(query)))
+
+
+def url_is_auth_bounce(url: str) -> bool:
+    text = str(url or "").lower()
+    return any(
+        marker in text
+        for marker in ("sign-in", "sign-up", "/login", "oauth2/sign")
+    )
 
 
 def decode_jwt_claims(token: str) -> dict[str, Any]:
@@ -184,7 +245,7 @@ class _CookieJar:
 
 
 class SSOBuildFlow:
-    """HTTP Device Flow converter (mirrors ssoBuildFlow in Go)."""
+    """HTTP Device Flow converter aligned with grok-build device_code.rs."""
 
     def __init__(
         self,
@@ -194,6 +255,7 @@ class SSOBuildFlow:
         proxies: dict | None = None,
         impersonate: str = DEFAULT_IMPERSONATE,
         timeout: float = 30.0,
+        client_surface: str = SSO_BUILD_CLIENT_SURFACE,
     ):
         token = normalize_sso_token(sso_token)
         if not token:
@@ -202,11 +264,12 @@ class SSOBuildFlow:
         self.proxies = proxies or {}
         self.impersonate = impersonate
         self.timeout = timeout
+        self.client_surface = (client_surface or SSO_BUILD_CLIENT_SURFACE).strip() or "cli"
         self.cookies = _CookieJar({"sso": token, "sso-rw": token})
 
     def convert(self, *, email: str = "", name: str = "") -> dict[str, Any]:
         status, final_url, _body = self._do("GET", SSO_ACCOUNTS_URL, None)
-        if status == 401 or "sign-in" in final_url or "sign-up" in final_url:
+        if status == 401 or url_is_auth_bounce(final_url):
             raise SSOBuildError("Grok Web SSO rejected", status=status, unauthorized=True)
         if status < 200 or status >= 400:
             raise SSOBuildError(f"validate SSO failed HTTP {status}", status=status)
@@ -215,8 +278,8 @@ class SSOBuildFlow:
         self._verify_and_approve_http(device)
         token = self._poll_token(
             device["device_code"],
-            interval=float(device.get("interval") or 5),
-            expires_in=float(device.get("expires_in") or 1800),
+            interval=float(device.get("interval") or DEFAULT_DEVICE_POLL_INTERVAL_SECS),
+            expires_in=float(device.get("expires_in") or MIN_DEVICE_CODE_EXPIRY_FALLBACK_SECS),
         )
         return self._seed_from_token(token, email=email, name=name)
 
@@ -231,7 +294,7 @@ class SSOBuildFlow:
         """Use registration browser for verify/approve; HTTP for start + token poll."""
         self._ensure_browser_sso_cookies(page)
         status, final_url, _body = self._do("GET", SSO_ACCOUNTS_URL, None)
-        if status == 401 or "sign-in" in final_url or "sign-up" in final_url:
+        if status == 401 or url_is_auth_bounce(final_url):
             raise SSOBuildError("Grok Web SSO rejected", status=status, unauthorized=True)
         if status < 200 or status >= 400:
             raise SSOBuildError(f"validate SSO failed HTTP {status}", status=status)
@@ -251,8 +314,8 @@ class SSOBuildFlow:
             self._verify_and_approve_http(device)
             token = self._poll_token(
                 device["device_code"],
-                interval=float(device.get("interval") or 5),
-                expires_in=float(device.get("expires_in") or 1800),
+                interval=float(device.get("interval") or DEFAULT_DEVICE_POLL_INTERVAL_SECS),
+                expires_in=float(device.get("expires_in") or MIN_DEVICE_CODE_EXPIRY_FALLBACK_SECS),
             )
             return self._seed_from_token(token, email=email, name=name)
 
@@ -276,39 +339,78 @@ class SSOBuildFlow:
             log_callback("[*] Device Flow: polling OAuth token")
         token = self._poll_token(
             device["device_code"],
-            interval=float(device.get("interval") or 5),
-            expires_in=float(device.get("expires_in") or 1800),
+            interval=float(device.get("interval") or DEFAULT_DEVICE_POLL_INTERVAL_SECS),
+            expires_in=float(device.get("expires_in") or MIN_DEVICE_CODE_EXPIRY_FALLBACK_SECS),
         )
         return self._seed_from_token(token, email=email, name=name)
 
     # ── steps ──────────────────────────────────────────────────────────
 
     def _start_device(self) -> dict[str, Any]:
+        # Matches grok-build request_device_code form + client headers.
         status, _url, body = self._do(
             "POST",
             SSO_DEVICE_URL,
-            {"client_id": SSO_BUILD_CLIENT_ID, "scope": SSO_BUILD_SCOPE},
+            {
+                "client_id": SSO_BUILD_CLIENT_ID,
+                "scope": SSO_BUILD_SCOPE,
+                "referrer": SSO_BUILD_REFERRER,
+            },
+            api_client=True,
         )
+        if status == 404:
+            raise SSOBuildError(
+                "Device-code login is not available for this deployment (HTTP 404)",
+                status=status,
+            )
         if status < 200 or status >= 300:
-            raise SSOBuildError(f"start Device Flow failed HTTP {status}", status=status)
+            snippet = ""
+            try:
+                snippet = (
+                    body.decode("utf-8", errors="replace")
+                    if isinstance(body, (bytes, bytearray))
+                    else str(body)
+                )[:300]
+            except Exception:
+                snippet = ""
+            raise SSOBuildError(
+                f"start Device Flow failed HTTP {status}: {snippet}".rstrip(": "),
+                status=status,
+            )
         try:
-            payload = json.loads(body.decode("utf-8", errors="replace") if isinstance(body, bytes) else body)
+            payload = json.loads(
+                body.decode("utf-8", errors="replace") if isinstance(body, bytes) else body
+            )
         except Exception as exc:
             raise SSOBuildError(f"parse Device Flow response: {exc}") from exc
         device_code = str(payload.get("device_code") or "").strip()
         user_code = str(payload.get("user_code") or "").strip()
-        complete = str(payload.get("verification_uri_complete") or "").strip()
-        if not device_code or not user_code or not safe_xai_url(complete):
+        verification_uri = str(payload.get("verification_uri") or "").strip()
+        complete = build_verification_uri_complete(
+            verification_uri,
+            user_code,
+            str(payload.get("verification_uri_complete") or ""),
+        )
+        if not device_code or not user_code:
             raise SSOBuildError("Device Flow response incomplete")
-        interval = int(payload.get("interval") or 5)
-        expires_in = int(payload.get("expires_in") or 1800)
+        if not valid_user_code(user_code):
+            raise SSOBuildError(
+                "Server returned invalid user_code format (expected [A-Z0-9-])"
+            )
+        if verification_uri and not safe_xai_url(verification_uri):
+            raise SSOBuildError(f"Server returned unsupported verification URI: {verification_uri}")
+        if not complete or not safe_xai_url(complete):
+            raise SSOBuildError("Device Flow verification URL incomplete")
+        interval = int(payload.get("interval") or DEFAULT_DEVICE_POLL_INTERVAL_SECS)
+        expires_in = int(payload.get("expires_in") or 0)
         if interval <= 0:
-            interval = 5
+            interval = DEFAULT_DEVICE_POLL_INTERVAL_SECS
         if expires_in <= 0:
-            expires_in = 1800
+            expires_in = MIN_DEVICE_CODE_EXPIRY_FALLBACK_SECS
         return {
             "device_code": device_code,
             "user_code": user_code,
+            "verification_uri": verification_uri or complete,
             "verification_uri_complete": complete,
             "interval": interval,
             "expires_in": expires_in,
@@ -316,22 +418,44 @@ class SSOBuildFlow:
 
     def _verify_and_approve_http(self, device: dict[str, Any]) -> None:
         complete = device["verification_uri_complete"]
-        status, _url, _ = self._do("GET", complete, None)
+        status, final_url, body = self._do("GET", complete, None)
         if status < 200 or status >= 400:
-            raise SSOBuildError(f"open Device Flow verify page failed HTTP {status}", status=status)
+            raise SSOBuildError(
+                f"open Device Flow verify page failed HTTP {status}", status=status
+            )
+        if url_is_auth_bounce(final_url):
+            raise SSOBuildError(
+                f"open Device Flow verify bounced to auth: {final_url}",
+                unauthorized=True,
+            )
 
-        status, final_url, _ = self._do(
-            "POST", SSO_VERIFY_URL, {"user_code": device["user_code"]}
+        verify_url = self._extract_form_action(body, "device/verify") or SSO_VERIFY_URL
+        if not safe_xai_url(verify_url):
+            verify_url = SSO_VERIFY_URL
+
+        status, final_url, body = self._do(
+            "POST", verify_url, {"user_code": device["user_code"]}
         )
         if status < 200 or status >= 400:
-            raise SSOBuildError(f"SSO auto-verify Device Flow failed HTTP {status}", status=status)
-        if "consent" not in final_url:
-            # some flows land on approve/consent without the word in URL; try approve anyway
-            pass
+            raise SSOBuildError(
+                f"SSO auto-verify Device Flow failed HTTP {status}", status=status
+            )
+        if url_is_auth_bounce(final_url):
+            raise SSOBuildError(
+                f"SSO auto-verify bounced to auth: {final_url}",
+                unauthorized=True,
+            )
+        if self._url_is_device_done(final_url):
+            return
+
+        # Some deployments land on consent HTML without "consent" in the URL.
+        approve_url = self._extract_form_action(body, "device/approve") or SSO_APPROVE_URL
+        if not safe_xai_url(approve_url):
+            approve_url = SSO_APPROVE_URL
 
         status, final_url, _ = self._do(
             "POST",
-            SSO_APPROVE_URL,
+            approve_url,
             {
                 "user_code": device["user_code"],
                 "action": "allow",
@@ -340,11 +464,14 @@ class SSOBuildFlow:
             },
         )
         if status < 200 or status >= 400:
-            raise SSOBuildError(f"SSO auto-approve Device Flow failed HTTP {status}", status=status)
-        if "done" not in final_url and "consent" not in final_url:
-            # Accept success-ish redirects; only hard-fail on obvious auth bounce.
-            if "sign-in" in final_url or "sign-up" in final_url:
-                raise SSOBuildError(f"SSO auto-approve Device Flow failed url={final_url}")
+            raise SSOBuildError(
+                f"SSO auto-approve Device Flow failed HTTP {status}", status=status
+            )
+        if url_is_auth_bounce(final_url):
+            raise SSOBuildError(
+                f"SSO auto-approve Device Flow failed url={final_url}",
+                unauthorized=True,
+            )
 
     def _poll_token(
         self,
@@ -353,18 +480,24 @@ class SSOBuildFlow:
         interval: float,
         expires_in: float,
     ) -> dict[str, Any]:
+        # Match device_code.rs complete_device_code_login:
+        # sleep first, then poll until expires_in (floored at 10 minutes).
         interval = max(float(interval or 1), 1.0)
-        deadline = time.time() + min(float(expires_in or 75), 75.0)
-        while time.time() < deadline:
+        poll_secs = max(float(expires_in or 0), float(MIN_DEVICE_CODE_EXPIRY_FALLBACK_SECS))
+        deadline = time.time() + poll_secs
+        while True:
             time.sleep(interval)
+            if time.time() > deadline:
+                raise SSOBuildError("Device code expired / poll timeout")
             status, _url, body = self._do(
                 "POST",
                 SSO_TOKEN_URL,
                 {
-                    "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
+                    "grant_type": DEVICE_GRANT_TYPE,
                     "client_id": SSO_BUILD_CLIENT_ID,
                     "device_code": device_code,
                 },
+                api_client=True,
             )
             try:
                 payload = json.loads(
@@ -387,15 +520,21 @@ class SSOBuildFlow:
             if err == "authorization_pending":
                 continue
             if err == "slow_down":
-                interval += 5
+                interval += float(DEVICE_SLOW_DOWN_INCREMENT_SECS)
                 continue
-            if err in ("access_denied", "expired_token"):
-                raise SSOBuildError(f"Device Flow denied: {err}", unauthorized=True)
+            if err == "access_denied":
+                raise SSOBuildError(
+                    "Authorization denied. The user rejected the request.",
+                    unauthorized=True,
+                )
+            if err == "expired_token":
+                raise SSOBuildError("Device code expired", unauthorized=True)
             if status >= 400:
                 desc = first_value(payload.get("error_description"), err, str(status))
                 raise SSOBuildError(f"OAuth token failed: {desc}", status=status)
-            raise SSOBuildError(f"OAuth token failed: {first_value(payload.get('error_description'), err, str(status))}")
-        raise SSOBuildError("Device Flow poll timeout")
+            raise SSOBuildError(
+                f"OAuth token failed: {first_value(payload.get('error_description'), err, str(status))}"
+            )
 
     def _seed_from_token(self, token: dict[str, Any], *, email: str = "", name: str = "") -> dict[str, Any]:
         claims = decode_jwt_claims(first_value(token.get("id_token"), token.get("access_token")))
@@ -477,9 +616,43 @@ class SSOBuildFlow:
         except Exception:
             return ""
 
+    @staticmethod
+    def _url_is_device_done(url: str) -> bool:
+        text = str(url or "").lower()
+        return any(
+            marker in text
+            for marker in (
+                "/oauth2/device/done",
+                "/oauth2/device/success",
+                "device/done",
+                "device/success",
+            )
+        )
+
     def _page_is_device_done(self, page) -> bool:
-        url = self._page_url(page).lower()
-        return "done" in url or "/oauth2/device/success" in url
+        return self._url_is_device_done(self._page_url(page))
+
+    @staticmethod
+    def _extract_form_action(body: bytes | str | None, path_fragment: str) -> str:
+        """Pull form action URL containing path_fragment from an HTML body."""
+        if body is None:
+            return ""
+        try:
+            text = body.decode("utf-8", errors="replace") if isinstance(body, (bytes, bytearray)) else str(body)
+        except Exception:
+            return ""
+        if not text or path_fragment not in text:
+            return ""
+        # Prefer absolute actions that include the fragment.
+        patterns = (
+            rf'''action=["'](https?://[^"']*{re.escape(path_fragment)}[^"']*)["']''',
+            rf'''action=["']([^"']*{re.escape(path_fragment)}[^"']*)["']''',
+        )
+        for pat in patterns:
+            match = re.search(pat, text, flags=re.I)
+            if match:
+                return str(match.group(1) or "").strip()
+        return ""
 
     def _browser_page_phase(self, page) -> str:
         """Classify current Device Flow UI.
@@ -493,7 +666,7 @@ class SSOBuildFlow:
                 """
 const normalize = (s) => (s || '').replace(/\\s+/g, ' ').trim().toLowerCase();
 const url = (location.href || '').toLowerCase();
-if (url.includes('/oauth2/device/done') || url.includes('device/success')) return 'done';
+if (url.includes('/oauth2/device/done') || url.includes('device/success') || url.includes('device/done')) return 'done';
 
 const forms = Array.from(document.querySelectorAll('form'));
 const approveForm = forms.find((f) => {
@@ -520,7 +693,13 @@ const heading = Array.from(document.querySelectorAll('h1,h2')).map(
 if (/authorize grok build|授权/.test(heading) && hasAllow) return 'consent';
 if (hasAllow && hasDeny) return 'consent';
 if (hasContinue && !hasAllow) return 'user_code';
-if (url.includes('user_code') || url.includes('device/verify') || url.includes('/device/code')) {
+// Current provider hosts the code page at accounts.x.ai/oauth2/device?user_code=…
+if (
+  url.includes('user_code')
+  || url.includes('device/verify')
+  || url.includes('/oauth2/device/user_code')
+  || /\\/oauth2\\/device\\/?(\\?|$)/.test(url)
+) {
   return 'user_code';
 }
 if (url.includes('consent') || url.includes('device/approve')) return 'consent';
@@ -882,19 +1061,37 @@ return {{ ok: true, via: 'form_submit' }};
 
     # ── low-level HTTP with manual redirects ───────────────────────────
 
-    def _do(self, method: str, endpoint: str, form: dict | None) -> tuple[int, str, bytes]:
+    def _do(
+        self,
+        method: str,
+        endpoint: str,
+        form: dict | None,
+        *,
+        api_client: bool = False,
+    ) -> tuple[int, str, bytes]:
         if not safe_xai_url(endpoint):
             raise SSOBuildError(f"unsafe xAI OAuth URL: {endpoint}")
         current_url = endpoint
         current_method = method.upper()
         current_form = form
         for _redirect in range(9):
-            headers = {
-                "Accept": "application/json, text/html;q=0.9, */*;q=0.8",
-                "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
-                "User-Agent": self.user_agent,
-                "Cookie": self.cookies.header(),
-            }
+            if api_client:
+                # grok-build device_code.rs: Accept JSON + x-grok-client-* headers
+                headers = {
+                    "Accept": "application/json",
+                    "User-Agent": self.user_agent,
+                    "x-grok-client-version": SSO_BUILD_CLIENT_VERSION,
+                    "x-grok-client-surface": self.client_surface,
+                }
+            else:
+                headers = {
+                    "Accept": "application/json, text/html;q=0.9, */*;q=0.8",
+                    "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+                    "User-Agent": self.user_agent,
+                }
+            cookie = self.cookies.header()
+            if cookie:
+                headers["Cookie"] = cookie
             data = None
             if current_form is not None:
                 data = urlencode(current_form)
@@ -919,10 +1116,9 @@ return {{ ok: true, via: 'form_submit' }};
             next_url = urljoin(current_url, location)
             if not safe_xai_url(next_url):
                 raise SSOBuildError(f"xAI OAuth redirected to untrusted host: {next_url}", status=status)
-            # 303 / 301-302 with non-GET → switch to GET (same as Go)
-            if status == 303 or (
-                status in (301, 302) and current_method not in ("GET", "HEAD")
-            ):
+            # Follow redirects as a browser would for form POSTs (switch to GET).
+            # accounts.x.ai often returns 307 to /sign-in when SSO is missing.
+            if status in (301, 302, 303, 307, 308) and current_method not in ("GET", "HEAD"):
                 current_method = "GET"
                 current_form = None
             current_url = next_url
@@ -973,7 +1169,7 @@ def convert_sso_to_build(
 
     mode:
       - auto    : browser if page given, else http
-      - http    : pure HTTP (grok2api path)
+      - http    : pure HTTP with SSO cookie auto verify/approve
       - browser : require page for verify/approve
     """
     flow = SSOBuildFlow(

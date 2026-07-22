@@ -3,13 +3,20 @@ import unittest
 from unittest.mock import MagicMock, patch
 
 from grok_register.sso_build import (
+    DEVICE_GRANT_TYPE,
+    MIN_DEVICE_CODE_EXPIRY_FALLBACK_SECS,
+    SSO_BUILD_CLIENT_ID,
+    SSO_BUILD_REFERRER,
+    SSO_BUILD_SCOPE,
     SSOBuildError,
     SSOBuildFlow,
     access_token_has_bot_flag,
     build_grok2api_import_document,
+    build_verification_uri_complete,
     normalize_sso_token,
     safe_xai_url,
     save_build_auth,
+    valid_user_code,
 )
 
 
@@ -42,9 +49,45 @@ class SSOBuildHelpersTests(unittest.TestCase):
     def test_safe_xai_url(self):
         self.assertTrue(safe_xai_url("https://auth.x.ai/oauth2/device/code"))
         self.assertTrue(safe_xai_url("https://accounts.x.ai/"))
+        self.assertTrue(safe_xai_url("https://accounts.x.ai/oauth2/device?user_code=ABCD-1234"))
+        self.assertTrue(safe_xai_url("http://localhost:22255/oauth2/device"))
         self.assertFalse(safe_xai_url("http://auth.x.ai/"))
         self.assertFalse(safe_xai_url("https://evil.com/"))
         self.assertFalse(safe_xai_url("https://user@auth.x.ai/"))
+
+    def test_scopes_match_grok_build_contract(self):
+        scopes = SSO_BUILD_SCOPE.split()
+        self.assertEqual(
+            scopes,
+            [
+                "openid",
+                "profile",
+                "email",
+                "offline_access",
+                "grok-cli:access",
+                "api:access",
+                "conversations:read",
+                "conversations:write",
+                "workspaces:read",
+                "workspaces:write",
+            ],
+        )
+        self.assertEqual(SSO_BUILD_REFERRER, "grok-build")
+        self.assertEqual(SSO_BUILD_CLIENT_ID, "b1a00492-073a-47ea-816f-4c329264a828")
+        self.assertEqual(DEVICE_GRANT_TYPE, "urn:ietf:params:oauth:grant-type:device_code")
+        self.assertEqual(MIN_DEVICE_CODE_EXPIRY_FALLBACK_SECS, 600)
+
+    def test_valid_user_code_and_complete_uri(self):
+        self.assertTrue(valid_user_code("ABCD-1234"))
+        self.assertFalse(valid_user_code("AB CD"))
+        self.assertFalse(valid_user_code(""))
+        built = build_verification_uri_complete(
+            "https://accounts.x.ai/oauth2/device",
+            "ABCD-1234",
+            "",
+        )
+        self.assertIn("user_code=ABCD-1234", built)
+        self.assertTrue(built.startswith("https://accounts.x.ai/oauth2/device"))
 
     def test_access_token_has_bot_flag(self):
         self.assertTrue(
@@ -92,7 +135,8 @@ class SSOBuildFlowTests(unittest.TestCase):
             {
                 "device_code": "dev-1",
                 "user_code": "ABCD-1234",
-                "verification_uri_complete": "https://auth.x.ai/oauth2/device/user_code?user_code=ABCD-1234",
+                "verification_uri": "https://accounts.x.ai/oauth2/device",
+                "verification_uri_complete": "https://accounts.x.ai/oauth2/device?user_code=ABCD-1234",
                 "interval": 1,
                 "expires_in": 600,
             }
@@ -105,36 +149,37 @@ class SSOBuildFlowTests(unittest.TestCase):
                 "expires_in": 3600,
             }
         ).encode()
-
-        responses = [
-            DummyResponse(200, b"ok", url="https://accounts.x.ai/"),
-            DummyResponse(200, device_body),
-            DummyResponse(200, b"verify-page"),
-            DummyResponse(302, b"", headers={"Location": "https://auth.x.ai/oauth2/device/consent"}),
-            DummyResponse(302, b"", headers={"Location": "https://auth.x.ai/oauth2/device/done"}),
-            DummyResponse(200, token_body),
-        ]
-        # After redirects, _do continues until non-3xx. Simulate final OK for consent/done.
-        # Our DummyResponse for 302 will be followed by the flow's next request only if
-        # Location is used and another request is made. Patch _request instead.
+        verify_page = (
+            b'<form action="https://auth.x.ai/oauth2/device/verify" method="POST">'
+            b'<input name="user_code" value="ABCD-1234"/>'
+            b"<button>Continue</button></form>"
+        )
+        consent_page = (
+            b'<form action="https://auth.x.ai/oauth2/device/approve" method="POST">'
+            b'<input name="user_code" value="ABCD-1234"/>'
+            b'<input name="action" value=""/>'
+            b"<button>Deny</button><button>Allow</button></form>"
+        )
 
         call_plan = []
 
         def fake_request(method, url, headers=None, data=None):
-            call_plan.append((method, url, data))
+            call_plan.append((method, url, data, dict(headers or {})))
             # accounts validate
             if url.rstrip("/") == "https://accounts.x.ai":
                 return DummyResponse(200, b"ok")
             if url.endswith("/oauth2/device/code"):
                 return DummyResponse(200, device_body)
-            if "user_code=ABCD-1234" in url or "device/user_code" in url:
-                return DummyResponse(200, b"page")
+            if "accounts.x.ai/oauth2/device" in url and method == "GET":
+                return DummyResponse(200, verify_page)
             if url.endswith("/oauth2/device/verify"):
                 return DummyResponse(
-                    302, b"", headers={"Location": "https://auth.x.ai/oauth2/device/consent"}
+                    302,
+                    b"",
+                    headers={"Location": "https://auth.x.ai/oauth2/device/consent"},
                 )
             if url.endswith("/oauth2/device/consent"):
-                return DummyResponse(200, b"consent")
+                return DummyResponse(200, consent_page)
             if url.endswith("/oauth2/device/approve"):
                 return DummyResponse(
                     302, b"", headers={"Location": "https://auth.x.ai/oauth2/device/done"}
@@ -154,8 +199,54 @@ class SSOBuildFlowTests(unittest.TestCase):
         self.assertEqual(seed["refresh_token"], "refresh-xyz")
         self.assertEqual(seed["email"], "user@example.com")
         self.assertEqual(seed["provider"], "grok_build")
-        self.assertTrue(any(u.endswith("/oauth2/device/code") for _, u, _ in call_plan))
-        self.assertTrue(any(u.endswith("/oauth2/token") for _, u, _ in call_plan))
+        self.assertIn("workspaces:read", seed["scope"])
+        self.assertTrue(any(u.endswith("/oauth2/device/code") for _, u, _, _ in call_plan))
+        self.assertTrue(any(u.endswith("/oauth2/token") for _, u, _, _ in call_plan))
+
+        # Device code + token requests must send grok-build referrer/scopes/headers.
+        code_calls = [c for c in call_plan if c[1].endswith("/oauth2/device/code")]
+        self.assertTrue(code_calls)
+        code_data = code_calls[0][2] or ""
+        self.assertIn("referrer=grok-build", code_data)
+        self.assertIn("workspaces%3Aread", code_data.replace("%3a", "%3A"))
+        # urlencode uses %3A for ':'
+        self.assertTrue(
+            "workspaces%3Aread" in code_data or "workspaces:read" in code_data
+        )
+        code_headers = code_calls[0][3]
+        self.assertEqual(code_headers.get("x-grok-client-version"), "0.2.109")
+        self.assertEqual(code_headers.get("x-grok-client-surface"), "cli")
+        self.assertIn("application/json", code_headers.get("Accept", ""))
+
+        token_calls = [c for c in call_plan if c[1].endswith("/oauth2/token")]
+        self.assertTrue(token_calls)
+        token_data = token_calls[0][2] or ""
+        self.assertIn("device_code=dev-1", token_data)
+        self.assertIn(f"client_id={SSO_BUILD_CLIENT_ID}", token_data)
+        self.assertIn("grant_type=", token_data)
+        self.assertIn("device_code", token_data)
+
+    def test_start_device_builds_complete_uri_when_missing(self):
+        device_body = json.dumps(
+            {
+                "device_code": "dev-2",
+                "user_code": "WXYZ-9999",
+                "verification_uri": "https://accounts.x.ai/oauth2/device",
+                "interval": 5,
+                "expires_in": 1800,
+            }
+        ).encode()
+
+        def fake_request(method, url, headers=None, data=None):
+            if url.endswith("/oauth2/device/code"):
+                return DummyResponse(200, device_body)
+            return DummyResponse(404, b"missing")
+
+        flow = SSOBuildFlow("sso-token-value")
+        with patch.object(flow, "_request", side_effect=fake_request):
+            device = flow._start_device()
+        self.assertEqual(device["user_code"], "WXYZ-9999")
+        self.assertIn("user_code=WXYZ-9999", device["verification_uri_complete"])
 
     def test_empty_sso_raises(self):
         with self.assertRaises(SSOBuildError):
@@ -218,6 +309,24 @@ class SSOBuildFlowTests(unittest.TestCase):
         with patch.object(flow, "_wait_browser_phase", return_value="user_code"):
             ok = flow._browser_submit_allow(page, "ABCD-1234")
         self.assertFalse(ok)
+
+    def test_verify_http_rejects_auth_bounce(self):
+        flow = SSOBuildFlow("sso-token-value")
+        device = {
+            "device_code": "dev",
+            "user_code": "ABCD-1234",
+            "verification_uri_complete": "https://accounts.x.ai/oauth2/device?user_code=ABCD-1234",
+        }
+
+        def fake_do(method, endpoint, form, api_client=False):
+            if method == "GET":
+                return 200, "https://accounts.x.ai/sign-in?redirect=oauth2", b"login"
+            return 200, endpoint, b""
+
+        with patch.object(flow, "_do", side_effect=fake_do):
+            with self.assertRaises(SSOBuildError) as ctx:
+                flow._verify_and_approve_http(device)
+        self.assertTrue(ctx.exception.unauthorized)
 
 
 if __name__ == "__main__":
