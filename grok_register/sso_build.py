@@ -15,7 +15,9 @@ from __future__ import annotations
 
 import base64
 import json
+import random
 import re
+import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -56,6 +58,23 @@ DEVICE_SLOW_DOWN_INCREMENT_SECS = 5
 # device_code.rs: MIN_DEVICE_CODE_EXPIRY_FALLBACK_SECS (floor poll window)
 MIN_DEVICE_CODE_EXPIRY_FALLBACK_SECS = 10 * 60
 DEVICE_GRANT_TYPE = "urn:ietf:params:oauth:grant-type:device_code"
+
+# POST /oauth2/device/code rate-limit backoff (HTTP 429 / error=slow_down).
+DEVICE_START_MAX_ATTEMPTS = 8
+DEVICE_START_BACKOFF_BASE_SECS = float(DEVICE_SLOW_DOWN_INCREMENT_SECS)
+DEVICE_START_BACKOFF_MAX_SECS = 60.0
+DEVICE_START_BACKOFF_JITTER_SECS = 1.5
+# Serialize minting across concurrent workers in this process.
+DEVICE_START_MIN_GAP_SECS = 2.0
+_device_start_lock = threading.Lock()
+_device_start_next_ok_at = 0.0
+
+# Browser verify (Continue) rate-limit: IdP returns
+#   /oauth2/device?error=rate_limited
+# and clears the user_code input — must backoff, re-type code, Continue again.
+DEVICE_VERIFY_MAX_ATTEMPTS = 6
+DEVICE_VERIFY_BACKOFF_BASE_SECS = 8.0
+DEVICE_VERIFY_BACKOFF_MAX_SECS = 60.0
 
 
 class SSOBuildError(RuntimeError):
@@ -284,7 +303,7 @@ class SSOBuildFlow:
         if status < 200 or status >= 400:
             raise SSOBuildError(f"validate SSO failed HTTP {status}", status=status)
 
-        device = self._start_device()
+        device = self._start_device(log_callback=log_callback)
         verify_url = device.get("verification_uri_complete") or ""
         if not safe_xai_url(verify_url):
             raise SSOBuildError("device flow verification URL incomplete")
@@ -343,37 +362,157 @@ class SSOBuildFlow:
 
     # ── steps ──────────────────────────────────────────────────────────
 
-    def _start_device(self) -> dict[str, Any]:
-        # Matches grok-build request_device_code form + client headers.
-        status, _url, body = self._do(
-            "POST",
-            SSO_DEVICE_URL,
-            {
-                "client_id": SSO_BUILD_CLIENT_ID,
-                "scope": SSO_BUILD_SCOPE,
-                "referrer": SSO_BUILD_REFERRER,
-            },
-            api_client=True,
+    @staticmethod
+    def _decode_body_text(body: Any, *, limit: int = 300) -> str:
+        try:
+            text = (
+                body.decode("utf-8", errors="replace")
+                if isinstance(body, (bytes, bytearray))
+                else str(body or "")
+            )
+        except Exception:
+            return ""
+        return text[:limit] if limit > 0 else text
+
+    @classmethod
+    def _is_device_start_rate_limited(cls, status: int, body: Any) -> bool:
+        """True for HTTP 429 / provider slow_down on device-code mint."""
+        if int(status or 0) == 429:
+            return True
+        text = cls._decode_body_text(body, limit=800).lower()
+        if not text:
+            return False
+        if "slow_down" in text or "too many device code" in text:
+            return True
+        try:
+            payload = json.loads(
+                body.decode("utf-8", errors="replace")
+                if isinstance(body, (bytes, bytearray))
+                else body
+            )
+        except Exception:
+            return False
+        if not isinstance(payload, dict):
+            return False
+        err = str(payload.get("error") or "").strip().lower()
+        return err in ("slow_down", "rate_limit", "rate_limited", "too_many_requests")
+
+    @staticmethod
+    def _device_start_backoff_secs(attempt: int) -> float:
+        """Exponential backoff with jitter: base * 2^(attempt-1), capped."""
+        attempt = max(int(attempt), 1)
+        base = float(DEVICE_START_BACKOFF_BASE_SECS)
+        delay = base * (2 ** (attempt - 1))
+        delay = min(delay, float(DEVICE_START_BACKOFF_MAX_SECS))
+        jitter = random.uniform(0.0, float(DEVICE_START_BACKOFF_JITTER_SECS))
+        return delay + jitter
+
+    def _wait_device_start_slot(
+        self,
+        *,
+        log_callback: Callable[[str], None] | None = None,
+    ) -> None:
+        """Respect process-wide min gap between device-code mints."""
+        global _device_start_next_ok_at
+        now = time.time()
+        wait = float(_device_start_next_ok_at) - now
+        if wait > 0.05:
+            if log_callback:
+                log_callback(
+                    f"[*] Device Flow: pacing device-code request "
+                    f"({wait:.1f}s min-gap)"
+                )
+            time.sleep(wait)
+
+    def _mark_device_start_ok(self, *, extra_gap: float = 0.0) -> None:
+        global _device_start_next_ok_at
+        gap = max(float(DEVICE_START_MIN_GAP_SECS), float(extra_gap or 0.0))
+        _device_start_next_ok_at = time.time() + gap
+
+    def _mark_device_start_rate_limited(self, wait_secs: float) -> None:
+        """Push next allowed mint past the backoff window for all workers."""
+        global _device_start_next_ok_at
+        _device_start_next_ok_at = max(
+            float(_device_start_next_ok_at),
+            time.time() + max(float(wait_secs), float(DEVICE_START_MIN_GAP_SECS)),
         )
-        if status == 404:
-            raise SSOBuildError(
-                "Device-code login is not available for this deployment (HTTP 404)",
-                status=status,
-            )
-        if status < 200 or status >= 300:
-            snippet = ""
-            try:
-                snippet = (
-                    body.decode("utf-8", errors="replace")
-                    if isinstance(body, (bytes, bytearray))
-                    else str(body)
-                )[:300]
-            except Exception:
-                snippet = ""
-            raise SSOBuildError(
-                f"start Device Flow failed HTTP {status}: {snippet}".rstrip(": "),
-                status=status,
-            )
+
+    def _start_device(
+        self,
+        *,
+        log_callback: Callable[[str], None] | None = None,
+    ) -> dict[str, Any]:
+        """Mint device_code with exponential backoff on 429 / slow_down.
+
+        Concurrent workers share a process-wide lock + min gap so parallel
+        registrations do not stampede auth.x.ai/oauth2/device/code.
+        """
+        # Matches grok-build request_device_code form + client headers.
+        form = {
+            "client_id": SSO_BUILD_CLIENT_ID,
+            "scope": SSO_BUILD_SCOPE,
+            "referrer": SSO_BUILD_REFERRER,
+        }
+        max_attempts = max(int(DEVICE_START_MAX_ATTEMPTS), 1)
+        last_status = 0
+        last_snippet = ""
+
+        with _device_start_lock:
+            for attempt in range(1, max_attempts + 1):
+                self._wait_device_start_slot(log_callback=log_callback)
+                status, _url, body = self._do(
+                    "POST",
+                    SSO_DEVICE_URL,
+                    form,
+                    api_client=True,
+                )
+                last_status = int(status or 0)
+
+                if 200 <= last_status < 300:
+                    self._mark_device_start_ok()
+                    return self._parse_device_start_payload(body)
+
+                if last_status == 404:
+                    raise SSOBuildError(
+                        "Device-code login is not available for this deployment (HTTP 404)",
+                        status=last_status,
+                    )
+
+                last_snippet = self._decode_body_text(body, limit=300)
+                if self._is_device_start_rate_limited(last_status, body):
+                    if attempt >= max_attempts:
+                        break
+                    wait = self._device_start_backoff_secs(attempt)
+                    # Hold other workers off for this window…
+                    self._mark_device_start_rate_limited(wait)
+                    if log_callback:
+                        log_callback(
+                            f"[*] Device Flow: rate limited "
+                            f"(HTTP {last_status}/slow_down), "
+                            f"backoff {wait:.1f}s "
+                            f"(attempt {attempt}/{max_attempts})"
+                        )
+                    time.sleep(wait)
+                    # …then clear our own slot: we already paid the wait
+                    # (also avoids double-wait when time.sleep is mocked).
+                    global _device_start_next_ok_at
+                    _device_start_next_ok_at = time.time()
+                    continue
+
+                raise SSOBuildError(
+                    f"start Device Flow failed HTTP {last_status}: {last_snippet}".rstrip(
+                        ": "
+                    ),
+                    status=last_status,
+                )
+
+        raise SSOBuildError(
+            f"start Device Flow failed HTTP {last_status}: {last_snippet}".rstrip(": ")
+            + f" (exhausted {max_attempts} attempts with backoff)",
+            status=last_status or 429,
+        )
+
+    def _parse_device_start_payload(self, body: Any) -> dict[str, Any]:
         try:
             payload = json.loads(
                 body.decode("utf-8", errors="replace") if isinstance(body, bytes) else body
@@ -824,7 +963,7 @@ return out;
     def _browser_page_phase(self, page) -> str:
         """Classify current Device Flow UI.
 
-        Returns: done | consent | user_code | unknown
+        Returns: done | consent | user_code | error | unknown
         """
         if self._page_is_device_done(page):
             return "done"
@@ -836,6 +975,21 @@ const url = (location.href || '').toLowerCase();
 if (url.includes('/oauth2/device/done') || url.includes('device/success') || url.includes('device/done')) return 'done';
 
 const forms = Array.from(document.querySelectorAll('form'));
+const buttons = Array.from(document.querySelectorAll('button, input[type="submit"], a[role="button"], a'));
+const texts = buttons.map((b) => normalize(b.innerText || b.textContent || b.value || ''));
+const hasRetry = texts.some((t) => t === 'retry' || t === '重试' || t === 'try again' || t === '再试一次');
+let bodyText = '';
+try {
+  bodyText = normalize(document.body && document.body.innerText ? document.body.innerText : '');
+} catch (e) {
+  bodyText = '';
+}
+const looksError = /error loading this page|an error occurred|there was an error|error occurred|出错|加载失败|加载.*错误/.test(bodyText)
+  || Array.from(document.querySelectorAll('[role="alert"], .text-destructive, .text-danger, [data-testid*="error"]'))
+      .some((el) => normalize(el.innerText || el.textContent || '').length > 0);
+// Transient provider error page: Retry only (no approve/verify form).
+if (hasRetry && (looksError || forms.length === 0)) return 'error';
+
 const approveForm = forms.find((f) => {
   const a = (f.getAttribute('action') || '');
   return a.includes('device/approve');
@@ -848,8 +1002,6 @@ const verifyForm = forms.find((f) => {
 });
 if (verifyForm) return 'user_code';
 
-const buttons = Array.from(document.querySelectorAll('button, input[type="submit"], a[role="button"]'));
-const texts = buttons.map((b) => normalize(b.innerText || b.textContent || b.value || ''));
 const hasAllow = texts.some((t) => t === 'allow' || t === '允许');
 const hasDeny = texts.some((t) => t === 'deny' || t === '拒绝' || t === '取消');
 const hasContinue = texts.some((t) => t === 'continue' || t === '继续' || t === '确认');
@@ -860,16 +1012,18 @@ const heading = Array.from(document.querySelectorAll('h1,h2')).map(
 if (/authorize grok build|授权/.test(heading) && hasAllow) return 'consent';
 if (hasAllow && hasDeny) return 'consent';
 if (hasContinue && !hasAllow) return 'user_code';
+// Path /oauth2/device/consent?user_code=… is consent, not the code-entry page.
+if (url.includes('/device/consent') || url.includes('device/approve')) return 'consent';
 // Current provider hosts the code page at accounts.x.ai/oauth2/device?user_code=…
 if (
-  url.includes('user_code')
-  || url.includes('device/verify')
+  url.includes('device/verify')
   || url.includes('/oauth2/device/user_code')
   || /\\/oauth2\\/device\\/?(\\?|$)/.test(url)
+  || (url.includes('user_code') && !url.includes('consent'))
 ) {
   return 'user_code';
 }
-if (url.includes('consent') || url.includes('device/approve')) return 'consent';
+if (url.includes('consent')) return 'consent';
 
 // user_code input present but no Allow pair → still on code page
 const codeInput = document.querySelector('input[name="user_code"], input[id*="user"], input[autocomplete="one-time-code"]');
@@ -880,9 +1034,192 @@ return 'unknown';
         except Exception:
             phase = "unknown"
         phase = str(phase or "unknown").strip().lower()
-        if phase in ("done", "consent", "user_code", "unknown"):
+        if phase in ("done", "consent", "user_code", "error", "unknown"):
             return phase
         return "unknown"
+
+    def _browser_click_retry(
+        self,
+        page,
+        *,
+        log_callback: Callable[[str], None] | None = None,
+    ) -> bool:
+        """Click Retry / 重试 on a transient Device Flow error page."""
+        js = """
+const normalize = (s) => (s || '').replace(/\\s+/g, ' ').trim().toLowerCase();
+const isRetry = (t) => t === 'retry' || t === '重试' || t === 'try again' || t === '再试一次';
+const nodes = Array.from(document.querySelectorAll(
+  'button, input[type="submit"], input[type="button"], a[role="button"], a'
+));
+const visible = (el) => {
+  try {
+    if (el.disabled || el.getAttribute('disabled') != null || el.getAttribute('aria-disabled') === 'true') {
+      return false;
+    }
+    return !!(el.offsetParent !== null || (el.getClientRects && el.getClientRects().length));
+  } catch (e) {
+    return true;
+  }
+};
+let btn = nodes.find((b) => {
+  const text = normalize(b.innerText || b.textContent || b.value || '');
+  return isRetry(text) && visible(b);
+});
+if (!btn) {
+  btn = nodes.find((b) => {
+    const text = normalize(b.innerText || b.textContent || b.value || '');
+    return isRetry(text);
+  });
+}
+if (!btn) {
+  return { ok: false, reason: 'no_retry_button' };
+}
+btn.click();
+return {
+  ok: true,
+  via: 'retry_click',
+  text: normalize(btn.innerText || btn.textContent || btn.value || '').slice(0, 40),
+  url: location.href || '',
+};
+"""
+        try:
+            result = page.run_js(js)
+        except Exception as exc:
+            if log_callback:
+                log_callback(f"[Debug] browser Retry JS failed: {exc}")
+            return False
+        if not isinstance(result, dict) or not result.get("ok"):
+            if log_callback:
+                reason = result.get("reason") if isinstance(result, dict) else result
+                log_callback(f"[Debug] browser Retry missed: {reason}")
+            return False
+        if log_callback:
+            log_callback(
+                f"[*] Device Flow: error page → Retry "
+                f"({result.get('via') or 'ok'}, text={result.get('text')!r})"
+            )
+        # Give the SPA a moment to re-fetch after Retry.
+        time.sleep(0.6)
+        return True
+
+    def _browser_recover_error_page(
+        self,
+        page,
+        *,
+        log_callback: Callable[[str], None] | None = None,
+        max_clicks: int = 3,
+        wait_after: float = 12.0,
+        wanted: set[str] | frozenset[str] | None = None,
+    ) -> str:
+        """If on error phase, click Retry until recovered or budget exhausted.
+
+        Returns the phase after recovery attempts (may still be 'error').
+        """
+        want = set(wanted or {"user_code", "consent", "done"})
+        phase = self._browser_page_phase(page)
+        if phase != "error":
+            return phase
+        for i in range(max(1, max_clicks)):
+            if log_callback:
+                log_callback(
+                    f"[*] Device Flow: page error → Retry "
+                    f"(attempt {i + 1}/{max_clicks}, url={self._page_url(page)[:120]})"
+                )
+            if not self._browser_click_retry(page, log_callback=log_callback):
+                break
+            phase = self._wait_browser_phase(
+                page,
+                want | {"error"},
+                timeout=wait_after,
+                log_callback=log_callback,
+                label=f"after Retry #{i + 1}",
+            )
+            if phase in want:
+                return phase
+            if phase != "error":
+                return phase
+        return self._browser_page_phase(page)
+
+    def _page_is_device_rate_limited(self, page) -> bool:
+        """True when verify/consent hit IdP rate_limited (URL and/or body)."""
+        url = self._page_url(page).lower()
+        if "error=rate_limited" in url or "error=slow_down" in url:
+            return True
+        if "rate_limited" in url or "ratelimited" in url:
+            return True
+        try:
+            hit = page.run_js(
+                """
+const normalize = (s) => (s || '').replace(/\\s+/g, ' ').trim().toLowerCase();
+const url = normalize(location.href || '');
+if (url.includes('error=rate_limited') || url.includes('error=slow_down')
+    || url.includes('rate_limited') || url.includes('too_many')) return true;
+const body = normalize(document.body && (document.body.innerText || document.body.textContent) || '');
+if (/rate.?limit|too many (device|request)|try again later|请求过于频繁|操作过于频繁|稍后再试/.test(body)) {
+  // Avoid matching the static helper text about "only enter this code…".
+  if (/rate.?limit|too many|过于频繁|slow.?down/.test(body)) return true;
+}
+const params = new URLSearchParams(location.search || '');
+const err = normalize(params.get('error') || '');
+return err === 'rate_limited' || err === 'slow_down' || err === 'too_many_requests';
+"""
+            )
+            # Strict: only accept real booleans (mock/errant dicts must not count).
+            return hit is True
+        except Exception:
+            return False
+
+    def _device_verify_backoff_secs(self, attempt: int) -> float:
+        attempt = max(int(attempt), 1)
+        delay = float(DEVICE_VERIFY_BACKOFF_BASE_SECS) * (2 ** (attempt - 1))
+        delay = min(delay, float(DEVICE_VERIFY_BACKOFF_MAX_SECS))
+        delay += random.uniform(0.0, float(DEVICE_START_BACKOFF_JITTER_SECS))
+        return delay
+
+    def _browser_reopen_user_code_page(
+        self,
+        page,
+        user_code: str,
+        *,
+        log_callback: Callable[[str], None] | None = None,
+    ) -> None:
+        """Reload device verify URL so rate_limited error state is cleared."""
+        code = str(user_code or "").strip()
+        if not code:
+            return
+        # Prefer same host as current page; fall back to accounts.x.ai.
+        current = self._page_url(page)
+        base = "https://accounts.x.ai/oauth2/device"
+        try:
+            parsed = urlparse(current)
+            if parsed.scheme in ("http", "https") and parsed.netloc.endswith("x.ai"):
+                # Strip query/error and open a clean user_code URL.
+                path = parsed.path or "/oauth2/device"
+                if "device" not in path:
+                    path = "/oauth2/device"
+                base = f"{parsed.scheme}://{parsed.netloc}{path.split('?')[0]}"
+        except Exception:
+            pass
+        target = f"{base}?user_code={code}"
+        if not safe_xai_url(target):
+            target = f"https://accounts.x.ai/oauth2/device?user_code={code}"
+        if log_callback:
+            log_callback(
+                f"[*] Device Flow: reopen user-code page after rate limit "
+                f"(code={code!r})"
+            )
+        try:
+            page.get(target, timeout=45)
+        except TypeError:
+            try:
+                page.get(target)
+            except Exception as exc:
+                if log_callback:
+                    log_callback(f"[Debug] reopen user-code failed: {exc}")
+        except Exception as exc:
+            if log_callback:
+                log_callback(f"[Debug] reopen user-code failed: {exc}")
+        time.sleep(0.5)
 
     def _wait_browser_phase(
         self,
@@ -892,10 +1229,18 @@ return 'unknown';
         timeout: float = 15.0,
         log_callback: Callable[[str], None] | None = None,
         label: str = "",
+        detect_rate_limit: bool = True,
     ) -> str:
         deadline = time.time() + max(timeout, 1.0)
         last = "unknown"
         while time.time() < deadline:
+            if detect_rate_limit and self._page_is_device_rate_limited(page):
+                if log_callback and label:
+                    log_callback(
+                        f"[Debug] wait {label}: rate_limited "
+                        f"(url={self._page_url(page)[:120]})"
+                    )
+                return "rate_limited"
             last = self._browser_page_phase(page)
             if last in wanted:
                 return last
@@ -922,7 +1267,7 @@ return 'unknown';
         """Browser: Continue on user-code page, then Allow on consent page."""
         phase = self._wait_browser_phase(
             page,
-            {"user_code", "consent", "done"},
+            {"user_code", "consent", "done", "error"},
             timeout=12.0,
             log_callback=log_callback,
             label="device UI",
@@ -931,6 +1276,27 @@ return 'unknown';
             return True
         if phase == "auth_bounce":
             return False
+        if phase == "error":
+            phase = self._browser_recover_error_page(
+                page,
+                log_callback=log_callback,
+                max_clicks=3,
+                wanted={"user_code", "consent", "done"},
+            )
+            if phase == "done":
+                return True
+            if phase == "error":
+                if log_callback:
+                    log_callback(
+                        "[Debug] Device Flow: still error after Retry"
+                    )
+                    self._log_browser_diag(
+                        page,
+                        expected_user_code=user_code,
+                        log_callback=log_callback,
+                        label="stuck on error after Retry",
+                    )
+                return False
 
         # Step 1: user code page → Continue (never Allow here)
         if phase == "user_code":
@@ -951,13 +1317,22 @@ return 'unknown';
                 return False
             phase = self._wait_browser_phase(
                 page,
-                {"consent", "done"},
+                {"consent", "done", "error"},
                 timeout=15.0,
                 log_callback=log_callback,
                 label="consent after Continue",
             )
             if phase == "done":
                 return True
+            if phase == "error":
+                phase = self._browser_recover_error_page(
+                    page,
+                    log_callback=log_callback,
+                    max_clicks=3,
+                    wanted={"consent", "done"},
+                )
+                if phase == "done":
+                    return True
             if phase != "consent":
                 if log_callback:
                     log_callback(
@@ -992,17 +1367,14 @@ return 'unknown';
             )
         return False
 
-    def _browser_submit_continue(
+    def _browser_click_continue_js(
         self,
         page,
         user_code: str,
+        *,
         log_callback: Callable[[str], None] | None = None,
-    ) -> bool:
-        """Click Continue on the user-code verification page.
-
-        Equivalent to POST /oauth2/device/verify with user_code.
-        Must not touch the consent Allow/Deny form.
-        """
+    ) -> dict[str, Any] | None:
+        """Fill user_code (React-safe) and click Continue once."""
         user_code_js = json.dumps(str(user_code or ""))
         js = f"""
 const userCode = {user_code_js};
@@ -1019,6 +1391,40 @@ const formMeta = (f) => f ? {{
   method: (f.getAttribute('method') || 'get').toLowerCase(),
   inputNames: Array.from(f.querySelectorAll('input')).map((i) => i.name || '').filter(Boolean).slice(0, 8),
 }} : null;
+
+// React-controlled inputs ignore naive .value= ; use native setter.
+const setNativeValue = (input, value) => {{
+  if (!input) return '';
+  try {{ input.focus(); }} catch (e) {{}}
+  try {{
+    const proto = window.HTMLInputElement && window.HTMLInputElement.prototype;
+    const desc = proto ? Object.getOwnPropertyDescriptor(proto, 'value') : null;
+    if (desc && desc.set) desc.set.call(input, value);
+    else input.value = value;
+  }} catch (e) {{
+    input.value = value;
+  }}
+  try {{
+    input.dispatchEvent(new Event('input', {{ bubbles: true }}));
+    input.dispatchEvent(new Event('change', {{ bubbles: true }}));
+    input.dispatchEvent(new KeyboardEvent('keyup', {{ bubbles: true, key: '0' }}));
+  }} catch (e) {{}}
+  // Force-enable Continue if the SPA still thinks the field is empty.
+  try {{
+    const form = input.form || input.closest('form');
+    if (form) {{
+      Array.from(form.querySelectorAll('button, input[type="submit"]')).forEach((b) => {{
+        const t = normalize(b.innerText || b.textContent || b.value || '');
+        if (t === 'continue' || t === '继续' || t === '确认' || t === 'next' || t === '下一步') {{
+          b.disabled = false;
+          b.removeAttribute('disabled');
+          b.removeAttribute('aria-disabled');
+        }}
+      }});
+    }}
+  }} catch (e) {{}}
+  return String(input.value || '');
+}};
 
 // Refuse to act on consent form — that is the next page.
 const approveForm = document.querySelector('form[action*="device/approve"]');
@@ -1043,12 +1449,7 @@ const setField = (root, name, value) => {{
     input.name = name;
     root.appendChild(input);
   }}
-  input.value = value;
-  try {{
-    input.dispatchEvent(new Event('input', {{ bubbles: true }}));
-    input.dispatchEvent(new Event('change', {{ bubbles: true }}));
-  }} catch (e) {{}}
-  return input ? String(input.value || '') : '';
+  return setNativeValue(input, value);
 }};
 
 if (form) {{
@@ -1064,6 +1465,12 @@ if (form) {{
   }});
   // Do not click Allow/Deny if somehow present.
   if (cont) {{
+    // After refill, Continue may still report disabled for one frame.
+    if (userCode && codeValue) {{
+      cont.disabled = false;
+      cont.removeAttribute('disabled');
+      cont.removeAttribute('aria-disabled');
+    }}
     const disabled = !!(cont.disabled || cont.getAttribute('disabled') != null);
     if (disabled) {{
       return {{
@@ -1091,6 +1498,10 @@ if (form) {{
   }}
   // Single submit on verify form is Continue.
   if (buttons.length === 1) {{
+    if (buttons[0].disabled && userCode && codeValue) {{
+      buttons[0].disabled = false;
+      buttons[0].removeAttribute('disabled');
+    }}
     if (buttons[0].disabled) {{
       return {{
         ok: false,
@@ -1154,11 +1565,12 @@ if (contBtn) {{
   }}
   let codeValue = '';
   if (codeInput && userCode) {{
-    codeInput.focus();
-    codeInput.value = userCode;
-    codeInput.dispatchEvent(new Event('input', {{ bubbles: true }}));
-    codeInput.dispatchEvent(new Event('change', {{ bubbles: true }}));
-    codeValue = String(codeInput.value || '');
+    codeValue = setNativeValue(codeInput, userCode);
+  }}
+  if (userCode && codeValue) {{
+    contBtn.disabled = false;
+    contBtn.removeAttribute('disabled');
+    contBtn.removeAttribute('aria-disabled');
   }}
   if (contBtn.disabled || contBtn.getAttribute('disabled') != null) {{
     return {{
@@ -1203,62 +1615,215 @@ return {{
                     label="Continue JS exception",
                     extra={"error": str(exc)},
                 )
-            return False
+            return None
+        return result if isinstance(result, dict) else None
 
-        if isinstance(result, dict) and result.get("reason") == "already_on_consent":
-            if log_callback:
-                log_callback("[*] Device Flow: already on consent (skip Continue)")
-            return True
-        if not isinstance(result, dict) or not result.get("ok"):
-            if log_callback:
-                reason = result.get("reason") if isinstance(result, dict) else result
-                via = result.get("via") if isinstance(result, dict) else None
-                log_callback(
-                    f"[Debug] browser Continue missed: reason={reason!r} via={via!r} "
-                    f"raw={result!r}"
-                )
-                self._log_browser_diag(
-                    page,
-                    expected_user_code=user_code,
-                    log_callback=log_callback,
-                    label="Continue click missed",
-                    extra={
-                        "reason": reason,
-                        "via": via,
-                        "result": result if isinstance(result, dict) else str(result),
-                    },
-                )
-            return False
+    def _browser_submit_continue(
+        self,
+        page,
+        user_code: str,
+        log_callback: Callable[[str], None] | None = None,
+    ) -> bool:
+        """Click Continue on the user-code verification page.
 
-        via = str(result.get("via") or "ok")
-        if log_callback:
-            log_callback(
-                f"[*] Device Flow: Continue submitted (via={via}, "
-                f"code_len={result.get('codeValueLen')}, "
-                f"code_match={result.get('codeMatches')}, "
-                f"url={(result.get('url') or self._page_url(page))[:100]})"
-            )
+        Equivalent to POST /oauth2/device/verify with user_code.
+        Must not touch the consent Allow/Deny form.
+
+        When the IdP returns error=rate_limited it clears the code field;
+        backoff, re-open the verify URL, re-type user_code, and Continue again.
+        """
+        max_attempts = max(int(DEVICE_VERIFY_MAX_ATTEMPTS), 1)
+        last_result: dict[str, Any] | None = None
+        last_phase = "unknown"
         url_before = self._page_url(page)
-        # Wait until we leave the pure user-code page.
-        phase = self._wait_browser_phase(
-            page,
-            {"consent", "done"},
-            timeout=15.0,
-            log_callback=log_callback,
-            label="after Continue",
-        )
-        if phase in ("consent", "done"):
+
+        for attempt in range(1, max_attempts + 1):
+            # Already past verify?
+            if self._page_is_device_done(page):
+                return True
+            phase_now = self._browser_page_phase(page)
+            if phase_now == "consent":
+                if log_callback:
+                    log_callback("[*] Device Flow: already on consent (skip Continue)")
+                return True
+
+            rate_limited = self._page_is_device_rate_limited(page)
+            if rate_limited or attempt > 1:
+                if rate_limited:
+                    wait = self._device_verify_backoff_secs(attempt)
+                    # Share cooldown with device-code mint so workers don't pile on.
+                    self._mark_device_start_rate_limited(wait)
+                    if log_callback:
+                        log_callback(
+                            f"[*] Device Flow: verify rate_limited → backoff "
+                            f"{wait:.1f}s then re-enter user_code "
+                            f"(attempt {attempt}/{max_attempts}, "
+                            f"code={user_code!r}, url={self._page_url(page)[:120]})"
+                        )
+                    time.sleep(wait)
+                    self._browser_reopen_user_code_page(
+                        page, user_code, log_callback=log_callback
+                    )
+                elif attempt > 1:
+                    # Non-rate-limit retry: short pause + re-fill in place.
+                    time.sleep(0.8)
+
+            # Ensure user_code field is ready before clicking.
+            phase_ready = self._wait_browser_phase(
+                page,
+                {"user_code", "consent", "done", "error"},
+                timeout=10.0,
+                log_callback=log_callback,
+                label="user-code for Continue",
+                detect_rate_limit=False,
+            )
+            if phase_ready == "done":
+                return True
+            if phase_ready == "consent":
+                if log_callback:
+                    log_callback("[*] Device Flow: already on consent (skip Continue)")
+                return True
+            if phase_ready == "error":
+                recovered = self._browser_recover_error_page(
+                    page,
+                    log_callback=log_callback,
+                    max_clicks=2,
+                    wanted={"user_code", "consent", "done"},
+                )
+                if recovered == "done":
+                    return True
+                if recovered == "consent":
+                    return True
+                if recovered != "user_code":
+                    last_phase = recovered
+                    continue
+
+            result = self._browser_click_continue_js(
+                page, user_code, log_callback=log_callback
+            )
+            last_result = result
+
+            if isinstance(result, dict) and result.get("reason") == "already_on_consent":
+                if log_callback:
+                    log_callback("[*] Device Flow: already on consent (skip Continue)")
+                return True
+            if not isinstance(result, dict) or not result.get("ok"):
+                reason = result.get("reason") if isinstance(result, dict) else result
+                # Disabled Continue with empty/partial code often follows rate_limit;
+                # treat as retryable.
+                retryable = str(reason or "") in (
+                    "continue_disabled",
+                    "single_submit_disabled",
+                    "page_continue_disabled",
+                ) or self._page_is_device_rate_limited(page)
+                if retryable and attempt < max_attempts:
+                    if log_callback:
+                        log_callback(
+                            f"[Debug] Continue not ready ({reason!r}); "
+                            f"will re-enter user_code "
+                            f"(attempt {attempt}/{max_attempts})"
+                        )
+                    # Force rate-limit style recovery next loop.
+                    if not self._page_is_device_rate_limited(page):
+                        # Soft backoff even without explicit error flag.
+                        soft = min(
+                            self._device_verify_backoff_secs(attempt) * 0.5,
+                            15.0,
+                        )
+                        time.sleep(soft)
+                        self._browser_reopen_user_code_page(
+                            page, user_code, log_callback=log_callback
+                        )
+                    continue
+                if log_callback:
+                    via = result.get("via") if isinstance(result, dict) else None
+                    log_callback(
+                        f"[Debug] browser Continue missed: reason={reason!r} via={via!r} "
+                        f"raw={result!r}"
+                    )
+                    self._log_browser_diag(
+                        page,
+                        expected_user_code=user_code,
+                        log_callback=log_callback,
+                        label="Continue click missed",
+                        extra={
+                            "reason": reason,
+                            "via": via,
+                            "attempt": attempt,
+                            "result": result if isinstance(result, dict) else str(result),
+                        },
+                    )
+                return False
+
+            via = str(result.get("via") or "ok")
             if log_callback:
                 log_callback(
-                    f"[*] Device Flow: left user-code page → phase={phase} "
-                    f"(was url={url_before[:100]})"
+                    f"[*] Device Flow: Continue submitted (via={via}, "
+                    f"code_len={result.get('codeValueLen')}, "
+                    f"code_match={result.get('codeMatches')}, "
+                    f"attempt={attempt}, "
+                    f"url={(result.get('url') or self._page_url(page))[:100]})"
                 )
-            return True
+            url_before = self._page_url(page)
+            # Wait until we leave the pure user-code page.
+            phase = self._wait_browser_phase(
+                page,
+                {"consent", "done", "error"},
+                timeout=15.0,
+                log_callback=log_callback,
+                label="after Continue",
+            )
+            last_phase = phase
+            if phase == "rate_limited":
+                if attempt >= max_attempts:
+                    break
+                # Loop: backoff + re-enter user_code.
+                continue
+            if phase == "error":
+                phase = self._browser_recover_error_page(
+                    page,
+                    log_callback=log_callback,
+                    max_clicks=3,
+                    wanted={"consent", "done", "user_code"},
+                )
+                last_phase = phase
+                if phase == "rate_limited" or self._page_is_device_rate_limited(page):
+                    continue
+                if phase == "user_code":
+                    # Error recovery landed back on code page — re-Continue.
+                    continue
+            if phase in ("consent", "done"):
+                if log_callback:
+                    log_callback(
+                        f"[*] Device Flow: left user-code page → phase={phase} "
+                        f"(was url={url_before[:100]})"
+                    )
+                return True
+
+            # Still on user_code without rate_limit flag: check once more.
+            if self._page_is_device_rate_limited(page):
+                continue
+            if attempt < max_attempts:
+                # Empty input after submit often means the IdP bounced us —
+                # re-open and retry once more with backoff.
+                if log_callback:
+                    log_callback(
+                        f"[Debug] Continue still on user-code "
+                        f"(phase={phase}); re-enter user_code "
+                        f"(attempt {attempt}/{max_attempts})"
+                    )
+                wait = min(self._device_verify_backoff_secs(attempt) * 0.4, 12.0)
+                time.sleep(wait)
+                self._browser_reopen_user_code_page(
+                    page, user_code, log_callback=log_callback
+                )
+                continue
+            break
 
         if log_callback:
             log_callback(
                 f"[Debug] browser Continue did not leave user-code page "
-                f"(via={via}, phase_after={phase}, "
+                f"(phase_after={last_phase}, attempts={max_attempts}, "
                 f"url_before={url_before[:120]}, url_after={self._page_url(page)[:120]})"
             )
             self._log_browser_diag(
@@ -1267,11 +1832,12 @@ return {{
                 log_callback=log_callback,
                 label="still on user-code after Continue",
                 extra={
-                    "via": via,
-                    "phase_after": phase,
+                    "phase_after": last_phase,
+                    "attempts": max_attempts,
                     "url_before": url_before,
+                    "rate_limited": self._page_is_device_rate_limited(page),
                     "submit_result": {
-                        k: result.get(k)
+                        k: last_result.get(k)
                         for k in (
                             "via",
                             "codeValueLen",
@@ -1280,43 +1846,19 @@ return {{
                             "form",
                             "reason",
                         )
-                        if k in result
+                        if isinstance(last_result, dict) and k in last_result
                     },
                 },
             )
         return False
-    def _browser_submit_allow(
+    def _browser_click_allow_js(
         self,
         page,
         user_code: str,
+        *,
         log_callback: Callable[[str], None] | None = None,
-    ) -> bool:
-        """Approve only on the consent form (Deny + Allow). Never on user-code page.
-
-        Real form (auth.x.ai):
-          <form action=".../oauth2/device/approve" method="POST">
-            <input name="user_code" value="XXXX-XXXX">
-            <input name="action" value="">
-            <button type="submit">Deny</button>
-            <button type="submit">Allow</button>
-          </form>
-        """
-        phase = self._wait_browser_phase(
-            page,
-            {"consent", "done"},
-            timeout=12.0,
-            log_callback=log_callback,
-            label="consent for Allow",
-        )
-        if phase == "done":
-            return True
-        if phase != "consent":
-            if log_callback:
-                log_callback(
-                    f"[Debug] Allow refused: not on consent (phase={phase})"
-                )
-            return False
-
+    ) -> dict[str, Any] | None:
+        """Run the Allow form submit JS once. Returns result dict or None."""
         user_code_js = json.dumps(str(user_code or ""))
         js = f"""
 const userCode = {user_code_js};
@@ -1387,41 +1929,132 @@ return {{ ok: true, via: 'form_submit' }};
         except Exception as exc:
             if log_callback:
                 log_callback(f"[Debug] browser Allow JS failed: {exc}")
-            result = None
+            return None
+        return result if isinstance(result, dict) else None
 
-        if not isinstance(result, dict) or not result.get("ok"):
+    def _browser_submit_allow(
+        self,
+        page,
+        user_code: str,
+        log_callback: Callable[[str], None] | None = None,
+    ) -> bool:
+        """Approve only on the consent form (Deny + Allow). Never on user-code page.
+
+        Real form (auth.x.ai):
+          <form action=".../oauth2/device/approve" method="POST">
+            <input name="user_code" value="XXXX-XXXX">
+            <input name="action" value="">
+            <button type="submit">Deny</button>
+            <button type="submit">Allow</button>
+          </form>
+
+        After Allow the IdP sometimes shows a transient error page with Retry;
+        click Retry and re-Allow if consent reappears.
+        """
+        max_allow_attempts = 4  # initial + retries after error page recovery
+        for attempt in range(max_allow_attempts):
+            phase = self._wait_browser_phase(
+                page,
+                {"consent", "done", "error"},
+                timeout=12.0,
+                log_callback=log_callback,
+                label="consent for Allow",
+            )
+            if phase == "done":
+                return True
+            if phase == "error":
+                phase = self._browser_recover_error_page(
+                    page,
+                    log_callback=log_callback,
+                    max_clicks=3,
+                    wanted={"consent", "done"},
+                )
+                if phase == "done":
+                    return True
+            if phase != "consent":
+                if log_callback:
+                    log_callback(
+                        f"[Debug] Allow refused: not on consent (phase={phase})"
+                    )
+                return False
+
+            result = self._browser_click_allow_js(
+                page, user_code, log_callback=log_callback
+            )
+            if not result or not result.get("ok"):
+                if log_callback:
+                    reason = result.get("reason") if isinstance(result, dict) else result
+                    log_callback(f"[Debug] browser Allow missed: {reason}")
+                return False
+
             if log_callback:
-                reason = result.get("reason") if isinstance(result, dict) else result
-                log_callback(f"[Debug] browser Allow missed: {reason}")
+                log_callback(
+                    f"[*] Device Flow: Allow submitted "
+                    f"({result.get('via') or 'ok'}"
+                    f"{f', attempt={attempt + 1}' if attempt else ''})"
+                )
+
+            wait_deadline = time.time() + 15.0
+            saw_error = False
+            while time.time() < wait_deadline:
+                if self._page_is_device_done(page):
+                    if log_callback:
+                        log_callback("[*] Device Flow: browser reached done")
+                    return True
+                url = self._page_url(page).lower()
+                if "sign-in" in url or "sign-up" in url:
+                    if log_callback:
+                        log_callback(f"[Debug] browser Allow bounced to {url[:100]}")
+                    return False
+                phase_now = self._browser_page_phase(page)
+                if phase_now == "error":
+                    saw_error = True
+                    if log_callback:
+                        log_callback(
+                            "[*] Device Flow: after Allow → error page, clicking Retry"
+                        )
+                    recovered = self._browser_recover_error_page(
+                        page,
+                        log_callback=log_callback,
+                        max_clicks=3,
+                        wanted={"consent", "done"},
+                    )
+                    if recovered == "done":
+                        if log_callback:
+                            log_callback("[*] Device Flow: browser reached done")
+                        return True
+                    if recovered == "consent":
+                        # Consent form reloaded after Retry — re-Allow.
+                        break
+                    if log_callback:
+                        log_callback(
+                            f"[Debug] browser Allow still error after Retry "
+                            f"(phase={recovered})"
+                        )
+                    return False
+                # Still on user-code means we never left Continue page — fail.
+                if phase_now == "user_code":
+                    if log_callback:
+                        log_callback("[Debug] browser Allow still on user-code page")
+                    return False
+                time.sleep(0.4)
+
+            if self._page_is_device_done(page):
+                return True
+            if saw_error and self._browser_page_phase(page) == "consent":
+                # Loop to re-submit Allow after Retry recovered consent UI.
+                continue
+            if log_callback:
+                log_callback(
+                    f"[Debug] browser Allow did not reach done "
+                    f"(phase={self._browser_page_phase(page)}, "
+                    f"url={self._page_url(page)[:100]})"
+                )
             return False
 
         if log_callback:
-            log_callback(f"[*] Device Flow: Allow submitted ({result.get('via') or 'ok'})")
-
-        wait_deadline = time.time() + 15.0
-        while time.time() < wait_deadline:
-            if self._page_is_device_done(page):
-                if log_callback:
-                    log_callback("[*] Device Flow: browser reached done")
-                return True
-            url = self._page_url(page).lower()
-            if "sign-in" in url or "sign-up" in url:
-                if log_callback:
-                    log_callback(f"[Debug] browser Allow bounced to {url[:100]}")
-                return False
-            # Still on user-code means we never left Continue page — fail.
-            phase_now = self._browser_page_phase(page)
-            if phase_now == "user_code":
-                if log_callback:
-                    log_callback("[Debug] browser Allow still on user-code page")
-                return False
-            time.sleep(0.4)
-
-        if self._page_is_device_done(page):
-            return True
-        if log_callback:
             log_callback(
-                f"[Debug] browser Allow did not reach done "
+                f"[Debug] browser Allow exhausted retries "
                 f"(phase={self._browser_page_phase(page)}, url={self._page_url(page)[:100]})"
             )
         return False

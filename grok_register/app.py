@@ -2804,64 +2804,428 @@ def refresh_active_page():
         return _tls_get_page()
 
 
-def click_email_signup_button(timeout=10, log_callback=None, cancel_callback=None):
+# Labels / selectors for the email signup entry on accounts.x.ai.
+# Provider UI copy drifts between locales and A/B variants.
+EMAIL_SIGNUP_LABELS = [
+    "使用邮箱注册",
+    "Sign up with email",
+    "Continue with email",
+    "Sign up with Email",
+    "Continue with Email",
+    "Use email",
+    "Use Email",
+    "Email",
+    "邮箱",
+    "用邮箱注册",
+    "邮箱注册",
+]
+
+EMAIL_SIGNUP_SELECTORS = [
+    'button:has-text("使用邮箱注册")',
+    'a:has-text("使用邮箱注册")',
+    '[role="button"]:has-text("使用邮箱注册")',
+    'button:has-text("Sign up with email")',
+    'button:has-text("Continue with email")',
+    'a:has-text("Sign up with email")',
+    'a:has-text("Continue with email")',
+    'button:has-text("Use email")',
+    'button:has-text("Email")',
+    'a:has-text("Email")',
+    '[role="button"]:has-text("Email")',
+    'button:has-text("邮箱")',
+    'a:has-text("邮箱")',
+]
+
+_EMAIL_FORM_READY_JS = """
+(() => {
+  const sel = [
+    'input[data-testid="email"]',
+    'input[name="email"]',
+    'input[type="email"]',
+    'input[autocomplete="email"]',
+    'input[placeholder*="mail" i]',
+    'input[aria-label*="mail" i]',
+    'input[aria-label*="邮箱"]',
+    'input[placeholder*="邮箱"]',
+  ].join(', ');
+  const nodes = Array.from(document.querySelectorAll(sel));
+  for (const el of nodes) {
+    try {
+      const st = window.getComputedStyle(el);
+      if (st.display === 'none' || st.visibility === 'hidden') continue;
+      const r = el.getBoundingClientRect();
+      if (r.width > 2 && r.height > 2) return true;
+    } catch (e) {}
+  }
+  return false;
+})()
+"""
+
+_SIGNUP_PAGE_PROBE_JS = """
+(() => {
+  const normalize = (s) => (s || '').replace(/\\s+/g, ' ').trim();
+  const lower = (s) => normalize(s).toLowerCase();
+  const body = lower(document.body && (document.body.innerText || document.body.textContent) || '');
+  const html = lower(document.documentElement ? document.documentElement.innerHTML.slice(0, 8000) : '');
+  const challenge = /just a moment|checking your browser|cf-browser-verification|challenge-platform|attention required|enable javascript and cookies/.test(body + ' ' + html)
+    || !!(document.querySelector('#challenge-running, #challenge-stage, #cf-challenge-running, .cf-browser-verification, iframe[src*="challenges.cloudflare.com"]'));
+  const loading = document.readyState !== 'complete'
+    || /loading|please wait|正在加载|请稍候/.test(body.slice(0, 200));
+
+  const collect = (root, out, depth) => {
+    if (!root || depth > 6) return;
+    let nodes;
+    try {
+      nodes = root.querySelectorAll('button, a, [role="button"], input[type="button"], input[type="submit"]');
+    } catch (e) {
+      return;
+    }
+    for (const el of nodes) {
+      let text = '';
+      try {
+        text = normalize(el.innerText || el.textContent || el.value || el.getAttribute('aria-label') || '');
+      } catch (e) {
+        text = '';
+      }
+      if (!text) continue;
+      let visible = false;
+      try {
+        const st = window.getComputedStyle(el);
+        const r = el.getBoundingClientRect();
+        visible = st.display !== 'none' && st.visibility !== 'hidden'
+          && Number(st.opacity || '1') > 0.05 && r.width > 2 && r.height > 2;
+      } catch (e) {
+        visible = true;
+      }
+      out.push({ text: text.slice(0, 80), visible });
+    }
+    let all;
+    try { all = root.querySelectorAll('*'); } catch (e) { return; }
+    for (const el of all) {
+      try {
+        if (el.shadowRoot) collect(el.shadowRoot, out, depth + 1);
+      } catch (e) {}
+    }
+  };
+  const buttons = [];
+  collect(document, buttons, 0);
+  const visibleButtons = buttons.filter((b) => b.visible).map((b) => b.text).slice(0, 16);
+  const emailPatterns = [
+    /使用邮箱注册/,
+    /用邮箱注册/,
+    /邮箱注册/,
+    /sign\\s*up\\s*with\\s*e-?mail/i,
+    /continue\\s*with\\s*e-?mail/i,
+    /use\\s*e-?mail/i,
+    /^e-?mail$/i,
+    /^邮箱$/,
+  ];
+  const hasEmailEntry = buttons.some((b) => emailPatterns.some((p) => p.test(b.text)));
+  return {
+    readyState: document.readyState || '',
+    challenge: !!challenge,
+    loading: !!loading,
+    buttonCount: buttons.length,
+    visibleButtons,
+    hasEmailEntry: !!hasEmailEntry,
+    bodySnippet: normalize(document.body && (document.body.innerText || document.body.textContent) || '').slice(0, 220),
+  };
+})()
+"""
+
+_CLICK_EMAIL_SIGNUP_JS = """
+(() => {
+  const normalize = (s) => (s || '').replace(/\\s+/g, ' ').trim();
+  const patterns = [
+    /使用邮箱注册/i,
+    /用邮箱注册/i,
+    /邮箱注册/i,
+    /sign\\s*up\\s*with\\s*e-?mail/i,
+    /continue\\s*with\\s*e-?mail/i,
+    /use\\s*e-?mail/i,
+    /^e-?mail$/i,
+    /^邮箱$/,
+  ];
+  // Prefer explicit email CTAs; avoid matching "email" inside long privacy text.
+  const isEmailCta = (text) => {
+    const t = normalize(text);
+    if (!t || t.length > 64) return false;
+    return patterns.some((p) => p.test(t));
+  };
+  const isVisible = (el) => {
+    try {
+      const st = window.getComputedStyle(el);
+      if (st.display === 'none' || st.visibility === 'hidden' || Number(st.opacity || '1') < 0.05) return false;
+      const r = el.getBoundingClientRect();
+      return r.width > 2 && r.height > 2;
+    } catch (e) {
+      return true;
+    }
+  };
+  const collect = (root, out, depth) => {
+    if (!root || depth > 6) return;
+    let nodes;
+    try {
+      nodes = root.querySelectorAll('button, a, [role="button"], input[type="button"], input[type="submit"]');
+    } catch (e) {
+      return;
+    }
+    for (const el of nodes) out.push(el);
+    let all;
+    try { all = root.querySelectorAll('*'); } catch (e) { return; }
+    for (const el of all) {
+      try {
+        if (el.shadowRoot) collect(el.shadowRoot, out, depth + 1);
+      } catch (e) {}
+    }
+  };
+  const candidates = [];
+  collect(document, candidates, 0);
+  for (const el of candidates) {
+    let text = '';
+    try {
+      text = normalize(el.innerText || el.textContent || el.value || el.getAttribute('aria-label') || '');
+    } catch (e) {
+      text = '';
+    }
+    if (!isEmailCta(text) || !isVisible(el)) continue;
+    try {
+      el.scrollIntoView({ block: 'center', inline: 'center', behavior: 'auto' });
+    } catch (e) {}
+    try {
+      el.click();
+      return { ok: true, via: 'js_deep_click', text: text.slice(0, 60) };
+    } catch (e) {
+      return { ok: false, reason: 'click_threw', text: text.slice(0, 60), error: String(e && e.message || e) };
+    }
+  }
+  return {
+    ok: false,
+    reason: 'no_email_cta',
+    buttonCount: candidates.length,
+    samples: candidates.slice(0, 12).map((el) => {
+      try {
+        return normalize(el.innerText || el.textContent || el.value || '').slice(0, 40);
+      } catch (e) {
+        return '';
+      }
+    }).filter(Boolean),
+  };
+})()
+"""
+
+
+def _signup_email_form_ready(page) -> bool:
+    """True when the email input of the signup form is already visible."""
+    if page is None:
+        return False
+    try:
+        return bool(page.run_js(_EMAIL_FORM_READY_JS))
+    except Exception:
+        return False
+
+
+def _probe_signup_page(page) -> dict:
+    if page is None:
+        return {}
+    try:
+        raw = page.run_js(_SIGNUP_PAGE_PROBE_JS)
+        return raw if isinstance(raw, dict) else {}
+    except Exception as exc:
+        return {"probe_error": str(exc)}
+
+
+def _js_click_email_signup(page) -> dict | None:
+    if page is None:
+        return None
+    try:
+        raw = page.run_js(_CLICK_EMAIL_SIGNUP_JS)
+        return raw if isinstance(raw, dict) else None
+    except Exception as exc:
+        return {"ok": False, "reason": f"js_error:{exc}"}
+
+
+def click_email_signup_button(timeout=28, log_callback=None, cancel_callback=None):
+    """Find and click the email signup CTA on accounts.x.ai.
+
+    Hardening vs flaky SPA / CF interstitial:
+      - skip if email form already present
+      - wait for hydrated auth buttons
+      - Playwright role/text/selectors + shadow-DOM JS deep click
+      - one mid-timeout reload if page stays empty/challenge
+    """
     # thread-local page/browser (multi-thread safe)
     browser, page = _ensure_thread_browser(log_callback=log_callback)
-    deadline = time.time() + timeout
-    labels = [
-        "使用邮箱注册",
-        "Sign up with email",
-        "Continue with email",
-        "Sign up with Email",
-        "邮箱",
-    ]
+    deadline = time.time() + max(float(timeout or 28), 8.0)
+    started = time.time()
+    last_status_log = 0.0
+    reloaded = False
+    attempt = 0
+
+    if _signup_email_form_ready(page):
+        if log_callback:
+            log_callback("[*] 已在邮箱注册表单，跳过入口按钮")
+        return True
+
     while time.time() < deadline:
         raise_if_cancelled(cancel_callback)
-        if log_callback:
-            log_callback("[Debug] 尝试查找“使用邮箱注册”按钮...")
+        attempt += 1
+        page = _tls_get_page() or page
+        if page is None:
+            browser, page = _ensure_thread_browser(log_callback=log_callback)
+        if page is None:
+            sleep_with_cancel(0.5, cancel_callback)
+            continue
 
-        _human_pause_cancel(0.25, 0.6, cancel_callback)
+        if _signup_email_form_ready(page):
+            if log_callback:
+                log_callback("[*] 邮箱输入框已出现（入口可能已自动展开）")
+            return True
+
+        probe = _probe_signup_page(page)
+        now = time.time()
+        if log_callback and (attempt == 1 or now - last_status_log >= 4.0):
+            last_status_log = now
+            url = ""
+            try:
+                url = page.url or ""
+            except Exception:
+                url = ""
+            btns = probe.get("visibleButtons") if isinstance(probe, dict) else None
+            btn_preview = ""
+            if isinstance(btns, list) and btns:
+                btn_preview = ", ".join(str(b)[:28] for b in btns[:6])
+            log_callback(
+                f"[Debug] 查找邮箱注册入口 attempt={attempt} "
+                f"url={str(url)[:100]} "
+                f"ready={probe.get('readyState')!r} "
+                f"challenge={probe.get('challenge')} "
+                f"buttons={probe.get('buttonCount')} "
+                f"has_email_cta={probe.get('hasEmailEntry')} "
+                f"visible=[{btn_preview}]"
+            )
+
+        # Cloudflare interstitial / empty SPA shell — wait a bit longer.
+        if probe.get("challenge") or (
+            int(probe.get("buttonCount") or 0) == 0 and probe.get("loading")
+        ):
+            sleep_with_cancel(1.2, cancel_callback)
+            # Mid-window: one hard reload to recover stuck shells.
+            if (
+                not reloaded
+                and (now - started) >= max(float(timeout) * 0.45, 8.0)
+            ):
+                reloaded = True
+                if log_callback:
+                    log_callback("[*] 注册页长时间无交互控件，刷新页面重试")
+                try:
+                    page.get(SIGNUP_URL)
+                    page.wait.doc_loaded()
+                    sleep_with_cancel(1.5, cancel_callback)
+                except Exception as exc:
+                    if log_callback:
+                        log_callback(f"[Debug] 注册页刷新失败: {exc}")
+            continue
+
+        _human_pause_cancel(0.15, 0.4, cancel_callback)
         hit = None
+
+        # 1) Playwright role / text (short timeouts to avoid blowing the budget)
         try:
-            hit = page.click_by_text(labels, role="button")
+            hit = page.click_by_text(
+                EMAIL_SIGNUP_LABELS, role="button", timeout_ms=1800
+            )
         except Exception:
             hit = None
         if not hit:
-            # broader native selectors
             try:
-                if page.click_first(
-                    [
-                        'button:has-text("使用邮箱注册")',
-                        'a:has-text("使用邮箱注册")',
-                        '[role="button"]:has-text("使用邮箱注册")',
-                        'button:has-text("email")',
-                        'a:has-text("email")',
-                        'button:has-text("Email")',
-                    ]
-                ):
+                hit = page.click_by_text(
+                    EMAIL_SIGNUP_LABELS, role="link", timeout_ms=1200
+                )
+            except Exception:
+                hit = None
+
+        # 2) CSS / has-text selectors
+        if not hit:
+            try:
+                if page.click_first(EMAIL_SIGNUP_SELECTORS, timeout_ms=1800):
                     hit = "selector"
             except Exception:
                 pass
+
+        # 3) Shadow-DOM aware JS deep click
+        if not hit:
+            js_result = _js_click_email_signup(page)
+            if isinstance(js_result, dict) and js_result.get("ok"):
+                hit = f"js:{js_result.get('via') or 'deep'}:{js_result.get('text') or ''}"
+            elif (
+                log_callback
+                and isinstance(js_result, dict)
+                and attempt == 1
+                and js_result.get("samples")
+            ):
+                samples = js_result.get("samples") or []
+                log_callback(
+                    f"[Debug] JS 未命中邮箱入口，可见候选: "
+                    f"{[str(s)[:30] for s in samples[:8]]}"
+                )
 
         if hit:
             if log_callback:
                 detail = f": {hit}" if isinstance(hit, str) else ""
                 log_callback(f"[*] 已点击「使用邮箱注册」按钮{detail}")
-            _human_pause_cancel(1.2, 2.2, cancel_callback)
+            _human_pause_cancel(0.8, 1.6, cancel_callback)
+            # Confirm the email form expands; if not, keep looping a bit.
+            form_wait_deadline = min(time.time() + 4.0, deadline)
+            while time.time() < form_wait_deadline:
+                if _signup_email_form_ready(page):
+                    return True
+                sleep_with_cancel(0.35, cancel_callback)
+            # Click registered even if form probe lags (fill step will re-click).
             return True
 
-        if log_callback:
-            current_url = page.url if page else "none"
-            log_callback(f"[Debug] 当前URL: {current_url}")
+        # One proactive reload if UI rendered but still no email CTA.
+        if (
+            not reloaded
+            and (now - started) >= max(float(timeout) * 0.55, 10.0)
+            and not probe.get("hasEmailEntry")
+        ):
+            reloaded = True
+            if log_callback:
+                log_callback(
+                    "[*] 未出现邮箱注册入口，刷新注册页后重试 "
+                    f"(visible={probe.get('visibleButtons')!r})"
+                )
+            try:
+                page.get(SIGNUP_URL)
+                page.wait.doc_loaded()
+                sleep_with_cancel(1.5, cancel_callback)
+            except Exception as exc:
+                if log_callback:
+                    log_callback(f"[Debug] 注册页刷新失败: {exc}")
+            continue
 
-        sleep_with_cancel(1, cancel_callback)
+        sleep_with_cancel(0.7, cancel_callback)
 
     if log_callback:
         try:
-            page_html = page.html[:500] if page else "no page"
-        except Exception:
-            page_html = "no page"
-        log_callback(f"[Debug] 页面内容片段: {page_html}")
+            page = _tls_get_page() or page
+            probe = _probe_signup_page(page)
+            url = page.url if page else "none"
+            log_callback(
+                f"[Debug] 邮箱入口最终失败 url={url} "
+                f"challenge={probe.get('challenge')} "
+                f"buttons={probe.get('buttonCount')} "
+                f"visible={probe.get('visibleButtons')!r} "
+                f"body≈{str(probe.get('bodySnippet') or '')[:160]!r}"
+            )
+            try:
+                page_html = page.html[:400] if page else "no page"
+            except Exception:
+                page_html = "no page"
+            log_callback(f"[Debug] 页面内容片段: {page_html}")
+        except Exception as exc:
+            log_callback(f"[Debug] 失败诊断异常: {exc}")
 
     raise Exception("未找到「使用邮箱注册」按钮")
 
@@ -2927,9 +3291,42 @@ def open_signup_page(log_callback=None, cancel_callback=None):
         _mirror_thread_browser_globals(browser, page)
 
     page.wait.doc_loaded()
-    sleep_with_cancel(2, cancel_callback)
+    # SPA shell often paints before auth method buttons hydrate.
+    try:
+        pw = getattr(page, "_p", None)
+        if pw is not None:
+            try:
+                pw.wait_for_load_state("load", timeout=8000)
+            except Exception:
+                pass
+            try:
+                # Best-effort: network settles, but don't fail if long-polls remain.
+                pw.wait_for_load_state("networkidle", timeout=5000)
+            except Exception:
+                pass
+    except Exception:
+        pass
+    sleep_with_cancel(1.2, cancel_callback)
+
+    # Brief wait for either email form or any auth CTA to appear.
+    hydrate_deadline = time.time() + 8.0
+    while time.time() < hydrate_deadline:
+        raise_if_cancelled(cancel_callback)
+        if _signup_email_form_ready(page):
+            break
+        probe = _probe_signup_page(page)
+        if int(probe.get("buttonCount") or 0) > 0 or probe.get("hasEmailEntry"):
+            break
+        if probe.get("challenge"):
+            sleep_with_cancel(1.0, cancel_callback)
+            continue
+        sleep_with_cancel(0.4, cancel_callback)
+
     if log_callback:
-        log_callback(f"[*] 当前URL: {page.url}")
+        try:
+            log_callback(f"[*] 当前URL: {page.url}")
+        except Exception:
+            log_callback("[*] 当前URL: <unknown>")
     click_email_signup_button(
         log_callback=log_callback, cancel_callback=cancel_callback
     )
@@ -2993,9 +3390,14 @@ def fill_email_and_submit(timeout=45, log_callback=None, cancel_callback=None):
             if now - last_reclick_time >= 3:
                 try:
                     rehit = page.click_by_text(
-                        ["使用邮箱注册", "Sign up with email", "Continue with email"],
+                        EMAIL_SIGNUP_LABELS,
                         role="button",
+                        timeout_ms=1800,
                     )
+                    if not rehit:
+                        js_hit = _js_click_email_signup(page)
+                        if isinstance(js_hit, dict) and js_hit.get("ok"):
+                            rehit = f"js:{js_hit.get('text') or 'email'}"
                 except Exception:
                     rehit = None
                 last_reclick_time = now

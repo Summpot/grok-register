@@ -263,6 +263,92 @@ class SSOBuildFlowTests(unittest.TestCase):
         self.assertEqual(device["user_code"], "WXYZ-9999")
         self.assertIn("user_code=WXYZ-9999", device["verification_uri_complete"])
 
+    def test_start_device_backoff_on_429_slow_down(self):
+        """HTTP 429 slow_down should exponential-backoff then succeed."""
+        import grok_register.sso_build as sso_mod
+
+        device_body = json.dumps(
+            {
+                "device_code": "dev-3",
+                "user_code": "RETRY-0001",
+                "verification_uri": "https://accounts.x.ai/oauth2/device",
+                "interval": 5,
+                "expires_in": 600,
+            }
+        ).encode()
+        rate_body = json.dumps(
+            {
+                "error": "slow_down",
+                "error_description": (
+                    "Too many device code requests. Please wait and try again."
+                ),
+            }
+        ).encode()
+        hits = {"n": 0}
+
+        def fake_request(method, url, headers=None, data=None):
+            if url.endswith("/oauth2/device/code"):
+                hits["n"] += 1
+                if hits["n"] <= 2:
+                    return DummyResponse(429, rate_body)
+                return DummyResponse(200, device_body)
+            return DummyResponse(404, b"missing")
+
+        logs: list[str] = []
+        sleeps: list[float] = []
+
+        flow = SSOBuildFlow("sso-token-value")
+        # Reset process-wide pacing so this test is isolated.
+        sso_mod._device_start_next_ok_at = 0.0
+
+        with patch.object(flow, "_request", side_effect=fake_request):
+            with patch(
+                "grok_register.sso_build.time.sleep",
+                side_effect=lambda s: sleeps.append(float(s)),
+            ):
+                with patch(
+                    "grok_register.sso_build.random.uniform",
+                    return_value=0.0,
+                ):
+                    device = flow._start_device(log_callback=logs.append)
+
+        self.assertEqual(device["user_code"], "RETRY-0001")
+        self.assertEqual(hits["n"], 3)
+        # attempt1 → 5s, attempt2 → 10s (base * 2^(n-1), no jitter)
+        self.assertEqual(sleeps, [5.0, 10.0])
+        joined = "\n".join(logs)
+        self.assertIn("rate limited", joined)
+        self.assertIn("backoff", joined)
+
+    def test_start_device_exhausted_429_raises(self):
+        import grok_register.sso_build as sso_mod
+
+        rate_body = b'{"error":"slow_down","error_description":"Too many device code requests."}'
+
+        def fake_request(method, url, headers=None, data=None):
+            if url.endswith("/oauth2/device/code"):
+                return DummyResponse(429, rate_body)
+            return DummyResponse(404, b"missing")
+
+        flow = SSOBuildFlow("sso-token-value")
+        sso_mod._device_start_next_ok_at = 0.0
+        with patch.object(flow, "_request", side_effect=fake_request):
+            with patch("grok_register.sso_build.time.sleep", return_value=None):
+                with patch.object(sso_mod, "DEVICE_START_MAX_ATTEMPTS", 3):
+                    with self.assertRaises(SSOBuildError) as ctx:
+                        flow._start_device()
+        self.assertIn("429", str(ctx.exception))
+        self.assertIn("exhausted", str(ctx.exception))
+
+    def test_device_start_backoff_secs_exponential_cap(self):
+        with patch("grok_register.sso_build.random.uniform", return_value=0.0):
+            self.assertEqual(SSOBuildFlow._device_start_backoff_secs(1), 5.0)
+            self.assertEqual(SSOBuildFlow._device_start_backoff_secs(2), 10.0)
+            self.assertEqual(SSOBuildFlow._device_start_backoff_secs(3), 20.0)
+            self.assertEqual(SSOBuildFlow._device_start_backoff_secs(4), 40.0)
+            self.assertEqual(SSOBuildFlow._device_start_backoff_secs(5), 60.0)
+            self.assertEqual(SSOBuildFlow._device_start_backoff_secs(8), 60.0)
+
     def test_empty_sso_raises(self):
         with self.assertRaises(SSOBuildError):
             SSOBuildFlow("")
@@ -325,6 +411,133 @@ class SSOBuildFlowTests(unittest.TestCase):
             ok = flow._browser_submit_allow(page, "ABCD-1234")
         self.assertFalse(ok)
 
+    def test_browser_click_retry_success(self):
+        flow = SSOBuildFlow("sso-token-value")
+        page = MagicMock()
+        page.run_js = MagicMock(
+            return_value={"ok": True, "via": "retry_click", "text": "retry"}
+        )
+        logs: list[str] = []
+        with patch("grok_register.sso_build.time.sleep", return_value=None):
+            ok = flow._browser_click_retry(page, log_callback=logs.append)
+        self.assertTrue(ok)
+        self.assertTrue(any("Retry" in m for m in logs))
+        page.run_js.assert_called_once()
+
+    def test_browser_allow_clicks_retry_then_reallow(self):
+        """After Allow, error page with Retry → click Retry → re-Allow → done."""
+        flow = SSOBuildFlow("sso-token-value")
+        page = MagicMock()
+        page.url = (
+            "https://accounts.x.ai/oauth2/device/consent?user_code=ABCD-1234"
+        )
+        logs: list[str] = []
+
+        wait_seq = iter(["consent", "consent"])
+
+        def fake_wait(page, wanted, timeout=15.0, log_callback=None, label=""):
+            try:
+                return next(wait_seq)
+            except StopIteration:
+                return "done"
+
+        allow_calls = {"n": 0}
+
+        def fake_allow_js(page, user_code, log_callback=None):
+            allow_calls["n"] += 1
+            return {"ok": True, "via": "allow_click"}
+
+        recover_calls = {"n": 0}
+
+        def fake_recover(
+            page,
+            log_callback=None,
+            max_clicks=3,
+            wait_after=12.0,
+            wanted=None,
+        ):
+            recover_calls["n"] += 1
+            return "consent"
+
+        # After first Allow: error once, then re-Allow marks done.
+        phase_after_allow = {"n": 0}
+
+        def fake_phase(page):
+            if allow_calls["n"] == 1 and phase_after_allow["n"] == 0:
+                phase_after_allow["n"] += 1
+                return "error"
+            return "consent"
+
+        def is_done(page):
+            return allow_calls["n"] >= 2
+
+        with patch.object(flow, "_wait_browser_phase", side_effect=fake_wait):
+            with patch.object(flow, "_browser_page_phase", side_effect=fake_phase):
+                with patch.object(
+                    flow, "_browser_click_allow_js", side_effect=fake_allow_js
+                ):
+                    with patch.object(
+                        flow,
+                        "_browser_recover_error_page",
+                        side_effect=fake_recover,
+                    ):
+                        with patch.object(
+                            flow, "_page_is_device_done", side_effect=is_done
+                        ):
+                            with patch(
+                                "grok_register.sso_build.time.sleep",
+                                return_value=None,
+                            ):
+                                ok = flow._browser_submit_allow(
+                                    page,
+                                    "ABCD-1234",
+                                    log_callback=logs.append,
+                                )
+
+        self.assertTrue(ok)
+        self.assertGreaterEqual(allow_calls["n"], 2)
+        self.assertGreaterEqual(recover_calls["n"], 1)
+        self.assertTrue(any("Retry" in m or "error" in m.lower() for m in logs))
+
+    def test_device_flow_steps_retries_on_initial_error(self):
+        flow = SSOBuildFlow("sso-token-value")
+        page = MagicMock()
+        wait_returns = iter(["error", "consent"])
+
+        def fake_wait(page, wanted, timeout=15.0, log_callback=None, label=""):
+            try:
+                return next(wait_returns)
+            except StopIteration:
+                return "done"
+
+        calls = []
+
+        def fake_recover(
+            page,
+            log_callback=None,
+            max_clicks=3,
+            wait_after=12.0,
+            wanted=None,
+        ):
+            calls.append("retry")
+            return "consent"
+
+        def fake_allow(page, user_code, log_callback=None):
+            calls.append("allow")
+            return True
+
+        with patch.object(flow, "_wait_browser_phase", side_effect=fake_wait):
+            with patch.object(
+                flow, "_browser_recover_error_page", side_effect=fake_recover
+            ):
+                with patch.object(
+                    flow, "_browser_submit_allow", side_effect=fake_allow
+                ):
+                    ok = flow._browser_device_flow_steps(page, "ABCD-1234")
+
+        self.assertTrue(ok)
+        self.assertEqual(calls, ["retry", "allow"])
+
     def test_format_browser_diag_includes_key_fields(self):
         flow = SSOBuildFlow("sso-token-value")
         text = flow._format_browser_diag(
@@ -363,6 +576,8 @@ class SSOBuildFlowTests(unittest.TestCase):
         self.assertIn("invalid code", text)
 
     def test_continue_stuck_logs_diag(self):
+        import grok_register.sso_build as sso_mod
+
         flow = SSOBuildFlow("sso-token-value")
         page = MagicMock()
         page.url = "https://accounts.x.ai/oauth2/device?user_code=ABCD-1234"
@@ -377,38 +592,136 @@ class SSOBuildFlowTests(unittest.TestCase):
         )
         logs: list[str] = []
 
-        with patch.object(flow, "_wait_browser_phase", return_value="user_code"):
-            with patch.object(
-                flow,
-                "_collect_browser_diag",
-                return_value={
-                    "phase": "user_code",
-                    "url": page.url,
-                    "ready_state": "complete",
-                    "title": "t",
-                    "forms": [],
-                    "buttons": [{"text": "Continue", "disabled": False, "visible": True}],
-                    "code_input": {
-                        "name": "user_code",
-                        "valueLen": 9,
-                        "valuePreview": "AB…34",
-                        "matchesExpected": True,
-                        "disabled": False,
-                        "readOnly": False,
-                    },
-                    "errors": [],
-                    "body_snippet": "Enter device code",
-                },
-            ):
-                ok = flow._browser_submit_continue(
-                    page, "ABCD-1234", log_callback=logs.append
-                )
+        with patch.object(sso_mod, "DEVICE_VERIFY_MAX_ATTEMPTS", 2):
+            with patch.object(flow, "_wait_browser_phase", return_value="user_code"):
+                with patch.object(flow, "_page_is_device_rate_limited", return_value=False):
+                    with patch.object(flow, "_page_is_device_done", return_value=False):
+                        with patch.object(
+                            flow, "_browser_page_phase", return_value="user_code"
+                        ):
+                            with patch(
+                                "grok_register.sso_build.time.sleep", return_value=None
+                            ):
+                                with patch.object(
+                                    flow,
+                                    "_browser_reopen_user_code_page",
+                                    return_value=None,
+                                ):
+                                    with patch.object(
+                                        flow,
+                                        "_collect_browser_diag",
+                                        return_value={
+                                            "phase": "user_code",
+                                            "url": page.url,
+                                            "ready_state": "complete",
+                                            "title": "t",
+                                            "forms": [],
+                                            "buttons": [
+                                                {
+                                                    "text": "Continue",
+                                                    "disabled": False,
+                                                    "visible": True,
+                                                }
+                                            ],
+                                            "code_input": {
+                                                "name": "user_code",
+                                                "valueLen": 9,
+                                                "valuePreview": "AB…34",
+                                                "matchesExpected": True,
+                                                "disabled": False,
+                                                "readOnly": False,
+                                            },
+                                            "errors": [],
+                                            "body_snippet": "Enter device code",
+                                        },
+                                    ):
+                                        ok = flow._browser_submit_continue(
+                                            page,
+                                            "ABCD-1234",
+                                            log_callback=logs.append,
+                                        )
 
         self.assertFalse(ok)
         joined = "\n".join(logs)
         self.assertIn("still on user-code after Continue", joined)
-        self.assertIn("via=continue_click", joined)
         self.assertIn("phase_after", joined)
+
+    def test_continue_rate_limited_reenters_user_code(self):
+        """error=rate_limited → backoff → reopen → re-type code → consent."""
+        import grok_register.sso_build as sso_mod
+
+        flow = SSOBuildFlow("sso-token-value")
+        page = MagicMock()
+        page.url = "https://accounts.x.ai/oauth2/device?error=rate_limited"
+        logs: list[str] = []
+        clicks = {"n": 0}
+        reopens = {"n": 0}
+
+        def fake_click(page, user_code, log_callback=None):
+            clicks["n"] += 1
+            return {
+                "ok": True,
+                "via": "continue_click",
+                "codeValueLen": len(user_code),
+                "codeMatches": True,
+                "url": page.url,
+            }
+
+        def fake_wait(page, wanted, timeout=15.0, log_callback=None, label="",
+                      detect_rate_limit=True):
+            # First post-Continue wait is rate_limited; second reaches consent.
+            if label == "after Continue":
+                return "consent" if clicks["n"] >= 2 else "rate_limited"
+            return "user_code"
+
+        def fake_reopen(page, user_code, log_callback=None):
+            reopens["n"] += 1
+            page.url = f"https://accounts.x.ai/oauth2/device?user_code={user_code}"
+
+        rate_flags = iter([True, True, False, False, False, False])
+
+        def fake_rate(page):
+            try:
+                return next(rate_flags)
+            except StopIteration:
+                return False
+
+        sso_mod._device_start_next_ok_at = 0.0
+        with patch.object(flow, "_browser_click_continue_js", side_effect=fake_click):
+            with patch.object(flow, "_wait_browser_phase", side_effect=fake_wait):
+                with patch.object(
+                    flow, "_page_is_device_rate_limited", side_effect=fake_rate
+                ):
+                    with patch.object(flow, "_page_is_device_done", return_value=False):
+                        with patch.object(
+                            flow, "_browser_page_phase", return_value="user_code"
+                        ):
+                            with patch.object(
+                                flow,
+                                "_browser_reopen_user_code_page",
+                                side_effect=fake_reopen,
+                            ):
+                                with patch(
+                                    "grok_register.sso_build.time.sleep",
+                                    return_value=None,
+                                ):
+                                    with patch(
+                                        "grok_register.sso_build.random.uniform",
+                                        return_value=0.0,
+                                    ):
+                                        ok = flow._browser_submit_continue(
+                                            page,
+                                            "64E2-WFCV",
+                                            log_callback=logs.append,
+                                        )
+
+        self.assertTrue(ok)
+        self.assertGreaterEqual(clicks["n"], 2)
+        self.assertGreaterEqual(reopens["n"], 1)
+        joined = "\n".join(logs)
+        self.assertIn("rate_limited", joined)
+        self.assertIn("re-enter user_code", joined)
+        self.assertIn("left user-code page", joined)
 
 
 if __name__ == "__main__":
