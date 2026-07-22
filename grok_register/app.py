@@ -109,6 +109,10 @@ DEFAULT_CONFIG = {
     "cloudflare_path_accounts": "/api/new_address",
     "cloudflare_path_token": "/api/token",
     "cloudflare_path_messages": "/api/mails",
+    # When true, pass enableRandomSubdomain to cloudflare_temp_email so each
+    # address becomes name@<random>.base-domain (requires Worker
+    # RANDOM_SUBDOMAIN_DOMAINS + wildcard MX on the base domain).
+    "enable_random_subdomain": False,
     "proxy": "http://127.0.0.1:7890",
     "enable_nsfw": True,
     "register_count": 1,
@@ -412,6 +416,14 @@ def cloudflare_is_admin_create_path(path):
     return str(path or "").rstrip("/").lower() == "/admin/new_address"
 
 
+def cloudflare_enable_random_subdomain():
+    """是否在创建地址时请求随机三级域名（name@随机串.基础域）。"""
+    value = config.get("enable_random_subdomain", False)
+    if isinstance(value, str):
+        return value.strip().lower() in ("1", "true", "yes", "on")
+    return bool(value)
+
+
 def _pick_list_payload(data):
     if isinstance(data, list):
         return data
@@ -437,15 +449,21 @@ def cloudflare_create_temp_address(api_base):
     url = f"{api_base}{path}"
     domain = cloudflare_next_default_domain()
     is_admin_create = cloudflare_is_admin_create_path(path)
+    use_random_subdomain = cloudflare_enable_random_subdomain()
     if is_admin_create:
         payload = {"name": generate_username(10), "enablePrefix": True}
         if domain:
             payload["domain"] = domain
+        if use_random_subdomain:
+            # domain must stay the base domain from defaultDomains / RANDOM_SUBDOMAIN_DOMAINS
+            payload["enableRandomSubdomain"] = True
         headers = cloudflare_build_headers(content_type=True)
     else:
         payload = {}
         if domain:
             payload["domain"] = domain
+        if use_random_subdomain:
+            payload["enableRandomSubdomain"] = True
         headers = {"Content-Type": "application/json"}
     resp = http_post(url, json=payload, headers=headers)
     resp.raise_for_status()
@@ -2836,19 +2854,26 @@ EMAIL_SIGNUP_SELECTORS = [
     'a:has-text("邮箱")',
 ]
 
+# NOTE: page.run_js wraps statement bodies as `() => { <code> }`.
+# Prefer bare statements with `return` (not IIFE) so the value is not dropped.
+# Expression/IIFE form is also supported by browser_adapter._eval_js, but
+# statement style matches the rest of this codebase.
 _EMAIL_FORM_READY_JS = """
-(() => {
-  const sel = [
-    'input[data-testid="email"]',
-    'input[name="email"]',
-    'input[type="email"]',
-    'input[autocomplete="email"]',
-    'input[placeholder*="mail" i]',
-    'input[aria-label*="mail" i]',
-    'input[aria-label*="邮箱"]',
-    'input[placeholder*="邮箱"]',
-  ].join(', ');
-  const nodes = Array.from(document.querySelectorAll(sel));
+const sels = [
+  'input[data-testid="email"]',
+  'input[name="email"]',
+  'input[type="email"]',
+  'input[autocomplete="email"]',
+  'input[placeholder*="mail"]',
+  'input[placeholder*="Mail"]',
+  'input[aria-label*="mail"]',
+  'input[aria-label*="Mail"]',
+  'input[aria-label*="邮箱"]',
+  'input[placeholder*="邮箱"]',
+];
+for (const sel of sels) {
+  let nodes;
+  try { nodes = document.querySelectorAll(sel); } catch (e) { continue; }
   for (const el of nodes) {
     try {
       const st = window.getComputedStyle(el);
@@ -2857,161 +2882,158 @@ _EMAIL_FORM_READY_JS = """
       if (r.width > 2 && r.height > 2) return true;
     } catch (e) {}
   }
-  return false;
-})()
+}
+return false;
 """
 
 _SIGNUP_PAGE_PROBE_JS = """
-(() => {
-  const normalize = (s) => (s || '').replace(/\\s+/g, ' ').trim();
-  const lower = (s) => normalize(s).toLowerCase();
-  const body = lower(document.body && (document.body.innerText || document.body.textContent) || '');
-  const html = lower(document.documentElement ? document.documentElement.innerHTML.slice(0, 8000) : '');
-  const challenge = /just a moment|checking your browser|cf-browser-verification|challenge-platform|attention required|enable javascript and cookies/.test(body + ' ' + html)
-    || !!(document.querySelector('#challenge-running, #challenge-stage, #cf-challenge-running, .cf-browser-verification, iframe[src*="challenges.cloudflare.com"]'));
-  const loading = document.readyState !== 'complete'
-    || /loading|please wait|正在加载|请稍候/.test(body.slice(0, 200));
+const normalize = (s) => (s || '').replace(/\\s+/g, ' ').trim();
+const lower = (s) => normalize(s).toLowerCase();
+const body = lower(document.body && (document.body.innerText || document.body.textContent) || '');
+const html = lower(document.documentElement ? document.documentElement.innerHTML.slice(0, 8000) : '');
+const challenge = /just a moment|checking your browser|cf-browser-verification|challenge-platform|attention required|enable javascript and cookies/.test(body + ' ' + html)
+  || !!(document.querySelector('#challenge-running, #challenge-stage, #cf-challenge-running, .cf-browser-verification, iframe[src*="challenges.cloudflare.com"]'));
+const loading = document.readyState !== 'complete'
+  || /loading|please wait|正在加载|请稍候/.test(body.slice(0, 200));
 
-  const collect = (root, out, depth) => {
-    if (!root || depth > 6) return;
-    let nodes;
-    try {
-      nodes = root.querySelectorAll('button, a, [role="button"], input[type="button"], input[type="submit"]');
-    } catch (e) {
-      return;
-    }
-    for (const el of nodes) {
-      let text = '';
-      try {
-        text = normalize(el.innerText || el.textContent || el.value || el.getAttribute('aria-label') || '');
-      } catch (e) {
-        text = '';
-      }
-      if (!text) continue;
-      let visible = false;
-      try {
-        const st = window.getComputedStyle(el);
-        const r = el.getBoundingClientRect();
-        visible = st.display !== 'none' && st.visibility !== 'hidden'
-          && Number(st.opacity || '1') > 0.05 && r.width > 2 && r.height > 2;
-      } catch (e) {
-        visible = true;
-      }
-      out.push({ text: text.slice(0, 80), visible });
-    }
-    let all;
-    try { all = root.querySelectorAll('*'); } catch (e) { return; }
-    for (const el of all) {
-      try {
-        if (el.shadowRoot) collect(el.shadowRoot, out, depth + 1);
-      } catch (e) {}
-    }
-  };
-  const buttons = [];
-  collect(document, buttons, 0);
-  const visibleButtons = buttons.filter((b) => b.visible).map((b) => b.text).slice(0, 16);
-  const emailPatterns = [
-    /使用邮箱注册/,
-    /用邮箱注册/,
-    /邮箱注册/,
-    /sign\\s*up\\s*with\\s*e-?mail/i,
-    /continue\\s*with\\s*e-?mail/i,
-    /use\\s*e-?mail/i,
-    /^e-?mail$/i,
-    /^邮箱$/,
-  ];
-  const hasEmailEntry = buttons.some((b) => emailPatterns.some((p) => p.test(b.text)));
-  return {
-    readyState: document.readyState || '',
-    challenge: !!challenge,
-    loading: !!loading,
-    buttonCount: buttons.length,
-    visibleButtons,
-    hasEmailEntry: !!hasEmailEntry,
-    bodySnippet: normalize(document.body && (document.body.innerText || document.body.textContent) || '').slice(0, 220),
-  };
-})()
-"""
-
-_CLICK_EMAIL_SIGNUP_JS = """
-(() => {
-  const normalize = (s) => (s || '').replace(/\\s+/g, ' ').trim();
-  const patterns = [
-    /使用邮箱注册/i,
-    /用邮箱注册/i,
-    /邮箱注册/i,
-    /sign\\s*up\\s*with\\s*e-?mail/i,
-    /continue\\s*with\\s*e-?mail/i,
-    /use\\s*e-?mail/i,
-    /^e-?mail$/i,
-    /^邮箱$/,
-  ];
-  // Prefer explicit email CTAs; avoid matching "email" inside long privacy text.
-  const isEmailCta = (text) => {
-    const t = normalize(text);
-    if (!t || t.length > 64) return false;
-    return patterns.some((p) => p.test(t));
-  };
-  const isVisible = (el) => {
-    try {
-      const st = window.getComputedStyle(el);
-      if (st.display === 'none' || st.visibility === 'hidden' || Number(st.opacity || '1') < 0.05) return false;
-      const r = el.getBoundingClientRect();
-      return r.width > 2 && r.height > 2;
-    } catch (e) {
-      return true;
-    }
-  };
-  const collect = (root, out, depth) => {
-    if (!root || depth > 6) return;
-    let nodes;
-    try {
-      nodes = root.querySelectorAll('button, a, [role="button"], input[type="button"], input[type="submit"]');
-    } catch (e) {
-      return;
-    }
-    for (const el of nodes) out.push(el);
-    let all;
-    try { all = root.querySelectorAll('*'); } catch (e) { return; }
-    for (const el of all) {
-      try {
-        if (el.shadowRoot) collect(el.shadowRoot, out, depth + 1);
-      } catch (e) {}
-    }
-  };
-  const candidates = [];
-  collect(document, candidates, 0);
-  for (const el of candidates) {
+const collect = (root, out, depth) => {
+  if (!root || depth > 6) return;
+  let nodes;
+  try {
+    nodes = root.querySelectorAll('button, a, [role="button"], input[type="button"], input[type="submit"]');
+  } catch (e) {
+    return;
+  }
+  for (const el of nodes) {
     let text = '';
     try {
       text = normalize(el.innerText || el.textContent || el.value || el.getAttribute('aria-label') || '');
     } catch (e) {
       text = '';
     }
-    if (!isEmailCta(text) || !isVisible(el)) continue;
+    if (!text) continue;
+    let visible = false;
     try {
-      el.scrollIntoView({ block: 'center', inline: 'center', behavior: 'auto' });
-    } catch (e) {}
-    try {
-      el.click();
-      return { ok: true, via: 'js_deep_click', text: text.slice(0, 60) };
+      const st = window.getComputedStyle(el);
+      const r = el.getBoundingClientRect();
+      visible = st.display !== 'none' && st.visibility !== 'hidden'
+        && Number(st.opacity || '1') > 0.05 && r.width > 2 && r.height > 2;
     } catch (e) {
-      return { ok: false, reason: 'click_threw', text: text.slice(0, 60), error: String(e && e.message || e) };
+      visible = true;
     }
+    out.push({ text: text.slice(0, 80), visible });
   }
-  return {
-    ok: false,
-    reason: 'no_email_cta',
-    buttonCount: candidates.length,
-    samples: candidates.slice(0, 12).map((el) => {
-      try {
-        return normalize(el.innerText || el.textContent || el.value || '').slice(0, 40);
-      } catch (e) {
-        return '';
-      }
-    }).filter(Boolean),
-  };
-})()
+  let all;
+  try { all = root.querySelectorAll('*'); } catch (e) { return; }
+  for (const el of all) {
+    try {
+      if (el.shadowRoot) collect(el.shadowRoot, out, depth + 1);
+    } catch (e) {}
+  }
+};
+const buttons = [];
+collect(document, buttons, 0);
+const visibleButtons = buttons.filter((b) => b.visible).map((b) => b.text).slice(0, 16);
+const emailPatterns = [
+  /使用邮箱注册/,
+  /用邮箱注册/,
+  /邮箱注册/,
+  /sign\\s*up\\s*with\\s*e-?mail/i,
+  /continue\\s*with\\s*e-?mail/i,
+  /use\\s*e-?mail/i,
+  /^e-?mail$/i,
+  /^邮箱$/,
+];
+const hasEmailEntry = buttons.some((b) => emailPatterns.some((p) => p.test(b.text)));
+return {
+  readyState: document.readyState || '',
+  challenge: !!challenge,
+  loading: !!loading,
+  buttonCount: buttons.length,
+  visibleButtons,
+  hasEmailEntry: !!hasEmailEntry,
+  bodySnippet: normalize(document.body && (document.body.innerText || document.body.textContent) || '').slice(0, 220),
+  title: document.title || '',
+};
+"""
+
+_CLICK_EMAIL_SIGNUP_JS = """
+const normalize = (s) => (s || '').replace(/\\s+/g, ' ').trim();
+const patterns = [
+  /使用邮箱注册/i,
+  /用邮箱注册/i,
+  /邮箱注册/i,
+  /sign\\s*up\\s*with\\s*e-?mail/i,
+  /continue\\s*with\\s*e-?mail/i,
+  /use\\s*e-?mail/i,
+  /^e-?mail$/i,
+  /^邮箱$/,
+];
+// Prefer explicit email CTAs; avoid matching "email" inside long privacy text.
+const isEmailCta = (text) => {
+  const t = normalize(text);
+  if (!t || t.length > 64) return false;
+  return patterns.some((p) => p.test(t));
+};
+const isVisible = (el) => {
+  try {
+    const st = window.getComputedStyle(el);
+    if (st.display === 'none' || st.visibility === 'hidden' || Number(st.opacity || '1') < 0.05) return false;
+    const r = el.getBoundingClientRect();
+    return r.width > 2 && r.height > 2;
+  } catch (e) {
+    return true;
+  }
+};
+const collect = (root, out, depth) => {
+  if (!root || depth > 6) return;
+  let nodes;
+  try {
+    nodes = root.querySelectorAll('button, a, [role="button"], input[type="button"], input[type="submit"]');
+  } catch (e) {
+    return;
+  }
+  for (const el of nodes) out.push(el);
+  let all;
+  try { all = root.querySelectorAll('*'); } catch (e) { return; }
+  for (const el of all) {
+    try {
+      if (el.shadowRoot) collect(el.shadowRoot, out, depth + 1);
+    } catch (e) {}
+  }
+};
+const candidates = [];
+collect(document, candidates, 0);
+for (const el of candidates) {
+  let text = '';
+  try {
+    text = normalize(el.innerText || el.textContent || el.value || el.getAttribute('aria-label') || '');
+  } catch (e) {
+    text = '';
+  }
+  if (!isEmailCta(text) || !isVisible(el)) continue;
+  try {
+    el.scrollIntoView({ block: 'center', inline: 'center', behavior: 'auto' });
+  } catch (e) {}
+  try {
+    el.click();
+    return { ok: true, via: 'js_deep_click', text: text.slice(0, 60) };
+  } catch (e) {
+    return { ok: false, reason: 'click_threw', text: text.slice(0, 60), error: String(e && e.message || e) };
+  }
+}
+return {
+  ok: false,
+  reason: 'no_email_cta',
+  buttonCount: candidates.length,
+  samples: candidates.slice(0, 12).map((el) => {
+    try {
+      return normalize(el.innerText || el.textContent || el.value || '').slice(0, 40);
+    } catch (e) {
+      return '';
+    }
+  }).filter(Boolean),
+};
 """
 
 
@@ -3019,6 +3041,26 @@ def _signup_email_form_ready(page) -> bool:
     """True when the email input of the signup form is already visible."""
     if page is None:
         return False
+    # Prefer Playwright-native probes (works even if run_js wrapping changes).
+    try:
+        pw = getattr(page, "_p", None)
+        if pw is not None:
+            for sel in (
+                'input[data-testid="email"]',
+                'input[name="email"]',
+                'input[type="email"]',
+                'input[autocomplete="email"]',
+            ):
+                try:
+                    loc = pw.locator(sel)
+                    n = loc.count()
+                    for i in range(min(n, 4)):
+                        if loc.nth(i).is_visible(timeout=200):
+                            return True
+                except Exception:
+                    continue
+    except Exception:
+        pass
     try:
         return bool(page.run_js(_EMAIL_FORM_READY_JS))
     except Exception:
@@ -3028,11 +3070,67 @@ def _signup_email_form_ready(page) -> bool:
 def _probe_signup_page(page) -> dict:
     if page is None:
         return {}
+    probe: dict = {}
     try:
         raw = page.run_js(_SIGNUP_PAGE_PROBE_JS)
-        return raw if isinstance(raw, dict) else {}
+        if isinstance(raw, dict):
+            probe = raw
+        elif raw is None:
+            probe = {"probe_error": "run_js returned None"}
+        else:
+            probe = {"probe_error": f"unexpected type={type(raw).__name__}"}
     except Exception as exc:
-        return {"probe_error": str(exc)}
+        probe = {"probe_error": str(exc)}
+
+    # Playwright fallback when JS probe is empty / broken (e.g. old IIFE issue).
+    if not probe.get("buttonCount") and not probe.get("visibleButtons"):
+        try:
+            pw = getattr(page, "_p", None)
+            if pw is not None:
+                texts = []
+                for role in ("button", "link"):
+                    try:
+                        loc = pw.get_by_role(role)
+                        count = min(loc.count(), 12)
+                        for i in range(count):
+                            try:
+                                t = (loc.nth(i).inner_text(timeout=400) or "").strip()
+                                if t:
+                                    texts.append(t[:80])
+                            except Exception:
+                                continue
+                    except Exception:
+                        continue
+                if texts:
+                    probe.setdefault("visibleButtons", texts[:16])
+                    probe.setdefault("buttonCount", len(texts))
+                    joined = " ".join(texts).lower()
+                    probe.setdefault(
+                        "hasEmailEntry",
+                        any(
+                            k in joined
+                            for k in (
+                                "email",
+                                "邮箱",
+                                "sign up with email",
+                                "continue with email",
+                                "use email",
+                            )
+                        ),
+                    )
+                try:
+                    probe.setdefault("readyState", pw.evaluate("() => document.readyState"))
+                    probe.setdefault(
+                        "bodySnippet",
+                        (pw.evaluate(
+                            "() => (document.body && (document.body.innerText || '')) || ''"
+                        ) or "")[:220],
+                    )
+                except Exception:
+                    pass
+        except Exception as exc:
+            probe.setdefault("probe_error", str(exc))
+    return probe
 
 
 def _js_click_email_signup(page) -> dict | None:
@@ -3059,7 +3157,7 @@ def click_email_signup_button(timeout=28, log_callback=None, cancel_callback=Non
     deadline = time.time() + max(float(timeout or 28), 8.0)
     started = time.time()
     last_status_log = 0.0
-    reloaded = False
+    reloaded = 0  # count of mid-timeout reloads
     attempt = 0
 
     if _signup_email_form_ready(page):
@@ -3084,6 +3182,8 @@ def click_email_signup_button(timeout=28, log_callback=None, cancel_callback=Non
 
         probe = _probe_signup_page(page)
         now = time.time()
+        btn_count = int(probe.get("buttonCount") or 0)
+        empty_shell = btn_count <= 0 and not probe.get("hasEmailEntry")
         if log_callback and (attempt == 1 or now - last_status_log >= 4.0):
             last_status_log = now
             url = ""
@@ -3095,6 +3195,7 @@ def click_email_signup_button(timeout=28, log_callback=None, cancel_callback=Non
             btn_preview = ""
             if isinstance(btns, list) and btns:
                 btn_preview = ", ".join(str(b)[:28] for b in btns[:6])
+            err = probe.get("probe_error")
             log_callback(
                 f"[Debug] 查找邮箱注册入口 attempt={attempt} "
                 f"url={str(url)[:100]} "
@@ -3103,21 +3204,27 @@ def click_email_signup_button(timeout=28, log_callback=None, cancel_callback=Non
                 f"buttons={probe.get('buttonCount')} "
                 f"has_email_cta={probe.get('hasEmailEntry')} "
                 f"visible=[{btn_preview}]"
+                + (f" probe_error={err!r}" if err else "")
             )
 
         # Cloudflare interstitial / empty SPA shell — wait a bit longer.
         if probe.get("challenge") or (
-            int(probe.get("buttonCount") or 0) == 0 and probe.get("loading")
-        ):
-            sleep_with_cancel(1.2, cancel_callback)
-            # Mid-window: one hard reload to recover stuck shells.
+            empty_shell and (probe.get("loading") or not probe.get("readyState"))
+        ) or (empty_shell and (now - started) < 6.0):
+            sleep_with_cancel(1.0, cancel_callback)
+            # Mid-window: hard reload to recover stuck shells (up to 2 times).
+            reload_budget = 2
             if (
-                not reloaded
-                and (now - started) >= max(float(timeout) * 0.45, 8.0)
+                reloaded < reload_budget
+                and empty_shell
+                and (now - started) >= max(float(timeout) * 0.35, 6.0)
             ):
-                reloaded = True
+                reloaded += 1
                 if log_callback:
-                    log_callback("[*] 注册页长时间无交互控件，刷新页面重试")
+                    log_callback(
+                        f"[*] 注册页长时间无交互控件，刷新页面重试 "
+                        f"({reloaded}/{reload_budget})"
+                    )
                 try:
                     page.get(SIGNUP_URL)
                     page.wait.doc_loaded()
@@ -3186,15 +3293,15 @@ def click_email_signup_button(timeout=28, log_callback=None, cancel_callback=Non
 
         # One proactive reload if UI rendered but still no email CTA.
         if (
-            not reloaded
+            reloaded < 2
             and (now - started) >= max(float(timeout) * 0.55, 10.0)
             and not probe.get("hasEmailEntry")
         ):
-            reloaded = True
+            reloaded += 1
             if log_callback:
                 log_callback(
                     "[*] 未出现邮箱注册入口，刷新注册页后重试 "
-                    f"(visible={probe.get('visibleButtons')!r})"
+                    f"(visible={probe.get('visibleButtons')!r}, reload={reloaded})"
                 )
             try:
                 page.get(SIGNUP_URL)

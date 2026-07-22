@@ -1959,7 +1959,35 @@ def _dp_sel_to_css(selector: str) -> str:
 
 
 def _eval_js(target: Any, js_code: str, *args) -> Any:
+    """Evaluate JS in page/element context.
+
+    Two call styles are supported for the no-args path:
+
+      1. Statement body (historical): ``return document.title``
+         → wrapped as ``() => { return document.title }``
+      2. Expression / IIFE: ``(() => { return {a:1} })()``
+         → evaluated as-is so the IIFE result is not discarded
+
+    Without (2), IIFE snippets silently returned ``None`` because the outer
+    arrow function never returned the IIFE value — which broke signup probes
+    that used ``(() => { ... return {...}; })()``.
+    """
     if not args:
+        code = (js_code or "").strip()
+        if not code:
+            return None
+        # Expression forms: IIFE, async IIFE, bare object/array/literal expr.
+        # Detect by leading "(" / "[" / "async" or a single trailing ")()" call.
+        head = code[:24].lstrip()
+        is_expr = (
+            head.startswith("(()")
+            or head.startswith("(function")
+            or head.startswith("async ")
+            or head.startswith("async(")
+            or (code.endswith(")()") and code.startswith("("))
+        )
+        if is_expr:
+            return target.evaluate(code)
         return target.evaluate(f"() => {{ {js_code} }}")
     arg_list = json.dumps(list(args))
     return target.evaluate(

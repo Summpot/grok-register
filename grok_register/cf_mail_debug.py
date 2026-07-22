@@ -73,6 +73,7 @@ def create_address(
     create_path: str = "/api/new_address",
     domain: str = "",
     name: str = "",
+    enable_random_subdomain: bool = False,
 ) -> Tuple[str, str]:
     """创建 Cloudflare 临时邮箱地址，支持匿名 API 和 admin API。"""
     path = normalize_path(create_path, "/api/new_address")
@@ -84,11 +85,15 @@ def create_address(
         }
         if domain.strip():
             payload["domain"] = domain.strip()
+        if enable_random_subdomain:
+            payload["enableRandomSubdomain"] = True
         headers = build_auth_headers(auth_mode, api_key, content_type=True)
     else:
-        payload = {}
+        payload: Dict[str, Any] = {}
         if domain.strip():
             payload["domain"] = domain.strip()
+        if enable_random_subdomain:
+            payload["enableRandomSubdomain"] = True
         headers = {"Content-Type": "application/json"}
     resp = requests.post(
         f"{api_base.rstrip('/')}{path}",
@@ -189,6 +194,11 @@ def main():
     ap.add_argument("--create-path", default="/api/new_address")
     ap.add_argument("--domain", default="")
     ap.add_argument("--name", default="")
+    ap.add_argument(
+        "--random-subdomain",
+        action="store_true",
+        help="Pass enableRandomSubdomain=true (name@<random>.base-domain)",
+    )
     ap.add_argument("--timeout", type=int, default=180)
     ap.add_argument("--interval", type=int, default=3)
     args = ap.parse_args()
@@ -203,6 +213,7 @@ def main():
             create_path=args.create_path,
             domain=args.domain,
             name=args.name,
+            enable_random_subdomain=bool(args.random_subdomain),
         )
         print(f"[NEW] address={address}")
         print(f"[NEW] credential(jwt)={credential}")

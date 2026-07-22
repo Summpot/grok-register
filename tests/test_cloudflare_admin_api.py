@@ -51,6 +51,7 @@ class CloudflareAdminCreateTests(unittest.TestCase):
             "cloudflare_auth_mode": "x-admin-auth",
             "cloudflare_path_accounts": "/admin/new_address",
             "defaultDomains": "vitassk.com",
+            "enable_random_subdomain": False,
         })
         captured = {}
 
@@ -74,12 +75,72 @@ class CloudflareAdminCreateTests(unittest.TestCase):
         self.assertEqual(captured["headers"]["Content-Type"], "application/json")
         self.assertEqual(captured["headers"]["x-admin-auth"], "admin-secret")
 
+    def test_app_passes_enable_random_subdomain_on_admin_create(self):
+        app.config.update({
+            "cloudflare_api_key": "admin-secret",
+            "cloudflare_auth_mode": "x-admin-auth",
+            "cloudflare_path_accounts": "/admin/new_address",
+            "defaultDomains": "vitassk.com",
+            "enable_random_subdomain": True,
+        })
+        captured = {}
+
+        def fake_post(url, **kwargs):
+            captured["url"] = url
+            captured.update(kwargs)
+            return DummyResponse({
+                "address": "adminuser@x7k2p9q1.vitassk.com",
+                "jwt": "sub-jwt",
+            })
+
+        with patch.object(app, "generate_username", return_value="adminuser"), \
+                patch.object(app, "http_post", side_effect=fake_post):
+            address, jwt = app.cloudflare_create_temp_address("https://temp-mail.ikun.day")
+
+        self.assertEqual(address, "adminuser@x7k2p9q1.vitassk.com")
+        self.assertEqual(jwt, "sub-jwt")
+        self.assertEqual(captured["json"], {
+            "name": "adminuser",
+            "domain": "vitassk.com",
+            "enablePrefix": True,
+            "enableRandomSubdomain": True,
+        })
+
+    def test_app_passes_enable_random_subdomain_on_anonymous_create(self):
+        app.config.update({
+            "cloudflare_api_key": "",
+            "cloudflare_auth_mode": "none",
+            "cloudflare_path_accounts": "/api/new_address",
+            "defaultDomains": "vitassk.com",
+            "enable_random_subdomain": True,
+        })
+        captured = {}
+
+        def fake_post(url, **kwargs):
+            captured["url"] = url
+            captured.update(kwargs)
+            return DummyResponse({
+                "address": "anon@abcd1234.vitassk.com",
+                "jwt": "anon-sub-jwt",
+            })
+
+        with patch.object(app, "http_post", side_effect=fake_post):
+            address, jwt = app.cloudflare_create_temp_address("https://temp-mail.ikun.day")
+
+        self.assertEqual(address, "anon@abcd1234.vitassk.com")
+        self.assertEqual(jwt, "anon-sub-jwt")
+        self.assertEqual(captured["json"], {
+            "domain": "vitassk.com",
+            "enableRandomSubdomain": True,
+        })
+
     def test_app_keeps_anonymous_new_address_with_none_auth(self):
         app.config.update({
             "cloudflare_api_key": "",
             "cloudflare_auth_mode": "none",
             "cloudflare_path_accounts": "/api/new_address",
             "defaultDomains": "vitassk.com",
+            "enable_random_subdomain": False,
         })
         captured = {}
 
@@ -125,6 +186,37 @@ class CloudflareAdminCreateTests(unittest.TestCase):
         })
         self.assertEqual(captured["headers"]["Content-Type"], "application/json")
         self.assertEqual(captured["headers"]["x-admin-auth"], "admin-secret")
+
+    def test_debug_tool_passes_enable_random_subdomain(self):
+        captured = {}
+
+        def fake_post(url, **kwargs):
+            captured["url"] = url
+            captured.update(kwargs)
+            return DummyResponse({
+                "address": "debuguser@zz99aa11.vitassk.com",
+                "jwt": "debug-sub-jwt",
+            })
+
+        with patch.object(cf_mail_debug.requests, "post", side_effect=fake_post):
+            address, jwt = cf_mail_debug.create_address(
+                "https://temp-mail.ikun.day",
+                auth_mode="x-admin-auth",
+                api_key="admin-secret",
+                create_path="/admin/new_address",
+                domain="vitassk.com",
+                name="debuguser",
+                enable_random_subdomain=True,
+            )
+
+        self.assertEqual(address, "debuguser@zz99aa11.vitassk.com")
+        self.assertEqual(jwt, "debug-sub-jwt")
+        self.assertEqual(captured["json"], {
+            "name": "debuguser",
+            "domain": "vitassk.com",
+            "enablePrefix": True,
+            "enableRandomSubdomain": True,
+        })
 
 
 if __name__ == "__main__":

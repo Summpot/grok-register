@@ -144,7 +144,8 @@ copy config.example.json config.json
   "cloudflare_path_accounts": "/api/new_address",
   "cloudflare_path_token": "/api/token",
   "cloudflare_path_messages": "/api/mails",
-  "defaultDomains": "你的收信域名.com"
+  "defaultDomains": "你的收信域名.com",
+  "enable_random_subdomain": true
 }
 ```
 
@@ -158,15 +159,23 @@ copy config.example.json config.json
   "cloudflare_auth_mode": "x-admin-auth",
   "cloudflare_path_accounts": "/admin/new_address",
   "cloudflare_path_messages": "/api/mails",
-  "defaultDomains": "你的收信域名.com"
+  "defaultDomains": "你的收信域名.com",
+  "enable_random_subdomain": true
 }
 ```
 
 说明：
 
 - `cloudflare_api_base`：邮箱 Worker / API 根地址
-- `defaultDomains`：实际收信域名，必须和邮箱服务一致
+- `defaultDomains`：基础收信域名（逗号分隔），必须与 Worker `DOMAINS` / `RANDOM_SUBDOMAIN_DOMAINS` 一致
+- `enable_random_subdomain`：`true` 时每个账号创建 `name@随机串.基础域`（cloudflare_temp_email 的 `enableRandomSubdomain`）
 - Admin 密码只用于创建邮箱；读信仍用接口返回的 JWT
+
+随机三级域名前置条件（在 temp-mail / Cloudflare 侧完成，非本仓库配置）：
+
+1. Worker 变量 `RANDOM_SUBDOMAIN_DOMAINS` 包含 `defaultDomains` 中的基础域
+2. 基础域 DNS 已配置通配 MX（`*` 复制 apex 的 Email Routing MX）
+3. Catch-all 已绑定到该 Worker
 
 先测邮箱是否通：
 
@@ -176,7 +185,8 @@ uv run python cf_mail_debug.py `
   --auth-mode x-admin-auth `
   --api-key "你的 ADMIN_PASSWORD" `
   --create-path /admin/new_address `
-  --domain "你的收信域名.com"
+  --domain "你的收信域名.com" `
+  --random-subdomain
 ```
 
 ### 2. 注册数量 / 并发（强烈建议）
@@ -271,6 +281,7 @@ uv run python cf_mail_debug.py `
 
 | 字段 | 默认建议 | 说明 |
 | --- | --- | --- |
+| `enable_random_subdomain` | `true`（示例） | 每个账号 `name@随机串.基础域`；需 Worker `RANDOM_SUBDOMAIN_DOMAINS` + 通配 MX |
 | `enable_nsfw` | `false` | 注册后尝试开 NSFW；常被 Cloudflare 403，不影响出号 |
 | `user_agent` | 保持示例 | 浏览器 UA |
 | `yyds_*` / `duckmail_api_key` | 按需 | 换邮箱供应商时使用 |
@@ -285,6 +296,7 @@ uv run python cf_mail_debug.py `
   "cloudflare_auth_mode": "x-admin-auth",
   "cloudflare_path_accounts": "/admin/new_address",
   "defaultDomains": "example.com",
+  "enable_random_subdomain": true,
   "register_count": 10,
   "code_poll_timeout": 90,
   "grok2api_auto_add_local": false,

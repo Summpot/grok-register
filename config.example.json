@@ -34,6 +34,7 @@
     "local_build_auth_dir": "./output/build_auths",
     "allow_bot_flagged": false,
     "defaultDomains": "example.com",
+    "enable_random_subdomain": true,
     "email_provider": "cloudflare",
     "yyds_api_key": "",
     "yyds_jwt": "",
