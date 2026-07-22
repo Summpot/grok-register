@@ -33,6 +33,8 @@
     "local_build_device_flow": false,
     "local_build_auth_dir": "./output/build_auths",
     "allow_bot_flagged": false,
+    "reg_stats_enabled": true,
+    "reg_stats_file": "output/reg_stats.jsonl",
     "defaultDomains": "example.com",
     "enable_random_subdomain": true,
     "email_provider": "cloudflare",

@@ -249,6 +249,21 @@ uv run python cf_mail_debug.py `
 - **legacy**：`grok2api_remote_base` 可填站点根或 `/admin/api`；优先 `/tokens/add`。
 - 打开远端：设 `grok2api_auto_add_remote: true`，并填 `remote_base` +（v3 密码 **或** legacy `app_key`）。
 - **bot 标记**：Device Flow 后若 Build `access_token` 含 `bot_flag_source=1`，默认视为失败且不上传；设 `allow_bot_flagged: true` 可仍保存/导入（部分场景账号仍可用）。
+- **注册参数采集**（分析 bot_flag / 失败原因）：默认开启，每次尝试写入 `output/reg_stats.jsonl`（含 Turnstile 鼠标路径随机数、点击次数、代理 host、邮箱域名、JWT 安全 claims 子集等，**不含**密码/完整 token）。
+
+```json
+{
+  "reg_stats_enabled": true,
+  "reg_stats_file": "output/reg_stats.jsonl"
+}
+```
+
+分析汇总：
+
+```bash
+python -m grok_register.reg_stats
+python -m grok_register.reg_stats --file output/reg_stats.jsonl --json
+```
 
 ### 4. 代理（按网络情况）
 

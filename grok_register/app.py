@@ -140,6 +140,10 @@ DEFAULT_CONFIG = {
     # When true, Build access_token with bot_flag_source=1 is still saved/uploaded
     # and counted as success. Default false: reject as registration failure.
     "allow_bot_flagged": False,
+    # Per-attempt telemetry (Turnstile randoms, proxy, domain, bot_flag outcome).
+    # JSONL → output/reg_stats.jsonl; analyze: python -m grok_register.reg_stats
+    "reg_stats_enabled": True,
+    "reg_stats_file": "output/reg_stats.jsonl",
     "yyds_preferred_domains": "",
     "yyds_blocked_domains": "",
     "yyds_domain_selection": "random",
@@ -788,6 +792,16 @@ def convert_sso_to_build_local(
     # Bot-flagged Build tokens: reject by default; allow when allow_bot_flagged=true.
     if access_token_has_bot_flag(seed.get("access_token")):
         seed["_bot_flagged"] = True
+        try:
+            from grok_register.reg_stats import safe_jwt_claims, update_attempt
+
+            update_attempt(
+                access_token=seed.get("access_token"),
+                bot_flagged=True,
+                jwt_claims=safe_jwt_claims(seed.get("access_token")),
+            )
+        except Exception:
+            pass
         if not config.get("allow_bot_flagged", False):
             if log_callback:
                 log_callback(
@@ -801,6 +815,13 @@ def convert_sso_to_build_local(
                 "[!] access_token 含 bot_flag_source=1，但 allow_bot_flagged=true，"
                 "继续保存/导入"
             )
+    else:
+        try:
+            from grok_register.reg_stats import update_attempt
+
+            update_attempt(access_token=seed.get("access_token"), bot_flagged=False)
+        except Exception:
+            pass
 
     auth_dir = str(config.get("local_build_auth_dir", "") or "").strip()
     if not auth_dir:
@@ -3903,6 +3924,18 @@ def fill_profile_and_submit(timeout=120, log_callback=None, cancel_callback=None
             form_filled_once = True
             if log_callback:
                 log_callback(f"[*] 资料已填写: {given_name} {family_name}")
+            try:
+                from grok_register.reg_stats import update_attempt
+
+                update_attempt(
+                    profile={
+                        "given_name": given_name,
+                        "family_name": family_name,
+                        "password": password,
+                    }
+                )
+            except Exception:
+                pass
             # Read form before engaging Turnstile — looks less scripted
             _human_pause_cancel(0.7, 1.6, cancel_callback)
 
@@ -4135,6 +4168,41 @@ def run_registration_cli(count):
             if controller.should_stop():
                 break
             cli_log(f"--- 开始第 {i + 1}/{count} 个账号 ---")
+            attempt_finished = False
+            finish_attempt = None
+            update_attempt = None
+            abandon_attempt = None
+            try:
+                from grok_register.reg_stats import (
+                    abandon_attempt as _abandon_attempt,
+                    begin_attempt as _begin_attempt,
+                    finish_attempt as _finish_attempt,
+                    update_attempt as _update_attempt,
+                )
+                from grok_register.proxyutil import get_runtime_proxy, resolve_proxy
+
+                finish_attempt = _finish_attempt
+                update_attempt = _update_attempt
+                abandon_attempt = _abandon_attempt
+                _begin_attempt(
+                    worker_id="cli",
+                    idx=i + 1,
+                    user_agent=str(config.get("user_agent", "") or ""),
+                    proxy=get_runtime_proxy() or resolve_proxy() or config.get("proxy"),
+                )
+            except Exception:
+                pass
+
+            def _finish(outcome: str, **kwargs) -> None:
+                nonlocal attempt_finished
+                if attempt_finished or not finish_attempt:
+                    return
+                try:
+                    finish_attempt(outcome, **kwargs)
+                    attempt_finished = True
+                except Exception:
+                    pass
+
             try:
                 email = ""
                 dev_token = ""
@@ -4159,6 +4227,11 @@ def run_registration_cli(count):
                             continue
                         raise
                     cli_log(f"[*] 邮箱: {email}")
+                    if update_attempt:
+                        try:
+                            update_attempt(email=email)
+                        except Exception:
+                            pass
                     cli_log(f"[Debug] 邮箱credential(jwt): {dev_token}")
                     try:
                         ensure_output_dir()
@@ -4216,6 +4289,12 @@ def run_registration_cli(count):
                     fail_count += 1
                     retry_count_for_slot = 0
                     i += 1
+                    _finish(
+                        "bot_flag",
+                        reason="bot_flag_source=1",
+                        bot_flagged=True,
+                        access_token=(pool.get("build_seed") or {}).get("access_token"),
+                    )
                     cli_log(
                         f"[-] 注册失败: bot_flag_source=1 ({email})，未导入 Web/Build"
                         "（可设 allow_bot_flagged=true 强制继续）"
@@ -4231,6 +4310,12 @@ def run_registration_cli(count):
                     success_count += 1
                     retry_count_for_slot = 0
                     i += 1
+                    _finish(
+                        "success",
+                        reason="bot_flag_allowed" if pool.get("bot_flagged") else "",
+                        bot_flagged=bool(pool.get("bot_flagged")),
+                        access_token=(pool.get("build_seed") or {}).get("access_token"),
+                    )
                     if pool.get("bot_flagged"):
                         cli_log(f"[+] 注册成功(bot标记已允许): {email}")
                     else:
@@ -4247,6 +4332,7 @@ def run_registration_cli(count):
                         )
             except RegistrationCancelled:
                 cli_log("[!] 注册被停止")
+                _finish("cancelled", reason="user_stop")
                 break
             except AccountRetryNeeded as exc:
                 retry_count_for_slot += 1
@@ -4254,24 +4340,44 @@ def run_registration_cli(count):
                     cli_log(
                         f"[!] 当前账号流程卡住，重试第 {retry_count_for_slot}/{max_slot_retry} 次: {exc}"
                     )
+                    _finish(
+                        "retry",
+                        reason=str(exc)[:200],
+                        error=str(exc)[:400],
+                    )
                 else:
                     fail_count += 1
                     retry_count_for_slot = 0
                     i += 1
                     cli_log(f"[-] 当前账号已达到最大重试次数，跳过: {exc}")
+                    _finish(
+                        "error",
+                        reason="max_retry",
+                        error=str(exc)[:400],
+                    )
             except Exception as exc:
                 fail_count += 1
                 retry_count_for_slot = 0
                 i += 1
                 cli_log(f"[-] 注册失败: {exc}")
+                _finish(
+                    "error",
+                    reason=str(exc)[:200],
+                    error=str(exc)[:400],
+                )
             finally:
-                if controller.should_stop() or i >= count:
-                    break
-                if browser is None:
-                    start_browser(log_callback=cli_log)
-                else:
-                    restart_browser(log_callback=cli_log)
-                sleep_with_cancel(1, controller.should_stop)
+                if not attempt_finished and abandon_attempt:
+                    try:
+                        abandon_attempt()
+                    except Exception:
+                        pass
+            if controller.should_stop() or i >= count:
+                break
+            if browser is None:
+                start_browser(log_callback=cli_log)
+            else:
+                restart_browser(log_callback=cli_log)
+            sleep_with_cancel(1, controller.should_stop)
     except KeyboardInterrupt:
         controller.stop()
         cli_log("[!] 收到 Ctrl+C，正在停止并清理")

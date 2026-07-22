@@ -189,7 +189,11 @@ _TURNSTILE_BBOX_JS = """
 
 
 def _checkbox_point_from_box(box: dict[str, Any]) -> tuple[float, float]:
-    """Map widget bbox → typical Turnstile checkbox center (left side of widget)."""
+    """Map widget bbox → typical Turnstile checkbox center (left side of widget).
+
+    Returns (cx, cy). Also stashes the last sample on the box dict under
+    ``_click_sample`` for telemetry (gauss base + sigmas).
+    """
     x = float(box.get("x") or 0)
     y = float(box.get("y") or 0)
     w = float(box.get("width") or 0)
@@ -197,10 +201,29 @@ def _checkbox_point_from_box(box: dict[str, Any]) -> tuple[float, float]:
     # Checkbox is a ~28px circle near the left edge, vertically centered.
     # Sample near the center of that circle (not a fixed pixel) for less
     # "always same coordinate" fingerprinting.
+    sigma_x, sigma_y = 2.4, 2.0
     base_cx = x + min(30.0, max(15.0, w * 0.095))
     base_cy = y + h * 0.50
-    cx = _gauss_clamp(base_cx, 2.4, x + 8.0, x + min(42.0, max(18.0, w * 0.22)))
-    cy = _gauss_clamp(base_cy, 2.0, y + h * 0.28, y + h * 0.72)
+    cx = _gauss_clamp(base_cx, sigma_x, x + 8.0, x + min(42.0, max(18.0, w * 0.22)))
+    cy = _gauss_clamp(base_cy, sigma_y, y + h * 0.28, y + h * 0.72)
+    try:
+        box["_click_sample"] = {
+            "checkbox_base_x": base_cx,
+            "checkbox_base_y": base_cy,
+            "gauss_sigma_x": sigma_x,
+            "gauss_sigma_y": sigma_y,
+            "target_x": cx,
+            "target_y": cy,
+            "box": {
+                "x": round(x, 2),
+                "y": round(y, 2),
+                "width": round(w, 2),
+                "height": round(h, 2),
+                "kind": box.get("kind"),
+            },
+        }
+    except Exception:
+        pass
     return cx, cy
 
 
@@ -228,9 +251,21 @@ def _box_click_priority(box: dict[str, Any]) -> tuple[int, float, float]:
     return (-score, float(box.get("y") or 0), float(box.get("x") or 0))
 
 
-def mouse_click_xy(pw_page: Any, x: float, y: float) -> None:
-    """Human-ish multi-segment mouse move + hover + click at viewport coords."""
+def mouse_click_xy(
+    pw_page: Any,
+    x: float,
+    y: float,
+    *,
+    purpose: str = "turnstile",
+    box_sample: dict[str, Any] | None = None,
+) -> None:
+    """Human-ish multi-segment mouse move + hover + click at viewport coords.
+
+    When a registration attempt is active (``reg_stats``), all random path
+    parameters are recorded for later bot_flag correlation.
+    """
     # Start from a plausible on-page position (not teleporting from 0,0).
+    vp: dict[str, Any] = {}
     try:
         vp = getattr(pw_page, "viewport_size", None) or {}
         vw = float(vp.get("width") or 1000)
@@ -247,34 +282,85 @@ def mouse_click_xy(pw_page: Any, x: float, y: float) -> None:
     over_x = x + random.uniform(-5, 7)
     over_y = y + random.uniform(-4, 5)
 
+    steps_start = random.randint(3, 7)
+    steps_mid = random.randint(14, 32)
+    steps_over = random.randint(7, 16)
+    steps_final = random.randint(4, 10)
+    steps_jitter = random.randint(1, 3)
+    click_delay_ms = random.randint(55, 175)
+
     try:
-        pw_page.mouse.move(sx, sy, steps=random.randint(3, 7))
+        pw_page.mouse.move(sx, sy, steps=steps_start)
         human_pause(0.05, 0.16)
     except Exception:
         pass
 
-    pw_page.mouse.move(mid_x, mid_y, steps=random.randint(14, 32))
+    pw_page.mouse.move(mid_x, mid_y, steps=steps_mid)
     human_pause(0.05, 0.16)
-    pw_page.mouse.move(over_x, over_y, steps=random.randint(7, 16))
+    pw_page.mouse.move(over_x, over_y, steps=steps_over)
     human_pause(0.04, 0.12)
-    pw_page.mouse.move(x, y, steps=random.randint(4, 10))
+    pw_page.mouse.move(x, y, steps=steps_final)
     # Hover / aim dwell — humans rarely click on the same frame they arrive.
     human_pause(0.14, 0.42)
+    final_x, final_y = x, y
     try:
         jx = x + random.uniform(-1.3, 1.3)
         jy = y + random.uniform(-1.1, 1.1)
-        pw_page.mouse.move(jx, jy, steps=random.randint(1, 3))
+        pw_page.mouse.move(jx, jy, steps=steps_jitter)
         human_pause(0.04, 0.12)
+        final_x, final_y = jx, jy
         x, y = jx, jy
     except Exception:
         pass
 
     # delay = hold time before mouseup (ms)
     try:
-        pw_page.mouse.click(x, y, delay=random.randint(55, 175))
+        pw_page.mouse.click(x, y, delay=click_delay_ms)
     except TypeError:
         pw_page.mouse.click(x, y)
+        click_delay_ms = None  # type: ignore[assignment]
     human_pause(0.18, 0.48)
+
+    # Telemetry: random path params for success/bot_flag correlation
+    try:
+        from grok_register.reg_stats import record_mouse_click
+
+        sample: dict[str, Any] = {
+            "purpose": purpose,
+            "target_x": float(box_sample.get("target_x", x)) if box_sample else x,
+            "target_y": float(box_sample.get("target_y", y)) if box_sample else y,
+            "start_x": sx,
+            "start_y": sy,
+            "mid_x": mid_x,
+            "mid_y": mid_y,
+            "over_x": over_x,
+            "over_y": over_y,
+            "final_x": final_x,
+            "final_y": final_y,
+            "steps_start": steps_start,
+            "steps_mid": steps_mid,
+            "steps_over": steps_over,
+            "steps_final": steps_final,
+            "steps_jitter": steps_jitter,
+            "click_delay_ms": click_delay_ms,
+            "viewport": {
+                "width": vp.get("width") if isinstance(vp, dict) else None,
+                "height": vp.get("height") if isinstance(vp, dict) else None,
+            },
+        }
+        if box_sample:
+            for k in (
+                "checkbox_base_x",
+                "checkbox_base_y",
+                "gauss_sigma_x",
+                "gauss_sigma_y",
+                "box",
+            ):
+                if k in box_sample:
+                    sample[k] = box_sample[k]
+        record_mouse_click(sample)
+    except Exception:
+        pass
 
 
 def find_turnstile_boxes(pw_page: Any) -> list[dict[str, Any]]:
@@ -430,7 +516,14 @@ def click_turnstile_checkbox(
                         f"turnstile mouse click @ ({cx:.0f},{cy:.0f}) "
                         f"box={box.get('kind')}:{box.get('width'):.0f}x{box.get('height'):.0f}"
                     )
-                mouse_click_xy(pw_page, cx, cy)
+                box_sample = box.get("_click_sample") if isinstance(box, dict) else None
+                mouse_click_xy(
+                    pw_page,
+                    cx,
+                    cy,
+                    purpose="turnstile",
+                    box_sample=box_sample if isinstance(box_sample, dict) else None,
+                )
                 return True
             except Exception as exc:
                 if log_fn:
@@ -538,7 +631,14 @@ def click_turnstile_checkbox(
                     "height": bb["height"],
                 }
                 cx, cy = _checkbox_point_from_box(box)
-                mouse_click_xy(pw_page, cx, cy)
+                box_sample = box.get("_click_sample") if isinstance(box, dict) else None
+                mouse_click_xy(
+                    pw_page,
+                    cx,
+                    cy,
+                    purpose="turnstile_locator",
+                    box_sample=box_sample if isinstance(box_sample, dict) else None,
+                )
                 if log_fn:
                     log_fn(f"turnstile locator bbox click ({cx:.0f},{cy:.0f})")
                 return True
@@ -660,6 +760,9 @@ def solve_turnstile_patient(
     """
     log_fn = log if callable(log) else None
     sleeper = sleep_fn if callable(sleep_fn) else (lambda s: time.sleep(s))
+    t_solve0 = time.time()
+    force_used = False
+    widget_meta: dict[str, Any] = {}
 
     def _cancelled() -> bool:
         return bool(callable(should_cancel) and should_cancel())
@@ -667,6 +770,21 @@ def solve_turnstile_patient(
     def _log(msg: str) -> None:
         if log_fn:
             log_fn(msg)
+
+    def _emit_ts(event: str, **fields: Any) -> None:
+        try:
+            from grok_register.reg_stats import record_turnstile_event
+
+            payload = {
+                "event": event,
+                "duration_ms": int((time.time() - t_solve0) * 1000),
+                "force_used": force_used,
+                **widget_meta,
+                **fields,
+            }
+            record_turnstile_event(payload)
+        except Exception:
+            pass
 
     deadline = time.time() + max(8.0, timeout)
     clicks_done = 0
@@ -676,6 +794,12 @@ def solve_turnstile_patient(
     # 0) If already solved, return immediately
     token = turnstile_token_value(pw_page)
     if len(token) >= min_token_len:
+        _emit_ts(
+            "solved",
+            method="pre_solved",
+            token_len=len(token),
+            clicks_done=0,
+        )
         return token
 
     # 1) Widget ready
@@ -685,22 +809,37 @@ def solve_turnstile_patient(
         sleep_fn=sleeper,
         should_cancel=should_cancel,
     )
-    if boxes and log_fn:
+    if boxes:
         b0 = boxes[0]
-        _log(
-            f"turnstile widget ready kind={b0.get('kind')} "
-            f"size={float(b0.get('width') or 0):.0f}x{float(b0.get('height') or 0):.0f}"
-        )
+        widget_meta = {
+            "widget_kind": b0.get("kind"),
+            "widget_w": round(float(b0.get("width") or 0), 1),
+            "widget_h": round(float(b0.get("height") or 0), 1),
+        }
+        if log_fn:
+            _log(
+                f"turnstile widget ready kind={b0.get('kind')} "
+                f"size={float(b0.get('width') or 0):.0f}x{float(b0.get('height') or 0):.0f}"
+            )
+        _emit_ts("widget_ready", method="wait", clicks_done=0)
 
     # 2) Natural / managed auto-solve window (no click yet)
     auto_lo, auto_hi = auto_solve_wait
-    auto_deadline = time.time() + random.uniform(auto_lo, auto_hi)
+    auto_wait_s = random.uniform(auto_lo, auto_hi)
+    auto_deadline = time.time() + auto_wait_s
     while time.time() < min(auto_deadline, deadline):
         if _cancelled():
             raise RuntimeError("Turnstile cancelled")
         token = turnstile_token_value(pw_page)
         if len(token) >= min_token_len:
             _log(f"turnstile auto-solved token_len={len(token)}")
+            _emit_ts(
+                "auto_solved",
+                method="auto",
+                token_len=len(token),
+                clicks_done=0,
+                auto_wait_s=round(auto_wait_s, 3),
+            )
             return token
         sleeper(random.uniform(0.28, 0.55))
 
@@ -712,9 +851,17 @@ def solve_turnstile_patient(
         token = turnstile_token_value(pw_page)
         if len(token) >= min_token_len:
             _log(f"turnstile solved token_len={len(token)}")
+            _emit_ts(
+                "solved",
+                method="token_before_click",
+                token_len=len(token),
+                clicks_done=clicks_done,
+            )
             return token
 
         allow_force = clicks_done >= force_after
+        if allow_force:
+            force_used = True
         _log(
             f"turnstile click attempt {clicks_done + 1}/{max_clicks}"
             + (" (force fallback enabled)" if allow_force else "")
@@ -732,13 +879,27 @@ def solve_turnstile_patient(
             # Widget may still be loading; short wait then retry
             sleeper(random.uniform(0.7, 1.3))
             clicks_done += 1  # count failed attempt to avoid infinite spin
+            _emit_ts(
+                "click_miss",
+                method="click",
+                clicks_done=clicks_done,
+                allow_force=allow_force,
+            )
             continue
+
+        _emit_ts(
+            "click",
+            method="click",
+            clicks_done=clicks_done,
+            allow_force=allow_force,
+        )
 
         # Patient wait after a real click — do NOT re-click every second
         post_lo, post_hi = post_click_wait
         # Slightly longer wait after later clicks (challenge may be harder)
         scale = 1.0 + 0.15 * max(0, clicks_done - 1)
-        wait_until = time.time() + random.uniform(post_lo, post_hi) * scale
+        post_wait_s = random.uniform(post_lo, post_hi) * scale
+        wait_until = time.time() + post_wait_s
         while time.time() < min(wait_until, deadline):
             if _cancelled():
                 raise RuntimeError("Turnstile cancelled")
@@ -747,6 +908,13 @@ def solve_turnstile_patient(
                 # Brief settle pause after success (look less "instant submit")
                 sleeper(random.uniform(0.25, 0.7))
                 _log(f"turnstile solved after click token_len={len(token)}")
+                _emit_ts(
+                    "solved",
+                    method="click",
+                    token_len=len(token),
+                    clicks_done=clicks_done,
+                    post_wait_s=round(post_wait_s, 3),
+                )
                 return token
             sleeper(random.uniform(0.35, 0.7))
 
@@ -756,7 +924,19 @@ def solve_turnstile_patient(
 
     token = turnstile_token_value(pw_page)
     if len(token) >= min_token_len:
+        _emit_ts(
+            "solved",
+            method="late",
+            token_len=len(token),
+            clicks_done=clicks_done,
+        )
         return token
+    _emit_ts(
+        "failed",
+        method="timeout",
+        token_len=len(token),
+        clicks_done=clicks_done,
+    )
     raise RuntimeError(
         f"Turnstile token not obtained after {clicks_done} click(s) "
         f"(token_len={len(token)})"

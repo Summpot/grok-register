@@ -163,6 +163,60 @@ def register_one(
     dev_token = ""
     max_mail_retry = 3
     cancel = DummyStop()
+    attempt_finished = False
+
+    try:
+        from grok_register.reg_stats import (
+            abandon_attempt,
+            begin_attempt,
+            finish_attempt,
+            update_attempt,
+        )
+        from grok_register.proxyutil import get_runtime_proxy
+    except Exception:
+        abandon_attempt = None  # type: ignore
+        begin_attempt = None  # type: ignore
+        finish_attempt = None  # type: ignore
+        update_attempt = None  # type: ignore
+        get_runtime_proxy = None  # type: ignore
+
+    def _stats_begin() -> None:
+        if not begin_attempt:
+            return
+        try:
+            proxy = ""
+            try:
+                proxy = (get_runtime_proxy() or "") if get_runtime_proxy else ""
+            except Exception:
+                proxy = ""
+            begin_attempt(
+                worker_id=worker_id,
+                idx=idx,
+                user_agent=str(reg.config.get("user_agent", "") or ""),
+                proxy=proxy,
+            )
+        except Exception:
+            pass
+
+    def _stats_finish(outcome: str, **kwargs) -> None:
+        nonlocal attempt_finished
+        if attempt_finished or not finish_attempt:
+            return
+        try:
+            finish_attempt(outcome, **kwargs)
+            attempt_finished = True
+        except Exception:
+            pass
+
+    def _stats_abandon() -> None:
+        nonlocal attempt_finished
+        if attempt_finished:
+            return
+        if abandon_attempt:
+            try:
+                abandon_attempt()
+            except Exception:
+                pass
 
     # Pin a proxy for this account/thread before browser start.
     try:
@@ -170,10 +224,44 @@ def register_one(
     except Exception as exc:
         log(worker_id, f"[proxy] assign failed: {exc}")
 
+    _stats_begin()
+
+    try:
+        return _register_one_body(
+            worker_id=worker_id,
+            idx=idx,
+            total=total,
+            accounts_file=accounts_file,
+            cancel=cancel,
+            max_mail_retry=max_mail_retry,
+            update_attempt=update_attempt,
+            get_runtime_proxy=get_runtime_proxy,
+            stats_finish=_stats_finish,
+        )
+    finally:
+        _stats_abandon()
+
+
+def _register_one_body(
+    *,
+    worker_id: int,
+    idx: int,
+    total: int,
+    accounts_file: str,
+    cancel,
+    max_mail_retry: int,
+    update_attempt,
+    get_runtime_proxy,
+    stats_finish,
+) -> dict | None:
+    email = ""
+    dev_token = ""
+
     try:
         _ensure_browser(worker_id, force_recycle=False)
     except Exception as exc:
         log(worker_id, f"! 浏览器启动失败: {exc}")
+        stats_finish("error", reason="browser_start_failed", error=str(exc)[:400])
         return None
 
     for mail_try in range(1, max_mail_retry + 1):
@@ -186,6 +274,16 @@ def register_one(
                 log_callback=lambda m: log(worker_id, m), cancel_callback=cancel
             )
             log(worker_id, f"邮箱: {email}")
+            if update_attempt:
+                try:
+                    proxy = ""
+                    try:
+                        proxy = (get_runtime_proxy() or "") if get_runtime_proxy else ""
+                    except Exception:
+                        pass
+                    update_attempt(email=email, proxy=proxy)
+                except Exception:
+                    pass
             log(worker_id, "3. 拉取验证码")
             code = reg.fill_code_and_submit(
                 email,
@@ -200,12 +298,12 @@ def register_one(
             try:
                 from grok_register.proxyutil import (
                     disable_proxy,
-                    get_runtime_proxy,
+                    get_runtime_proxy as _grp,
                     is_proxy_failure,
                     proxy_log_label,
                 )
                 if is_proxy_failure(msg):
-                    cur = (get_runtime_proxy() or "").strip()
+                    cur = (_grp() or "").strip()
                     if cur:
                         disable_proxy(cur, reason=msg[:160])
                         log(
@@ -232,6 +330,7 @@ def register_one(
             log(worker_id, f"! 邮箱阶段失败: {msg}")
             traceback.print_exc()
             _inc("reg_fail")
+            stats_finish("error", reason="email_stage", error=msg[:400])
             try:
                 reg.restart_browser(log_callback=lambda m: log(worker_id, m))
             except Exception:
@@ -287,6 +386,12 @@ def register_one(
             )
             reg.mark_error(email or "", reason="bot_flag_source=1")
             _inc("reg_fail")
+            stats_finish(
+                "bot_flag",
+                reason="bot_flag_source=1",
+                bot_flagged=True,
+                access_token=(pool.get("build_seed") or {}).get("access_token"),
+            )
             return None
 
         line = f"{email}----{password}----{sso}\n"
@@ -310,18 +415,24 @@ def register_one(
         }
 
         _inc("reg_success")
+        stats_finish(
+            "success",
+            reason="bot_flag_allowed" if pool.get("bot_flagged") else "",
+            bot_flagged=bool(pool.get("bot_flagged")),
+            access_token=(pool.get("build_seed") or {}).get("access_token"),
+        )
         return job
     except Exception as exc:
         log(worker_id, f"! 注册失败: {exc}")
         try:
             from grok_register.proxyutil import (
                 disable_proxy,
-                get_runtime_proxy,
+                get_runtime_proxy as _grp2,
                 is_proxy_failure,
                 proxy_log_label,
             )
             if is_proxy_failure(exc):
-                cur = (get_runtime_proxy() or "").strip()
+                cur = (_grp2() or "").strip()
                 if cur:
                     disable_proxy(cur, reason=str(exc)[:160])
                     log(worker_id, f"[proxy] disabled {proxy_log_label(cur)} (register_fail)")
@@ -330,6 +441,7 @@ def register_one(
         reg.mark_error(email or "", reason=str(exc)[:120])
         traceback.print_exc()
         _inc("reg_fail")
+        stats_finish("error", reason=str(exc)[:200], error=str(exc)[:400])
         try:
             reg.restart_browser(log_callback=lambda m: log(worker_id, m))
         except Exception:
