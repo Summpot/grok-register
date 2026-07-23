@@ -113,8 +113,34 @@ class DigitalOceanClient:
         return out
 
     def list_ssh_keys(self) -> list[dict[str, Any]]:
-        data = self._request("GET", "/account/keys", params={"per_page": 50})
-        return list((data or {}).get("ssh_keys") or [])
+        out: list[dict[str, Any]] = []
+        page = 1
+        while True:
+            data = self._request(
+                "GET",
+                "/account/keys",
+                params={"page": page, "per_page": 50},
+            )
+            batch = (data or {}).get("ssh_keys") or []
+            out.extend(batch)
+            links = ((data or {}).get("links") or {}).get("pages") or {}
+            if not links.get("next"):
+                break
+            page += 1
+            if page > 20:
+                break
+        return out
+
+    def create_ssh_key(self, *, name: str, public_key: str) -> dict[str, Any]:
+        data = self._request(
+            "POST",
+            "/account/keys",
+            json_body={"name": name, "public_key": public_key},
+        )
+        key = (data or {}).get("ssh_key")
+        if not key:
+            raise DOError("create_ssh_key: missing ssh_key", body=data)
+        return key
 
 
 def public_ipv4(droplet: dict[str, Any]) -> str:

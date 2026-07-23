@@ -94,7 +94,6 @@ class TestLocalConfig(unittest.TestCase):
             enable_hy2=True,
             enable_tuic=True,
             enable_trojan=True,
-            protocol_prefer="trojan",
         )
         nodes = [
             EgressNode(
@@ -108,6 +107,8 @@ class TestLocalConfig(unittest.TestCase):
                 trojan_password="tr",
                 socks_port=17891,
                 status="ready",
+                # Probe found all three; order is randomized at probe time
+                working_protocols=["hy2", "tuic", "trojan"],
             ),
         ]
         doc = build_local_config(s, nodes)
@@ -119,8 +120,7 @@ class TestLocalConfig(unittest.TestCase):
         self.assertIn("urltest", types)
         self.assertEqual(doc["route"]["rules"][0]["outbound"], "egress-0")
         urltest = next(o for o in doc["outbounds"] if o.get("type") == "urltest")
-        self.assertEqual(urltest["outbounds"][0], "trojan-0")
-        self.assertIn("hy2-0", urltest["outbounds"])
+        self.assertEqual(set(urltest["outbounds"]), {"hy2-0", "tuic-0", "trojan-0"})
         url = socks_url(s, nodes[0])
         self.assertEqual(url, "socks5://127.0.0.1:17891")
 
@@ -139,6 +139,24 @@ class TestLocalConfig(unittest.TestCase):
         doc = build_local_config(s, [n])
         types = {o["type"] for o in doc["outbounds"] if o.get("type") not in ("direct", "block", "urltest")}
         self.assertEqual(types, {"trojan"})
+
+    def test_working_protocols_order_preserved_for_urltest(self):
+        from grok_register.do_egress.settings import DoEgressSettings
+
+        s = DoEgressSettings(enable_hy2=True, enable_tuic=True, enable_trojan=True)
+        n = EgressNode(
+            slot=0,
+            ip="1.1.1.1",
+            remote_secret="a",
+            tuic_uuid="11111111-1111-4111-8111-111111111111",
+            tuic_password="tp",
+            trojan_password="tr",
+            status="ready",
+            working_protocols=["tuic", "hy2"],
+        )
+        doc = build_local_config(s, [n])
+        urltest = next(o for o in doc["outbounds"] if o.get("type") == "urltest")
+        self.assertEqual(urltest["outbounds"], ["tuic-0", "hy2-0"])
 
     def test_slot_count_follows_threads(self):
         from grok_register.do_egress.settings import resolve_egress_slot_count
@@ -187,6 +205,100 @@ class TestExampleConfig(unittest.TestCase):
         raw = json.loads((root / "config.example.json").read_text(encoding="utf-8"))
         self.assertIn("do_egress", raw)
         self.assertEqual(raw.get("proxy_pool_source"), "file")
+        self.assertTrue(raw["do_egress"].get("ssh_probe", False))
+
+
+class TestManagedSshKeys(unittest.TestCase):
+    def test_generate_local_keypair(self):
+        from grok_register.do_egress.settings import DoEgressSettings
+        from grok_register.do_egress import ssh_keys as sk
+
+        with tempfile.TemporaryDirectory() as td:
+            s = DoEgressSettings(state_dir=td, ssh_key_name="test-egress")
+            priv, pub = sk.ensure_local_keypair(s)
+            self.assertTrue(priv.is_file())
+            self.assertTrue(pub.is_file())
+            text = pub.read_text(encoding="utf-8")
+            self.assertTrue(text.startswith("ssh-ed25519 "))
+            # Second call reuses
+            priv2, pub2 = sk.ensure_local_keypair(s)
+            self.assertEqual(priv, priv2)
+            self.assertEqual(pub.read_text(encoding="utf-8"), text)
+
+    def test_find_or_create_reuses_existing_pubkey(self):
+        from grok_register.do_egress import ssh_keys as sk
+
+        class FakeClient:
+            def __init__(self):
+                self.created = 0
+                self.keys = [
+                    {
+                        "id": 42,
+                        "name": "old",
+                        "public_key": "ssh-ed25519 AAAAB3NzaC1lZDI1NTE5AAAAIGtestblob comment",
+                    }
+                ]
+
+            def list_ssh_keys(self):
+                return list(self.keys)
+
+            def create_ssh_key(self, *, name, public_key):
+                self.created += 1
+                kid = 100 + self.created
+                row = {"id": kid, "name": name, "public_key": public_key}
+                self.keys.append(row)
+                return row
+
+        client = FakeClient()
+        kid = sk.find_or_create_do_key(
+            client,
+            name="grok-reg-egress",
+            public_key="ssh-ed25519 AAAAB3NzaC1lZDI1NTE5AAAAIGtestblob other-comment",
+        )
+        self.assertEqual(kid, 42)
+        self.assertEqual(client.created, 0)
+
+    def test_find_or_create_uploads_new(self):
+        from grok_register.do_egress import ssh_keys as sk
+
+        class FakeClient:
+            def list_ssh_keys(self):
+                return []
+
+            def create_ssh_key(self, *, name, public_key):
+                return {"id": 7, "name": name, "public_key": public_key}
+
+        kid = sk.find_or_create_do_key(
+            FakeClient(),
+            name="grok-reg-egress",
+            public_key="ssh-ed25519 AAAAB3NzaC1lZDI1NTE5AAAAINewkey x",
+        )
+        self.assertEqual(kid, 7)
+
+    def test_ssh_remote_ready_passes_identity(self):
+        from grok_register.do_egress import local_tunnel as lt
+
+        captured = {}
+
+        def fake_run(cmd, **kwargs):
+            captured["cmd"] = cmd
+
+            class R:
+                returncode = 0
+                stdout = ""
+                stderr = ""
+
+            return R()
+
+        with patch.object(lt.subprocess, "run", side_effect=fake_run):
+            ok, detail = lt.ssh_remote_service_ready(
+                "1.2.3.4", identity_file=r"C:\keys\id_ed25519", timeout_s=5
+            )
+        self.assertTrue(ok)
+        self.assertIn("ssh:ready+active", detail)
+        self.assertIn("-i", captured["cmd"])
+        self.assertIn(r"C:\keys\id_ed25519", captured["cmd"])
+        self.assertIn("IdentitiesOnly=yes", captured["cmd"])
 
 
 if __name__ == "__main__":

@@ -109,6 +109,20 @@ DEFAULT_CONFIG = {
     "cloudflare_path_accounts": "/api/new_address",
     "cloudflare_path_token": "/api/token",
     "cloudflare_path_messages": "/api/mails",
+    # Exchange Online catch-all via Microsoft Graph (@*.onmicrosoft.com).
+    # Switch with email_provider: "exchange" | "cloudflare" | "duckmail" | "yyds".
+    # Does NOT create users — random local-parts land in exchange_mailbox.
+    "exchange_tenant_id": "",
+    "exchange_client_id": "",
+    "exchange_client_secret": "",
+    # Catch-all destination mailbox UPN or object id (the real inbox Graph reads).
+    "exchange_mailbox": "",
+    # Comma-separated catch-all domains; falls back to defaultDomains when empty.
+    "exchange_domains": "",
+    "exchange_username_prefix": "tmp",
+    "exchange_username_length": 12,
+    "exchange_list_top": 50,
+    "exchange_graph_base": "https://graph.microsoft.com/v1.0",
     # When true, pass enableRandomSubdomain to cloudflare_temp_email so each
     # address becomes name@<random>.base-domain (requires Worker
     # RANDOM_SUBDOMAIN_DOMAINS + wildcard MX on the base domain).
@@ -187,6 +201,8 @@ DEFAULT_CONFIG = {
         "size": "s-1vcpu-512mb-10gb",
         "image": "ubuntu-24-04-x64",
         "ssh_key_ids": [],
+        "ssh_key_name": "grok-reg-egress",
+        "ssh_identity_file": "",
         "pool_size": 3,
         "remote_port": 8443,
         "tuic_port": 8444,
@@ -194,8 +210,7 @@ DEFAULT_CONFIG = {
         "enable_hy2": True,
         "enable_tuic": True,
         "enable_trojan": True,
-        "protocol_prefer": "trojan",
-        "ssh_probe": False,
+        "ssh_probe": True,
         "socks_base_port": 17891,
         "singbox_exe": "sing-box",
         "ready_wait_s": 240,
@@ -1686,6 +1701,25 @@ def http_post(url, **kwargs):
         raise
 
 
+def http_delete(url, **kwargs):
+    try:
+        return curl_requests.delete(url, **_build_request_kwargs(**kwargs))
+    except Exception as exc:
+        err = str(exc)
+        if _is_tls_backend_error(exc):
+            return std_requests.delete(url, **_to_std_request_kwargs(kwargs))
+        if "127.0.0.1 port 7890" in err or "Could not connect to server" in err:
+            retry_kwargs = dict(kwargs)
+            retry_kwargs["proxies"] = {}
+            try:
+                return curl_requests.delete(url, **_build_request_kwargs(**retry_kwargs))
+            except Exception as retry_exc:
+                if _is_tls_backend_error(retry_exc):
+                    return std_requests.delete(url, **_to_std_request_kwargs(retry_kwargs))
+                raise
+        raise
+
+
 def raise_if_cancelled(cancel_callback=None):
     if cancel_callback and cancel_callback():
         raise RegistrationCancelled("鐢ㄦ埛鍋滄娉ㄥ唽")
@@ -2097,13 +2131,74 @@ def pick_domain(api_key=None):
 
 
 def get_email_provider():
-    return config.get("email_provider", "duckmail")
+    return str(config.get("email_provider", "duckmail") or "duckmail").strip().lower()
+
+
+def get_exchange_client():
+    """Build an ExchangeMailClient bound to current config + HTTP helpers."""
+    from grok_register.exchange_mail import ExchangeMailClient
+
+    return ExchangeMailClient.from_config(
+        config,
+        http_get=http_get,
+        http_post=http_post,
+        sleep_fn=sleep_with_cancel,
+    )
+
+
+def exchange_get_email_and_token(log_callback=None, cancel_callback=None):
+    """Allocate a catch-all address (no user creation); poll via exchange_mailbox."""
+    from grok_register.exchange_mail import ExchangeMailError
+
+    client = get_exchange_client()
+    try:
+        address, mailbox_token = client.create_temp_address(
+            blocked=is_email_domain_blocked,
+            log_callback=log_callback,
+        )
+    except ExchangeMailError as exc:
+        raise Exception(str(exc)) from exc
+    safe_print(f"[*] 已分配 Exchange catch-all 地址: {address}")
+    # dev_token is the catch-all mailbox UPN/id used for Graph list messages.
+    return address, mailbox_token
+
+
+def exchange_get_oai_code(
+    dev_token,
+    email,
+    timeout=180,
+    poll_interval=3,
+    log_callback=None,
+    cancel_callback=None,
+    resend_callback=None,
+):
+    from grok_register.exchange_mail import ExchangeMailError
+
+    client = get_exchange_client()
+    try:
+        return client.get_oai_code(
+            dev_token,
+            email,
+            timeout=timeout,
+            poll_interval=poll_interval,
+            log_callback=log_callback,
+            cancel_callback=cancel_callback,
+            resend_callback=resend_callback,
+            extract_fn=extract_verification_code,
+        )
+    except ExchangeMailError as exc:
+        msg = str(exc)
+        if msg == "cancelled":
+            raise RegistrationCancelled("用户停止注册") from exc
+        raise Exception(msg) from exc
 
 
 def get_email_and_token(api_key=None):
     provider = get_email_provider()
     if provider == "yyds":
         return yyds_get_email_and_token(api_key=api_key, jwt=get_yyds_jwt())
+    if provider == "exchange":
+        return exchange_get_email_and_token()
     if provider == "cloudflare":
         api_base = get_cloudflare_api_base()
         if not api_base:
@@ -2163,6 +2258,16 @@ def get_oai_code(
             log_callback=log_callback,
             jwt=get_yyds_jwt(),
             cancel_callback=cancel_callback,
+        )
+    if provider == "exchange":
+        return exchange_get_oai_code(
+            dev_token,
+            email,
+            timeout=timeout,
+            poll_interval=poll_interval,
+            log_callback=log_callback,
+            cancel_callback=cancel_callback,
+            resend_callback=resend_callback,
         )
     if provider == "cloudflare":
         return cloudflare_get_oai_code(

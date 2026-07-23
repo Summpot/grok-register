@@ -9,6 +9,7 @@ import threading
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import urlparse
 
@@ -34,6 +35,7 @@ from grok_register.do_egress.settings import (
     settings_from_config,
 )
 from grok_register.do_egress.singbox_bin import ensure_singbox_for_settings
+from grok_register.do_egress.ssh_keys import ensure_managed_ssh
 from grok_register.do_egress.state import EgressNode, EgressState, load_state, save_state
 
 LogFn = Callable[[str], None]
@@ -92,17 +94,17 @@ def _require_token(settings: DoEgressSettings) -> None:
 
 
 def _ssh_keys(client: DigitalOceanClient, settings: DoEgressSettings, log: LogFn | None) -> list:
-    keys = list(settings.ssh_key_ids)
-    if keys:
-        return keys
-    remote = client.list_ssh_keys()
-    if not remote:
-        raise RuntimeError(
-            "No ssh_key_ids configured and no SSH keys on the DO account"
-        )
-    ids = [k["id"] for k in remote]
-    _log(f"[egress] using account SSH keys: {ids}", log)
-    return ids
+    """Ensure managed ed25519 keypair, upload to DO, return key ids for create.
+
+    Always injects the managed public key so SSH readiness probes work with
+    the matching private key under state_dir/ssh/.
+    """
+    ids, priv = ensure_managed_ssh(client, settings, log=log)
+    _log(
+        f"[egress] droplet SSH keys={ids} identity={priv}",
+        log,
+    )
+    return list(ids)
 
 
 def _register_atexit_once() -> None:
@@ -337,11 +339,12 @@ def _wait_remote_singbox(
     *,
     log: LogFn | None = None,
 ) -> list[str]:
-    """Poll until at least one tunnel protocol works. Returns working protocol names.
+    """Poll until sing-box is up and at least one tunnel protocol works.
 
-    ready_wait_s = max wait; ready_poll_s = interval.
-    SSH probe is optional (usually fails without matching local private key).
-    When Trojan is enabled, waits for TCP port open as cloud-init progress signal.
+    Primary gate (when managed key present): SSH checks
+    ``/var/log/sing-box/ready`` + ``systemctl is-active sing-box``.
+    Fallback gate: TCP connect to trojan port.
+    Then ``probe_remote_ready`` confirms which protocols work end-to-end.
     """
     timeout_s = max(30, int(settings.ready_wait_s or 240))
     poll_s = max(1, int(settings.ready_poll_s or 5))
@@ -350,13 +353,41 @@ def _wait_remote_singbox(
     last_detail = ""
     t0 = time.time()
     trojan_port = int(node.trojan_port or settings.trojan_port or 443)
-    saw_tcp = False
+    identity = str(getattr(settings, "ssh_identity_file", "") or "").strip()
+    use_ssh = bool(
+        settings.ssh_probe and identity and Path(identity).is_file()
+    )
+    saw_service = False
 
     while time.time() < deadline:
         attempt += 1
 
-        # Cloud-init progress: TCP trojan port opens only after sing-box starts
-        if settings.enable_trojan:
+        if use_ssh:
+            ssh_ok, ssh_detail = ssh_remote_service_ready(
+                node.ip,
+                identity_file=identity,
+                timeout_s=min(12.0, max(4.0, float(poll_s) + 2.0)),
+            )
+            last_detail = ssh_detail
+            if not ssh_ok:
+                remain = deadline - time.time()
+                if remain <= 0:
+                    break
+                _log(
+                    f"[egress] slot {node.slot}: not ready yet attempt={attempt} "
+                    f"({ssh_detail}); retry in {min(poll_s, remain):.0f}s",
+                    log,
+                )
+                time.sleep(min(poll_s, max(0.5, remain)))
+                continue
+            if not saw_service:
+                saw_service = True
+                _log(
+                    f"[egress] slot {node.slot}: {ssh_detail}, probing tunnels…",
+                    log,
+                )
+        elif settings.enable_trojan:
+            # No identity file: fall back to TCP progress signal
             if not tcp_port_open(node.ip, trojan_port, timeout_s=3.0):
                 last_detail = (
                     f"waiting tcp:{node.ip}:{trojan_port} "
@@ -372,22 +403,12 @@ def _wait_remote_singbox(
                 )
                 time.sleep(min(poll_s, max(0.5, remain)))
                 continue
-            if not saw_tcp:
-                saw_tcp = True
-                # ufw --force reset + systemctl restart 刚结束时端口会抖；
-                # 实测 Trojan 配置正确，但过早探测会 dial timeout / refused
-                settle = min(15, max(5, poll_s * 2))
+            if not saw_service:
+                saw_service = True
                 _log(
-                    f"[egress] slot {node.slot}: tcp:{trojan_port} open, "
-                    f"settle {settle}s then probe…",
+                    f"[egress] slot {node.slot}: tcp:{trojan_port} open, probing…",
                     log,
                 )
-                time.sleep(settle)
-
-        if settings.ssh_probe:
-            ssh_ok, ssh_detail = ssh_remote_service_ready(node.ip, timeout_s=6)
-            if ssh_ok:
-                _log(f"[egress] slot {node.slot}: {ssh_detail}", log)
 
         ok, detail, working = probe_remote_ready(
             settings, node, probe_timeout_s=20.0
@@ -414,7 +435,12 @@ def _wait_remote_singbox(
 
     hint = ""
     low = (last_detail or "").lower()
-    if "unreachable" in low or "i/o timeout" in low or "waiting tcp" in low:
+    if "ssh" in low and ("connection refused" in low or "timed out" in low or "timeout" in low):
+        hint = (
+            " SSH(22) 连不上：确认本机有 OpenSSH、安全组/防火墙放行 22，"
+            "或 region 换 sgp1；密钥在 state_dir/ssh/id_ed25519。"
+        )
+    elif "unreachable" in low or "i/o timeout" in low or "waiting tcp" in low:
         hint = (
             " 网络层到 VPS 不通（非账号密码问题）。"
             " 建议: 1) config 里 do_egress.region 改为 sgp1/sgp2 试新加坡;"
@@ -505,7 +531,7 @@ def ensure_pool(
         _log(
             f"[egress] startup cleanup (region={settings.region}) then create "
             f"slots={target} (pool_size max={settings.pool_size}) "
-            f"protocols=[{', '.join(protos) or 'none'}] prefer={settings.protocol_prefer}",
+            f"protocols=[{', '.join(protos) or 'none'}] (probe all, random pick working)",
             log,
         )
         # destroy_all takes lock — call internal cleanup without re-enter

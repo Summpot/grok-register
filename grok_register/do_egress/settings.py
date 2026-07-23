@@ -36,6 +36,10 @@ class DoEgressSettings:
     size: str = "s-1vcpu-512mb-10gb"
     image: str = "ubuntu-24-04-x64"
     ssh_key_ids: list[int | str] = field(default_factory=list)
+    # Auto-generated ed25519 under state_dir/ssh/; also set after ensure_managed_ssh.
+    ssh_identity_file: str = ""
+    # Name when uploading the managed public key to the DO account.
+    ssh_key_name: str = "grok-reg-egress"
     droplet_tag: str = "grok-reg-egress"
     name_prefix: str = "reg-egress"
     pool_size: int = 3
@@ -46,10 +50,11 @@ class DoEgressSettings:
     enable_hy2: bool = True
     enable_tuic: bool = True
     enable_trojan: bool = True
-    # Prefer TCP first when UDP is commonly blocked to the VPS
-    protocol_prefer: str = "trojan"
-    # SSH probe needs a local private key matching DO ssh_key_ids — off by default
-    ssh_probe: bool = False
+    # Deprecated / ignored: all enabled protocols are probed; working ones are
+    # shuffled for random selection. Kept for config backward compatibility.
+    protocol_prefer: str = ""
+    # Primary readiness: SSH ready marker + systemctl (managed key injected on create)
+    ssh_probe: bool = True
     singbox_version: str = "1.11.15"
     socks_listen: str = "127.0.0.1"
     socks_base_port: int = 17891
@@ -127,6 +132,14 @@ def settings_from_config(cfg: dict[str, Any] | None) -> DoEgressSettings:
         size=str(_get(cfg, "size", nest.get("size") or "s-1vcpu-512mb-10gb")),
         image=str(_get(cfg, "image", nest.get("image") or "ubuntu-24-04-x64")),
         ssh_key_ids=list(ssh),
+        ssh_identity_file=str(
+            _get(cfg, "ssh_identity_file", nest.get("ssh_identity_file") or "") or ""
+        ).strip(),
+        ssh_key_name=str(
+            _get(cfg, "ssh_key_name", nest.get("ssh_key_name") or "grok-reg-egress")
+            or "grok-reg-egress"
+        ).strip()
+        or "grok-reg-egress",
         droplet_tag=str(_get(cfg, "droplet_tag", nest.get("droplet_tag") or "grok-reg-egress")),
         name_prefix=str(_get(cfg, "name_prefix", nest.get("name_prefix") or "reg-egress")),
         pool_size=int(_get(cfg, "pool_size", nest.get("pool_size") or 3) or 3),
@@ -141,12 +154,11 @@ def settings_from_config(cfg: dict[str, Any] | None) -> DoEgressSettings:
             nest.get("enable_trojan", cfg.get("do_egress_enable_trojan", True))
         ),
         protocol_prefer=str(
-            _get(cfg, "protocol_prefer", nest.get("protocol_prefer") or "trojan")
+            _get(cfg, "protocol_prefer", nest.get("protocol_prefer") or "") or ""
         )
         .strip()
-        .lower()
-        or "trojan",
-        ssh_probe=bool(nest.get("ssh_probe", cfg.get("do_egress_ssh_probe", False))),
+        .lower(),
+        ssh_probe=bool(nest.get("ssh_probe", cfg.get("do_egress_ssh_probe", True))),
         singbox_version=str(
             _get(cfg, "singbox_version", nest.get("singbox_version") or "1.11.15")
         ),

@@ -82,7 +82,7 @@ uv run python -m grok_register.cli --count 1 --threads 1
 ## 功能
 
 - CLI 多线程批量注册
-- Cloudflare / DuckMail / YYDS 临时邮箱
+- Cloudflare / Exchange（@*.onmicrosoft.com）/ DuckMail / YYDS 临时邮箱
 - Chrome / Chromium 真实浏览器注册流程（含 Turnstile 扩展 `turnstilePatch/`）
 - 成功账号实时写入 `output/accounts_*.txt` / `output/accounts_cli.txt`
 - 可选写入本地 / 远端 **grok2api Web** 池（**默认关闭**；Build 仅走本地 Device Flow 后导入）
@@ -188,6 +188,47 @@ uv run python cf_mail_debug.py `
   --domain "你的收信域名.com" `
   --random-subdomain
 ```
+
+#### 方案 C：Exchange Online catch-all（`@tenant.onmicrosoft.com`）
+
+**不创建用户**。流程：随机生成 `tmp…@域名` → 邮件进固定 catch-all 邮箱 → Graph 按收件人过滤取验证码。与 Cloudflare 通道互斥，改 `email_provider` 即可切换：
+
+```json
+{
+  "email_provider": "exchange",
+  "exchange_tenant_id": "你的-Directory-(tenant)-ID",
+  "exchange_client_id": "应用(客户端)ID",
+  "exchange_client_secret": "客户端密码",
+  "exchange_mailbox": "catchall@你的租户.onmicrosoft.com",
+  "exchange_domains": "你的租户.onmicrosoft.com"
+}
+```
+
+切回 Cloudflare Temp Mail：
+
+```json
+{
+  "email_provider": "cloudflare"
+}
+```
+
+**租户侧前置：**
+
+1. 在 Exchange / M365 为域名开启 **catch-all**（或传输规则：未知收件人转发到 `exchange_mailbox`）
+2. Entra ID → 应用注册 → 记下 **应用程序(客户端) ID** 与 **目录(租户) ID**
+3. 证书和密码 → 新建客户端密码 → `exchange_client_secret`
+4. API 权限 → Microsoft Graph **应用程序权限** `Mail.Read` → **管理员同意**（需能读 catch-all 邮箱）
+5. `exchange_domains` 填 catch-all 域（如 `xxx.onmicrosoft.com`）；留空时回退 `defaultDomains`
+
+| 字段 | 说明 |
+| --- | --- |
+| `exchange_tenant_id` / `client_id` / `client_secret` | 应用身份（client credentials） |
+| `exchange_mailbox` | catch-all **实际收信邮箱** 的 UPN 或对象 ID（Graph 轮询目标） |
+| `exchange_domains` | 对外使用的域名，逗号分隔，如 `contoso.onmicrosoft.com` |
+| `exchange_username_prefix` / `length` | 随机本地部分，默认 `tmp` + 12 位 |
+| `exchange_list_top` | 每轮拉取最近邮件条数，默认 50 |
+
+> 并发时多个随机地址共用同一 catch-all 邮箱；程序按 `toRecipients` / 原始收件人头匹配目标地址，互不干扰。
 
 ### 2. 注册数量 / 并发（强烈建议）
 
@@ -310,6 +351,8 @@ python -m grok_register.reg_stats --file output/reg_stats.jsonl --json
 | `enable_nsfw` | `false` | 注册后尝试开 NSFW；常被 Cloudflare 403，不影响出号 |
 | `user_agent` | 保持示例 | 浏览器 UA |
 | `yyds_*` / `duckmail_api_key` | 按需 | 换邮箱供应商时使用 |
+| `email_provider` | `cloudflare` | `cloudflare` / `exchange` / `duckmail` / `yyds` |
+| `exchange_*` | 按需 | Graph 临时邮箱；见上文「方案 C」 |
 
 ### 最小可跑示例（本地出号 + 远端 grok2api Web）
 

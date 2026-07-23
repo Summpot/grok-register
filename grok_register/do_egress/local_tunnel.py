@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import os
+import random
 import signal
 import socket
 import subprocess
@@ -45,13 +46,13 @@ def _protocol_outbounds(
     *,
     only: str | None = None,
 ) -> tuple[list[dict[str, Any]], list[str]]:
-    """Build protocol leaf outbounds + ordered tags for urltest (prefer first).
+    """Build protocol leaf outbounds + ordered tags for urltest.
 
     only: if set to hy2|tuic|trojan, build just that protocol (for probes).
     When node.working_protocols is non-empty, only include those that passed probe.
+    Order among working protocols is randomized (no protocol_prefer).
     """
     leaves: list[dict[str, Any]] = []
-    prefer = (settings.protocol_prefer or "hy2").strip().lower()
     working = {str(x).lower() for x in (n.working_protocols or [])}
 
     def _want(name: str) -> bool:
@@ -64,6 +65,7 @@ def _protocol_outbounds(
     hy2_tag = f"hy2-{n.slot}"
     tuic_tag = f"tuic-{n.slot}"
     trojan_tag = f"trojan-{n.slot}"
+    tag_by_name = {"hy2": hy2_tag, "tuic": tuic_tag, "trojan": trojan_tag}
 
     if settings.enable_hy2 and _want("hy2"):
         leaves.append(
@@ -106,20 +108,21 @@ def _protocol_outbounds(
             }
         )
 
-    present = {x["tag"]: x for x in leaves}
-    order_pref = []
-    # prefer first, then stable order hy2 → tuic → trojan
-    for name, tag in (
-        ("hy2", hy2_tag),
-        ("tuic", tuic_tag),
-        ("trojan", trojan_tag),
-    ):
-        if tag in present:
-            order_pref.append((0 if name == prefer else 1, name, tag))
-    order_pref.sort(key=lambda t: (t[0], {"hy2": 0, "tuic": 1, "trojan": 2}.get(t[1], 9)))
-    ordered = [t[2] for t in order_pref]
+    present = {x["tag"] for x in leaves}
+    # Prefer order of working_protocols (already shuffled at probe time), then fill rest.
+    ordered: list[str] = []
+    for name in n.working_protocols or []:
+        tag = tag_by_name.get(str(name).lower())
+        if tag and tag in present and tag not in ordered:
+            ordered.append(tag)
+    for tag in (hy2_tag, tuic_tag, trojan_tag):
+        if tag in present and tag not in ordered:
+            ordered.append(tag)
     if not ordered:
         ordered = [x["tag"] for x in leaves]
+    if len(ordered) > 1 and not (n.working_protocols or []):
+        # No probe result yet: randomize initial order among enabled leaves.
+        random.shuffle(ordered)
     return leaves, ordered
 
 
@@ -381,6 +384,8 @@ def _probe_settings_copy(
         size=settings.size,
         image=settings.image,
         ssh_key_ids=list(settings.ssh_key_ids),
+        ssh_identity_file=str(getattr(settings, "ssh_identity_file", "") or ""),
+        ssh_key_name=str(getattr(settings, "ssh_key_name", "") or "grok-reg-egress"),
         droplet_tag=settings.droplet_tag,
         name_prefix=settings.name_prefix,
         pool_size=settings.pool_size,
@@ -599,9 +604,10 @@ def probe_remote_ready(
     health_url: str = DEFAULT_HEALTH_URL,
     probe_timeout_s: float = 12.0,
 ) -> tuple[bool, str, list[str]]:
-    """Probe each enabled protocol separately. Ready if any works.
+    """Probe **every** enabled protocol. Ready if at least one works.
 
-    Returns (ok, detail, working_protocol_names).
+    Returns (ok, detail, working_protocol_names) with working list shuffled
+    so local routing can pick randomly among available protocols.
     """
     if not node.ip or not node.remote_secret:
         return False, "missing ip/secret", []
@@ -616,56 +622,39 @@ def probe_remote_ready(
     if not candidates:
         return False, "no protocols enabled", []
 
-    # Always try TCP trojan before UDP when both enabled (UDP often blackholed CN→DO)
-    prefer = (settings.protocol_prefer or "trojan").lower()
-    ordered: list[str] = []
-    for c in (prefer, "trojan", "hy2", "tuic"):
-        if c in candidates and c not in ordered:
-            ordered.append(c)
-    for c in candidates:
-        if c not in ordered:
-            ordered.append(c)
-    candidates = ordered
+    # Probe order is randomized each time (no protocol_prefer short-circuit).
+    random.shuffle(candidates)
 
     working: list[str] = []
     details: list[str] = []
-    # Up to 3 tries on the preferred/TCP protocol before trying others
-    primary = candidates[0]
-    for attempt in range(1, 4):
+    for proto in candidates:
         ok, detail = _run_one_probe(
             settings,
             node,
-            protocol=primary,
+            protocol=proto,
             health_url=health_url,
             probe_timeout_s=probe_timeout_s,
         )
-        details.append(f"{primary}#{attempt}:{detail}")
+        details.append(detail)
         if ok:
-            working.append(primary)
-            break
-        time.sleep(2.0)
-
-    if not working:
-        for proto in candidates[1:]:
-            ok, detail = _run_one_probe(
-                settings,
-                node,
-                protocol=proto,
-                health_url=health_url,
-                probe_timeout_s=probe_timeout_s,
-            )
-            details.append(detail)
-            if ok:
-                working.append(proto)
-                break
+            working.append(proto)
 
     if working:
+        random.shuffle(working)
         return True, "; ".join(details), working
     return False, "; ".join(details), []
 
 
-def ssh_remote_service_ready(ip: str, *, timeout_s: float = 8.0) -> tuple[bool, str]:
-    """Optional SSH check: ready marker + systemctl (when OpenSSH client works)."""
+def ssh_remote_service_ready(
+    ip: str,
+    *,
+    identity_file: str | None = None,
+    timeout_s: float = 8.0,
+) -> tuple[bool, str]:
+    """SSH check: ready marker + systemctl is-active sing-box.
+
+    Uses ``identity_file`` (managed egress private key) when provided.
+    """
     if not ip:
         return False, "no ip"
     ssh = "ssh"
@@ -680,10 +669,21 @@ def ssh_remote_service_ready(ip: str, *, timeout_s: float = 8.0) -> tuple[bool, 
         "-o",
         f"UserKnownHostsFile={known}",
         "-o",
+        "IdentitiesOnly=yes",
+        "-o",
+        "PreferredAuthentications=publickey",
+        "-o",
         f"ConnectTimeout={max(1, int(timeout_s))}",
-        f"root@{ip}",
-        "test -f /var/log/sing-box/ready && systemctl is-active --quiet sing-box",
     ]
+    ident = str(identity_file or "").strip()
+    if ident:
+        cmd.extend(["-i", ident])
+    cmd.extend(
+        [
+            f"root@{ip}",
+            "test -f /var/log/sing-box/ready && systemctl is-active --quiet sing-box",
+        ]
+    )
     try:
         r = subprocess.run(
             cmd,
