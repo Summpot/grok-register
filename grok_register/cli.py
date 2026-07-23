@@ -679,10 +679,20 @@ def main() -> int:
         cfg0 = getattr(reg, "config", {}) or {}
         if cfg0.get("proxy_pool_enabled"):
             src = str(cfg0.get("proxy_pool_source") or "file").strip().lower()
+            # DO: droplet count = min(pool_size, register threads)
+            if src in ("do", "digitalocean", "do_egress", "egress"):
+                cfg0 = dict(cfg0)
+                cfg0["register_threads"] = threads
+                cfg0["_egress_slots"] = threads
+                try:
+                    reg.config["register_threads"] = threads
+                except Exception:
+                    pass
             n = ensure_pool_from_config(cfg0)
             if src in ("do", "digitalocean", "do_egress", "egress"):
                 print(
-                    f"[*] proxy_pool source=do (local SOCKS egress) size={n} "
+                    f"[*] proxy_pool source=do (local SOCKS, hy2+tuic fallback) "
+                    f"size={n} threads={threads} "
                     f"mode={cfg0.get('proxy_pool_mode', 'random')}",
                     flush=True,
                 )

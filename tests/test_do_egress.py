@@ -49,44 +49,106 @@ class TestSettings(unittest.TestCase):
 
 
 class TestBootstrap(unittest.TestCase):
-    def test_user_data_has_secret_not_branded_cli(self):
+    def test_user_data_is_valid_yaml_shape_with_b64(self):
+        import base64
+        import re
+
         yml = render_user_data(
             remote_port=8443,
             remote_secret="Sec123",
             singbox_version="1.11.15",
+            tuic_port=8444,
+            tuic_uuid="aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee",
+            tuic_password="TuicPass",
+            trojan_port=443,
+            trojan_password="TrPass",
         )
-        self.assertIn("Sec123", yml)
-        self.assertIn("setup-egress.sh", yml)
         self.assertIn("#cloud-config", yml)
+        self.assertIn("encoding: b64", yml)
+        self.assertIn("setup-egress.sh", yml)
+        blobs = re.findall(r"content: ([A-Za-z0-9+/=]+)", yml)
+        self.assertEqual(len(blobs), 2)
+        cfg = base64.b64decode(blobs[0]).decode()
+        setup = base64.b64decode(blobs[1]).decode()
+        self.assertIn("Sec123", cfg)
+        self.assertIn("hysteria2", cfg)
+        self.assertIn("tuic", cfg)
+        self.assertIn("trojan", cfg)
+        self.assertIn("TuicPass", cfg)
+        self.assertIn("TrPass", cfg)
+        self.assertIn('"listen_port": 443', cfg)
+        self.assertIn("ufw allow 443/tcp", setup)
+        self.assertIn("ufw allow 8443/udp", setup)
+        self.assertNotIn("\nufw allow", yml)
 
 
 class TestLocalConfig(unittest.TestCase):
-    def test_one_socks_per_node(self):
+    def test_one_socks_per_node_with_protocol_fallback(self):
         from grok_register.do_egress.settings import DoEgressSettings
 
-        s = DoEgressSettings(socks_base_port=17891)
+        s = DoEgressSettings(
+            socks_base_port=17891,
+            enable_hy2=True,
+            enable_tuic=True,
+            enable_trojan=True,
+            protocol_prefer="trojan",
+        )
         nodes = [
             EgressNode(
                 slot=0,
                 ip="1.1.1.1",
                 remote_secret="a",
+                tuic_uuid="11111111-1111-4111-8111-111111111111",
+                tuic_password="tp",
+                tuic_port=8444,
+                trojan_port=443,
+                trojan_password="tr",
                 socks_port=17891,
-                status="ready",
-            ),
-            EgressNode(
-                slot=1,
-                ip="2.2.2.2",
-                remote_secret="b",
-                socks_port=17892,
                 status="ready",
             ),
         ]
         doc = build_local_config(s, nodes)
-        self.assertEqual(len(doc["inbounds"]), 2)
-        self.assertEqual(doc["inbounds"][0]["listen_port"], 17891)
+        self.assertEqual(len(doc["inbounds"]), 1)
+        types = {o["type"] for o in doc["outbounds"]}
+        self.assertIn("hysteria2", types)
+        self.assertIn("tuic", types)
+        self.assertIn("trojan", types)
+        self.assertIn("urltest", types)
         self.assertEqual(doc["route"]["rules"][0]["outbound"], "egress-0")
+        urltest = next(o for o in doc["outbounds"] if o.get("type") == "urltest")
+        self.assertEqual(urltest["outbounds"][0], "trojan-0")
+        self.assertIn("hy2-0", urltest["outbounds"])
         url = socks_url(s, nodes[0])
         self.assertEqual(url, "socks5://127.0.0.1:17891")
+
+    def test_working_protocols_filters_leaves(self):
+        from grok_register.do_egress.settings import DoEgressSettings
+
+        s = DoEgressSettings(enable_hy2=True, enable_tuic=True, enable_trojan=True)
+        n = EgressNode(
+            slot=0,
+            ip="1.1.1.1",
+            remote_secret="a",
+            tuic_uuid="11111111-1111-4111-8111-111111111111",
+            status="ready",
+            working_protocols=["trojan"],
+        )
+        doc = build_local_config(s, [n])
+        types = {o["type"] for o in doc["outbounds"] if o.get("type") not in ("direct", "block", "urltest")}
+        self.assertEqual(types, {"trojan"})
+
+    def test_slot_count_follows_threads(self):
+        from grok_register.do_egress.settings import resolve_egress_slot_count
+
+        cfg = {
+            "proxy_pool_enabled": True,
+            "proxy_pool_source": "do",
+            "do_egress": {"pool_size": 3},
+            "register_threads": 1,
+        }
+        self.assertEqual(resolve_egress_slot_count(cfg), 1)
+        self.assertEqual(resolve_egress_slot_count(cfg, threads=2), 2)
+        self.assertEqual(resolve_egress_slot_count(cfg, threads=5), 3)
 
 
 class TestState(unittest.TestCase):

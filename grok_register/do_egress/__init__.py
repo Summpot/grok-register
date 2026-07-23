@@ -15,13 +15,14 @@ from grok_register.do_egress.pool import (
     shutdown_local,
     socks_urls,
 )
-from grok_register.do_egress.settings import is_do_pool_source
+from grok_register.do_egress.settings import is_do_pool_source, resolve_egress_slot_count
 
 __all__ = [
     "destroy_all",
     "ensure_pool",
     "is_do_pool_source",
     "is_enabled",
+    "resolve_egress_slot_count",
     "rotate_for_proxy",
     "settings_from_config",
     "shutdown_local",

@@ -7,6 +7,7 @@ import secrets
 import string
 import threading
 import time
+import uuid
 from typing import Any, Callable
 from urllib.parse import urlparse
 
@@ -16,13 +17,22 @@ from grok_register.do_egress.api import (
     public_ipv4,
     wait_droplet_active,
 )
-from grok_register.do_egress.local_tunnel import apply_local, socks_url, stop_local
+from grok_register.do_egress.local_tunnel import (
+    apply_local,
+    probe_remote_ready,
+    socks_url,
+    ssh_remote_service_ready,
+    stop_local,
+    tcp_port_open,
+)
 from grok_register.do_egress.remote_bootstrap import render_user_data
 from grok_register.do_egress.settings import (
     DoEgressSettings,
     is_do_pool_source,
+    resolve_egress_slot_count,
     settings_from_config,
 )
+from grok_register.do_egress.singbox_bin import ensure_singbox_for_settings
 from grok_register.do_egress.state import EgressNode, EgressState, load_state, save_state
 
 LogFn = Callable[[str], None]
@@ -218,18 +228,34 @@ def _create_slot(
     log: LogFn | None,
 ) -> EgressNode:
     secret = _secret()
+    tuic_uuid = str(uuid.uuid4())
+    tuic_password = _secret(24)
+    trojan_password = _secret(24)
     name = settings.droplet_name(slot)
     user_data = render_user_data(
         remote_port=settings.remote_port,
         remote_secret=secret,
         singbox_version=settings.singbox_version,
+        tuic_port=settings.tuic_port,
+        tuic_uuid=tuic_uuid,
+        tuic_password=tuic_password,
+        trojan_port=settings.trojan_port,
+        trojan_password=trojan_password,
         allow_from_cidrs=settings.allow_from_cidrs,
+        enable_hy2=settings.enable_hy2,
+        enable_tuic=settings.enable_tuic,
+        enable_trojan=settings.enable_trojan,
     )
     node = EgressNode(
         slot=slot,
         name=name,
         remote_port=settings.remote_port,
+        tuic_port=settings.tuic_port,
+        trojan_port=settings.trojan_port,
         remote_secret=secret,
+        tuic_uuid=tuic_uuid,
+        tuic_password=tuic_password,
+        trojan_password=trojan_password,
         socks_port=settings.socks_port(slot),
         region=settings.region,
         status="creating",
@@ -269,19 +295,113 @@ def _create_slot(
     state.upsert(node)
     save_state(settings.state_path, state)
     _log(
-        f"[egress] slot {slot}: active ip={ip}; wait bootstrap {settings.ready_wait_s}s",
+        f"[egress] slot {slot}: active ip={ip}; probing remote sing-box "
+        f"(max {settings.ready_wait_s}s, poll {settings.ready_poll_s}s)",
         log,
     )
-    time.sleep(max(0, int(settings.ready_wait_s)))
+    working = _wait_remote_singbox(settings, node, log=log)
+    node.working_protocols = working
     node.status = "ready"
     node.last_error = ""
     state.upsert(node)
     save_state(settings.state_path, state)
     _log(
-        f"[egress] slot {slot}: ready socks={settings.socks_listen}:{node.socks_port}",
+        f"[egress] slot {slot}: ready socks={settings.socks_listen}:{node.socks_port} "
+        f"via={working}",
         log,
     )
     return node
+
+
+def _wait_remote_singbox(
+    settings: DoEgressSettings,
+    node: EgressNode,
+    *,
+    log: LogFn | None = None,
+) -> list[str]:
+    """Poll until at least one tunnel protocol works. Returns working protocol names.
+
+    ready_wait_s = max wait; ready_poll_s = interval.
+    SSH probe is optional (usually fails without matching local private key).
+    When Trojan is enabled, waits for TCP port open as cloud-init progress signal.
+    """
+    timeout_s = max(30, int(settings.ready_wait_s or 240))
+    poll_s = max(1, int(settings.ready_poll_s or 5))
+    deadline = time.time() + timeout_s
+    attempt = 0
+    last_detail = ""
+    t0 = time.time()
+    trojan_port = int(node.trojan_port or settings.trojan_port or 443)
+    saw_tcp = False
+
+    while time.time() < deadline:
+        attempt += 1
+
+        # Cloud-init progress: TCP trojan port opens only after sing-box starts
+        if settings.enable_trojan:
+            if not tcp_port_open(node.ip, trojan_port, timeout_s=3.0):
+                last_detail = (
+                    f"waiting tcp:{node.ip}:{trojan_port} "
+                    f"(cloud-init / sing-box / or path filtered)"
+                )
+                remain = deadline - time.time()
+                if remain <= 0:
+                    break
+                _log(
+                    f"[egress] slot {node.slot}: not ready yet attempt={attempt} "
+                    f"({last_detail}); retry in {min(poll_s, remain):.0f}s",
+                    log,
+                )
+                time.sleep(min(poll_s, max(0.5, remain)))
+                continue
+            if not saw_tcp:
+                saw_tcp = True
+                _log(
+                    f"[egress] slot {node.slot}: tcp:{trojan_port} open, probing tunnels…",
+                    log,
+                )
+
+        if settings.ssh_probe:
+            ssh_ok, ssh_detail = ssh_remote_service_ready(node.ip, timeout_s=6)
+            if ssh_ok:
+                _log(f"[egress] slot {node.slot}: {ssh_detail}", log)
+
+        ok, detail, working = probe_remote_ready(
+            settings, node, probe_timeout_s=12.0
+        )
+        last_detail = detail
+        if ok and working:
+            elapsed = time.time() - t0
+            _log(
+                f"[egress] slot {node.slot}: tunnel ready after "
+                f"{elapsed:.1f}s ({attempt} probe(s), working={working}, {detail})",
+                log,
+            )
+            return working
+
+        remain = deadline - time.time()
+        if remain <= 0:
+            break
+        _log(
+            f"[egress] slot {node.slot}: not ready yet attempt={attempt} "
+            f"({detail}); retry in {min(poll_s, remain):.0f}s",
+            log,
+        )
+        time.sleep(min(poll_s, max(0.5, remain)))
+
+    hint = ""
+    low = (last_detail or "").lower()
+    if "unreachable" in low or "i/o timeout" in low or "waiting tcp" in low:
+        hint = (
+            " 网络层到 VPS 不通（非账号密码问题）。"
+            " 建议: 1) config 里 do_egress.region 改为 sgp1/sgp2 试新加坡;"
+            " 2) trojan_port 保持 443;"
+            " 3) 本机 PowerShell: Test-NetConnection <ip> -Port 443"
+        )
+    raise TimeoutError(
+        f"slot {node.slot} ip={node.ip}: remote tunnel not ready within "
+        f"{timeout_s}s (last={last_detail}).{hint}"
+    )
 
 
 def _destroy_slot(
@@ -329,9 +449,10 @@ def ensure_pool(
 
     settings = settings_from_config(cfg)
     _require_token(settings)
-    target = int(size if size is not None else settings.pool_size)
-    if target < 0:
-        raise ValueError("pool size must be >= 0")
+    # Droplet count = min(pool_size, register threads) unless explicit size=
+    target = resolve_egress_slot_count(cfg, size=size)
+    if target < 1:
+        raise ValueError("pool size must be >= 1")
 
     with _lock:
         if _pool_ready and _enabled and not force and _active_settings is not None:
@@ -339,6 +460,9 @@ def ensure_pool(
             urls = [socks_url(_active_settings, n) for n in state.ready_nodes()]
             if len(urls) >= target:
                 return urls
+
+        # Auto-download sing-box for do_egress.singbox_version if missing
+        ensure_singbox_for_settings(settings, log=log)
 
         _active_settings = settings
         _active_cfg = dict(cfg or {})
@@ -348,8 +472,17 @@ def ensure_pool(
         client = DigitalOceanClient(settings.token)
 
         # Startup cleanup: never reuse stale Droplets from a prior crash/exit
+        protos = []
+        if settings.enable_hy2:
+            protos.append(f"hy2:{settings.remote_port}/udp")
+        if settings.enable_tuic:
+            protos.append(f"tuic:{settings.tuic_port}/udp")
+        if settings.enable_trojan:
+            protos.append(f"trojan:{settings.trojan_port}/tcp")
         _log(
-            f"[egress] startup cleanup (region={settings.region}) then create pool_size={target}",
+            f"[egress] startup cleanup (region={settings.region}) then create "
+            f"slots={target} (pool_size max={settings.pool_size}) "
+            f"protocols=[{', '.join(protos) or 'none'}] prefer={settings.protocol_prefer}",
             log,
         )
         # destroy_all takes lock — call internal cleanup without re-enter

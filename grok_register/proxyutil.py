@@ -462,7 +462,18 @@ def ensure_pool_from_config(cfg: dict | None) -> int:
     from grok_register.do_egress import ensure_pool as do_ensure, is_do_pool_source
 
     if is_do_pool_source(cfg):
-        urls = do_ensure(cfg, log=lambda m: print(m, flush=True))
+        # Optional: cfg["_egress_slots"] or register_threads caps droplet count
+        size_override = None
+        if cfg.get("_egress_slots") is not None:
+            try:
+                size_override = int(cfg["_egress_slots"])
+            except Exception:
+                size_override = None
+        urls = do_ensure(
+            cfg,
+            log=lambda m: print(m, flush=True),
+            size=size_override,
+        )
         n = _install_pool_urls(urls)
         if n > 0:
             with _pool_lock:

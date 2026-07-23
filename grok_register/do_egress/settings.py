@@ -39,7 +39,17 @@ class DoEgressSettings:
     droplet_tag: str = "grok-reg-egress"
     name_prefix: str = "reg-egress"
     pool_size: int = 3
-    remote_port: int = 8443
+    remote_port: int = 8443  # Hysteria2 UDP
+    tuic_port: int = 8444  # TUIC UDP
+    # 443 looks like HTTPS — often works when high ports are filtered (CN→DO)
+    trojan_port: int = 443
+    enable_hy2: bool = True
+    enable_tuic: bool = True
+    enable_trojan: bool = True
+    # Prefer TCP first when UDP is commonly blocked to the VPS
+    protocol_prefer: str = "trojan"
+    # SSH probe needs a local private key matching DO ssh_key_ids — off by default
+    ssh_probe: bool = False
     singbox_version: str = "1.11.15"
     socks_listen: str = "127.0.0.1"
     socks_base_port: int = 17891
@@ -48,7 +58,8 @@ class DoEgressSettings:
     state_dir: str = "output/do_egress"
     singbox_exe: str = "sing-box"
     create_timeout_s: int = 180
-    ready_wait_s: int = 90
+    # Max seconds to wait for remote sing-box readiness (polled, not fixed sleep)
+    ready_wait_s: int = 240
     ready_poll_s: int = 5
     allow_from_cidrs: list[str] = field(default_factory=list)
     rotate_on_disable: bool = True
@@ -120,6 +131,22 @@ def settings_from_config(cfg: dict[str, Any] | None) -> DoEgressSettings:
         name_prefix=str(_get(cfg, "name_prefix", nest.get("name_prefix") or "reg-egress")),
         pool_size=int(_get(cfg, "pool_size", nest.get("pool_size") or 3) or 3),
         remote_port=int(_get(cfg, "remote_port", nest.get("remote_port") or 8443) or 8443),
+        tuic_port=int(_get(cfg, "tuic_port", nest.get("tuic_port") or 8444) or 8444),
+        trojan_port=int(
+            _get(cfg, "trojan_port", nest.get("trojan_port") or 443) or 443
+        ),
+        enable_hy2=bool(nest.get("enable_hy2", cfg.get("do_egress_enable_hy2", True))),
+        enable_tuic=bool(nest.get("enable_tuic", cfg.get("do_egress_enable_tuic", True))),
+        enable_trojan=bool(
+            nest.get("enable_trojan", cfg.get("do_egress_enable_trojan", True))
+        ),
+        protocol_prefer=str(
+            _get(cfg, "protocol_prefer", nest.get("protocol_prefer") or "trojan")
+        )
+        .strip()
+        .lower()
+        or "trojan",
+        ssh_probe=bool(nest.get("ssh_probe", cfg.get("do_egress_ssh_probe", False))),
         singbox_version=str(
             _get(cfg, "singbox_version", nest.get("singbox_version") or "1.11.15")
         ),
@@ -136,7 +163,9 @@ def settings_from_config(cfg: dict[str, Any] | None) -> DoEgressSettings:
         create_timeout_s=int(
             _get(cfg, "create_timeout_s", nest.get("create_timeout_s") or 180) or 180
         ),
-        ready_wait_s=int(_get(cfg, "ready_wait_s", nest.get("ready_wait_s") or 90) or 90),
+        ready_wait_s=int(
+            _get(cfg, "ready_wait_s", nest.get("ready_wait_s") or 240) or 240
+        ),
         ready_poll_s=int(_get(cfg, "ready_poll_s", nest.get("ready_poll_s") or 5) or 5),
         allow_from_cidrs=allow,
         rotate_on_disable=bool(
@@ -163,6 +192,31 @@ def is_do_pool_source(cfg: dict[str, Any] | None) -> bool:
     if cfg.get("do_egress_enabled") is True:
         return True
     return False
+
+
+def resolve_egress_slot_count(
+    cfg: dict[str, Any] | None,
+    *,
+    size: int | None = None,
+    threads: int | None = None,
+) -> int:
+    """How many Droplets to create: min(pool_size, threads).
+
+    When register threads < pool_size, only create that many nodes.
+    """
+    settings = settings_from_config(cfg)
+    max_n = max(1, int(settings.pool_size or 1))
+    if size is not None:
+        return max(1, min(int(size), max_n))
+    thr = threads
+    if thr is None and cfg:
+        try:
+            thr = int(cfg.get("register_threads") or 0) or None
+        except Exception:
+            thr = None
+    if thr is not None and thr > 0:
+        return max(1, min(int(thr), max_n))
+    return max_n
 
 
 # silence unused import warning for OUTPUT_DIR if any tooling flags it

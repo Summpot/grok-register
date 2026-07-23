@@ -16,11 +16,18 @@ class EgressNode:
     droplet_id: int | None = None
     name: str = ""
     ip: str = ""
-    remote_port: int = 8443
-    remote_secret: str = ""
+    remote_port: int = 8443  # Hysteria2 UDP port
+    tuic_port: int = 8444
+    trojan_port: int = 8445
+    remote_secret: str = ""  # HY2 password (+ default TUIC/Trojan password)
+    tuic_uuid: str = ""
+    tuic_password: str = ""
+    trojan_password: str = ""
     socks_port: int = 0
     region: str = ""
     status: str = "empty"  # empty | creating | ready | error
+    # Which protocols passed readiness probe (hy2/tuic/trojan)
+    working_protocols: list[str] = field(default_factory=list)
     created_at: float = 0.0
     last_error: str = ""
 
@@ -29,16 +36,26 @@ class EgressNode:
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> EgressNode:
+        secret = str(d.get("remote_secret") or d.get("hy2_password") or "")
+        wp = d.get("working_protocols") or []
+        if not isinstance(wp, list):
+            wp = []
         return cls(
             slot=int(d.get("slot", 0)),
             droplet_id=(int(d["droplet_id"]) if d.get("droplet_id") is not None else None),
             name=str(d.get("name") or ""),
             ip=str(d.get("ip") or ""),
             remote_port=int(d.get("remote_port") or d.get("hy2_port") or 8443),
-            remote_secret=str(d.get("remote_secret") or d.get("hy2_password") or ""),
+            tuic_port=int(d.get("tuic_port") or 8444),
+            trojan_port=int(d.get("trojan_port") or 8445),
+            remote_secret=secret,
+            tuic_uuid=str(d.get("tuic_uuid") or ""),
+            tuic_password=str(d.get("tuic_password") or secret),
+            trojan_password=str(d.get("trojan_password") or secret),
             socks_port=int(d.get("socks_port") or 0),
             region=str(d.get("region") or ""),
             status=str(d.get("status") or "empty"),
+            working_protocols=[str(x) for x in wp],
             created_at=float(d.get("created_at") or 0.0),
             last_error=str(d.get("last_error") or ""),
         )
