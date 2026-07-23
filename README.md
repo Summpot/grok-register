@@ -3,7 +3,7 @@
 [![Grok Register — CLI registration + optional grok2api upload](assets/banner.png)](https://github.com/van7517/grok-register-mint)
 
 **Grok Register** — 面向 Windows 的 Grok 账号注册自动化工具（二次开发版）  
-支持 CLI、临时邮箱、多线程批量注册，以及可选写入 **grok2api**（Web 池；可选本地 Device Flow 后导入 Build）。
+支持 CLI、临时邮箱、多线程批量注册，以及可选写入 **grok2api**（Web 池；可选本地 OAuth / `grok login --oauth` 后导入 Build）。
 
 <p>
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-blue.svg" alt="License: MIT"></a>
@@ -34,7 +34,7 @@
 
 上游项目与社区讨论仍见 [AaronL725/grok-register](https://github.com/AaronL725/grok-register) 与 [linux.do](https://linux.do)。本 README 只描述 **本仓库当前行为**。
 
-主路径：注册拿 SSO → 写 `accounts_*.txt` →（可选）上传 grok2api Web 池 →（可选）本地 Device Flow 后导入 Build 凭据。
+主路径：生成 Build OAuth authorize 链接（同 `grok login --oauth`）→ **在该链接内完成注册** → consent / loopback 直接拿 Build token → 写账号 / 导入 grok2api。
 
 ## 目录
 
@@ -85,7 +85,7 @@ uv run python -m grok_register.cli --count 1 --threads 1
 - Cloudflare / Exchange（@*.onmicrosoft.com）/ DuckMail / YYDS 临时邮箱
 - Chrome / Chromium 真实浏览器注册流程（含 Turnstile 扩展 `turnstilePatch/`）
 - 成功账号实时写入 `output/accounts_*.txt` / `output/accounts_cli.txt`
-- 可选写入本地 / 远端 **grok2api Web** 池（**默认关闭**；Build 仅走本地 Device Flow 后导入）
+- 可选写入本地 / 远端 **grok2api Web** 池（**默认关闭**；Build 仅走本地 OAuth 后导入）
 - 页面卡住检测、邮箱重试、浏览器复用与回收
 
 ## 环境要求
@@ -262,7 +262,7 @@ uv run python cf_mail_debug.py `
 
 | mode | 目标 | 认证 | 接口 |
 | --- | --- | --- | --- |
-| `v3` | [chenyme/grok2api](https://github.com/chenyme/grok2api) Go v3 | 管理员用户名/密码登录拿 Bearer | Web: `POST /api/admin/v1/accounts/web/import`；Build: 本地 Device Flow 后 `accounts` 导入 |
+| `v3` | [chenyme/grok2api](https://github.com/chenyme/grok2api) Go v3 | 管理员用户名/密码登录拿 Bearer | Web: `POST /api/admin/v1/accounts/web/import`；Build: 本地 OAuth 后 `accounts` 导入 |
 | `legacy` | 旧版 Python / jiujiu 池 | `app_key` 查询参数 | `/tokens/add`、`/admin/api/tokens/add` 等 |
 | `auto`（默认） | 先 v3，失败再 legacy | 两种都配齐时可用 | 自动降级 |
 
@@ -285,11 +285,11 @@ uv run python cf_mail_debug.py `
 说明：
 
 - **v3 Web**：注册成功后的 SSO JWT 作为 Grok Web 账号导入（`grok2api_auto_add_remote`）。
-- **远端 Build**：本地 Device Flow 拿到 OAuth 后导入 Build 池（`grok2api_auto_add_build`）；**不再**调用远端 `web/convert-to-build`。
+- **远端 Build**：`local_build_device_flow=true` 时以 OAuth authorize URL 为注册入口，注册完成后直接拿到 Build 凭据并导入（`grok2api_auto_add_build`）；**不再**调用远端 `web/convert-to-build`。
 - Web tier：`ssoBasic`→`basic`，`ssoSuper`→`super`，可用 `grok2api_v3_web_tier` 覆盖。
 - **legacy**：`grok2api_remote_base` 可填站点根或 `/admin/api`；优先 `/tokens/add`。
 - 打开远端：设 `grok2api_auto_add_remote: true`，并填 `remote_base` +（v3 密码 **或** legacy `app_key`）。
-- **bot 标记**：Device Flow 后若 Build `access_token` 含 `bot_flag_source=1`，默认视为失败且不上传；设 `allow_bot_flagged: true` 可仍保存/导入（部分场景账号仍可用）。
+- **bot 标记**：OAuth 后若 Build `access_token` 含 `bot_flag_source=1`，默认视为失败且不上传；设 `allow_bot_flagged: true` 可仍保存/导入（部分场景账号仍可用）。
 - **注册参数采集**（分析 bot_flag / 失败原因）：默认开启，每次尝试写入 `output/reg_stats.jsonl`（含 Turnstile 鼠标路径随机数、pace 时延参数、点击次数、代理 host、邮箱域名、JWT 安全 claims 子集等，**不含**密码/完整 token）。
 - **成功口径**（primary）：
   - `build_clean`：拿到无 `bot_flag` 的 Build token（真正成功）
@@ -475,7 +475,7 @@ uv run python -u register_cli.py `
   → 完成注册，拿到 SSO
   → 写入 accounts 文件
   → （可选）写 grok2api 本地/远端 Web 池
-  → （可选）本地 Device Flow → 导入远端 Build 凭据
+  → （local_build_device_flow）OAuth authorize 入口注册 → Build token → 导入
 ```
 
 因此：

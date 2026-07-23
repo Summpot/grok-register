@@ -135,8 +135,8 @@ DEFAULT_CONFIG = {
     "grok2api_local_token_file": "",
     "grok2api_pool_name": "ssoBasic",
     "grok2api_auto_add_remote": False,
-    # When true and Device Flow produced Build OAuth, upload that credential to
-    # remote grok2api Build pool. Never calls remote Web→Build convert API.
+    # When true and OAuth (Auth Code + PKCE) produced Build credentials, upload
+    # that credential to remote grok2api Build pool. Never calls remote Web→Build.
     "grok2api_auto_add_build": False,
     "grok2api_remote_base": "",
     "grok2api_remote_app_key": "",
@@ -147,8 +147,9 @@ DEFAULT_CONFIG = {
     "grok2api_remote_password": "",
     # v3 web tier: auto | basic | super | heavy
     "grok2api_v3_web_tier": "auto",
-    # Local Web SSO → Build OAuth Device Flow (aligned with grok-build device_code).
-    # Browser-only verify/approve via the registration page; no HTTP fallback.
+    # When true: open Grok Build OAuth authorize URL as the signup entry
+    # (same as `grok login --oauth`), complete registration inside that session,
+    # then consent + loopback → Build tokens. No separate post-SSO convert.
     "local_build_device_flow": False,
     "local_build_auth_dir": "./output/build_auths",
     # When true, Build access_token with bot_flag_source=1 is still saved/uploaded
@@ -826,109 +827,75 @@ def _parse_go_import_sse(text: str) -> dict | None:
     return last_complete
 
 
-def convert_sso_to_build_local(
-    raw_token,
-    email="",
-    log_callback=None,
-    page=None,
-) -> dict | None:
-    """Run local Web SSO → Build Device Flow after registration.
+def oauth_entry_enabled() -> bool:
+    """True when registration should start from Build OAuth authorize URL."""
+    return bool(config.get("local_build_device_flow", False))
 
-    Returns the OAuth seed dict on success, or None if disabled / failed.
 
-    Special flags on the returned seed:
-      - ``_bot_flagged``: access_token JWT has bot_flag_source=1. By default
-        treated as registration failure (nothing saved/imported); when
-        ``allow_bot_flagged`` is true, still save/import and mark the flag.
-      - ``_remote_build_imported``: Build OAuth uploaded to grok2api.
+def _tls_get_oauth_session():
+    return getattr(_tls, "oauth_session", None)
 
-    When Device Flow succeeds (and not rejected as bot-flagged), callers must
-    NOT import Grok Web for this account — only Build.
+
+def _tls_set_oauth_session(session) -> None:
+    _tls.oauth_session = session
+
+
+def _tls_clear_oauth_session() -> None:
+    session = getattr(_tls, "oauth_session", None)
+    if session is not None:
+        try:
+            session.close()
+        except Exception:
+            pass
+    _tls.oauth_session = None
+
+
+def begin_oauth_register_session(page=None, log_callback=None):
+    """Start OAuth loopback + PKCE; return authorize URL for signup entry.
+
+    Stores the session on the thread-local so finish_oauth_register can complete it.
     """
-    if not config.get("local_build_device_flow", False):
-        return None
-    token = _normalize_sso_token(raw_token)
-    if not token:
-        if log_callback:
-            log_callback("[Debug] local Device Flow: empty SSO, skip")
-        return None
-    try:
-        from grok_register.sso_build import (
-            access_token_has_bot_flag,
-            convert_sso_to_build,
-            save_build_auth,
-            SSOBuildError,
-        )
-    except Exception as exc:
-        if log_callback:
-            log_callback(f"[Debug] local Device Flow import failed: {exc}")
-        return None
+    from grok_register.sso_build import OAuthRegisterSession, SSOBuildError
 
+    _tls_clear_oauth_session()
     ua = str(config.get("user_agent", "") or "").strip()
-    proxies = get_proxies()
+    session = OAuthRegisterSession(user_agent=ua or None)
     active_page = page
     if active_page is None:
         try:
             active_page = _get_page()
         except Exception:
             active_page = None
-    if active_page is None:
-        if log_callback:
-            log_callback(
-                "[!] 本地 Device Flow 需要注册浏览器 page（仅 browser 模式，无 HTTP 回退）"
-            )
-        return None
-
-    if log_callback:
-        log_callback("[*] 本地 Web→Build Device Flow 开始 (mode=browser)")
     try:
-        pace_stage(
-            "register_pace_device_flow_pre_s",
-            1.0,
-            2.4,
-            None,
-            name="device_flow_pre",
-            log_callback=log_callback,
-        )
+        auth_url = session.begin(active_page, log_callback=log_callback)
+    except SSOBuildError:
+        session.close()
+        raise
     except Exception:
-        pass
-    try:
-        if log_callback:
-            try:
-                from grok_register.proxyutil import proxy_log_label
+        session.close()
+        raise
+    _tls_set_oauth_session(session)
+    return auth_url, session
 
-                pl = proxy_log_label(
-                    str((proxies or {}).get("https") or (proxies or {}).get("http") or "")
-                )
-            except Exception:
-                pl = "browser"
-            log_callback(
-                f"[*] Device Flow: mint/poll=page.request "
-                f"(同注册浏览器出口, proxy={pl}); "
-                f"SSO 仅写浏览器 cookie; Continue/Allow 同页"
-            )
-        seed = convert_sso_to_build(
-            token,
-            email=email,
-            user_agent=ua,
-            proxies=proxies,
-            page=active_page,
-            mode="browser",
-            log_callback=log_callback,
-        )
-    except SSOBuildError as exc:
-        if log_callback:
-            log_callback(f"[!] 本地 Device Flow 失败: {exc}")
+
+def _finalize_build_seed(seed: dict, email="", log_callback=None) -> dict | None:
+    """Apply bot_flag policy, save auth file, optional remote Build import."""
+    if not seed:
         return None
+    try:
+        from grok_register.sso_build import (
+            access_token_has_bot_flag,
+            save_build_auth,
+        )
     except Exception as exc:
         if log_callback:
-            log_callback(f"[!] 本地 Device Flow 异常: {exc}")
+            log_callback(f"[Debug] Build seed finalize import failed: {exc}")
         return None
 
+    seed = dict(seed)
     seed["_bot_flagged"] = False
     seed["_remote_build_imported"] = False
 
-    # Bot-flagged Build tokens: reject by default; allow when allow_bot_flagged=true.
     if access_token_has_bot_flag(seed.get("access_token")):
         seed["_bot_flagged"] = True
         try:
@@ -976,7 +943,6 @@ def convert_sso_to_build_local(
         if log_callback:
             log_callback(f"[Debug] 保存 Build OAuth 文件失败: {exc}")
 
-    # Device Flow 成功：只导入 Build，不再走 Web 池 / 远端 convert。
     if config.get("grok2api_auto_add_remote", False) and config.get(
         "grok2api_auto_add_build", False
     ):
@@ -989,9 +955,167 @@ def convert_sso_to_build_local(
             if log_callback:
                 log_callback(f"[Debug] 远端 Build 导入失败（本地凭据已保存）: {exc}")
     elif config.get("grok2api_auto_add_build", False) and log_callback:
-        # Build 开关开着但远端 Web 关着：仍只本地落盘
-        log_callback("[*] Device Flow 完成：已跳过 Grok Web 导入（仅本地 Build）")
+        log_callback("[*] OAuth 完成：已跳过 Grok Web 导入（仅本地 Build）")
     return seed
+
+
+def finish_oauth_register(
+    email="",
+    log_callback=None,
+    page=None,
+) -> dict | None:
+    """Complete OAuth after signup inside the authorize session (consent + tokens).
+
+    Uses the thread-local session started by ``begin_oauth_register_session`` /
+    ``open_signup_page``. Returns Build seed dict or None.
+    """
+    if not oauth_entry_enabled():
+        return None
+    session = _tls_get_oauth_session()
+    if session is None or not getattr(session, "started", False):
+        if log_callback:
+            log_callback("[Debug] OAuth finish: no active authorize session")
+        return None
+
+    active_page = page
+    if active_page is None:
+        try:
+            active_page = _get_page()
+        except Exception:
+            active_page = None
+    if active_page is None:
+        if log_callback:
+            log_callback("[!] OAuth finish 需要浏览器 page")
+        _tls_clear_oauth_session()
+        return None
+
+    try:
+        pace_stage(
+            "register_pace_device_flow_pre_s",
+            1.0,
+            2.4,
+            None,
+            name="oauth_finish",
+            log_callback=log_callback,
+        )
+    except Exception:
+        pass
+
+    try:
+        from grok_register.sso_build import SSOBuildError
+
+        if log_callback:
+            log_callback(
+                "[*] OAuth: 注册已完成，等待 consent / loopback callback → token"
+            )
+        seed = session.finish(
+            active_page,
+            email=email,
+            log_callback=log_callback,
+            already_registered=True,
+        )
+    except SSOBuildError as exc:
+        if log_callback:
+            log_callback(f"[!] OAuth finish 失败: {exc}")
+        _tls_clear_oauth_session()
+        return None
+    except Exception as exc:
+        if log_callback:
+            log_callback(f"[!] OAuth finish 异常: {exc}")
+        _tls_clear_oauth_session()
+        return None
+    finally:
+        _tls.oauth_session = None
+
+    return _finalize_build_seed(seed, email=email, log_callback=log_callback)
+
+
+def convert_sso_to_build_local(
+    raw_token,
+    email="",
+    log_callback=None,
+    page=None,
+) -> dict | None:
+    """Obtain Build OAuth after registration.
+
+    Preferred path: finish the authorize session that was opened as the signup
+    entry (``local_build_device_flow`` / OAuth entry). Fallback: legacy convert
+    from Web SSO cookie when no session is active.
+    """
+    if not config.get("local_build_device_flow", False):
+        return None
+
+    # Primary: registration already ran inside the OAuth authorize URL.
+    session = _tls_get_oauth_session()
+    if session is not None and getattr(session, "started", False):
+        return finish_oauth_register(email=email, log_callback=log_callback, page=page)
+
+    # Legacy fallback: SSO already obtained, open a new authorize with cookies.
+    token = _normalize_sso_token(raw_token)
+    if not token:
+        if log_callback:
+            log_callback("[Debug] local OAuth: empty SSO and no authorize session")
+        return None
+    try:
+        from grok_register.sso_build import (
+            convert_sso_to_build,
+            SSOBuildError,
+        )
+    except Exception as exc:
+        if log_callback:
+            log_callback(f"[Debug] local OAuth import failed: {exc}")
+        return None
+
+    ua = str(config.get("user_agent", "") or "").strip()
+    proxies = get_proxies()
+    active_page = page
+    if active_page is None:
+        try:
+            active_page = _get_page()
+        except Exception:
+            active_page = None
+    if active_page is None:
+        if log_callback:
+            log_callback(
+                "[!] 本地 OAuth 需要注册浏览器 page（Auth Code + PKCE / loopback）"
+            )
+        return None
+
+    if log_callback:
+        log_callback(
+            "[*] 本地 Web→Build OAuth 回退路径 (已有 SSO → 新 authorize session)"
+        )
+    try:
+        pace_stage(
+            "register_pace_device_flow_pre_s",
+            1.0,
+            2.4,
+            None,
+            name="oauth_pre",
+            log_callback=log_callback,
+        )
+    except Exception:
+        pass
+    try:
+        seed = convert_sso_to_build(
+            token,
+            email=email,
+            user_agent=ua,
+            proxies=proxies,
+            page=active_page,
+            mode="browser",
+            log_callback=log_callback,
+        )
+    except SSOBuildError as exc:
+        if log_callback:
+            log_callback(f"[!] 本地 OAuth 失败: {exc}")
+        return None
+    except Exception as exc:
+        if log_callback:
+            log_callback(f"[!] 本地 OAuth 异常: {exc}")
+        return None
+
+    return _finalize_build_seed(seed, email=email, log_callback=log_callback)
 
 
 def apply_post_register_pools(
@@ -1001,13 +1125,13 @@ def apply_post_register_pools(
     log_callback=None,
     page=None,
 ) -> dict:
-    """Device Flow + grok2api pool routing after SSO is obtained.
+    """OAuth (Auth Code + PKCE) + grok2api pool routing after SSO is obtained.
 
     Returns a result dict:
       ok: bool — overall registration acceptance
       bot_flagged: bool
       build_seed: dict | None
-      skipped_web: bool — True when Device Flow succeeded (Web must not be imported)
+      skipped_web: bool — True when OAuth succeeded (Web must not be imported)
     """
     result = {
         "ok": True,
@@ -1022,7 +1146,7 @@ def apply_post_register_pools(
         )
     except Exception as exc:
         if log_callback:
-            log_callback(f"[Debug] local Device Flow: {exc}")
+            log_callback(f"[Debug] local OAuth: {exc}")
         build_seed = None
     result["build_seed"] = build_seed
 
@@ -1041,13 +1165,13 @@ def apply_post_register_pools(
         return result
 
     if build_seed:
-        # Device Flow succeeded → Build only, never import Grok Web.
+        # OAuth succeeded → Build only, never import Grok Web.
         result["skipped_web"] = True
         if log_callback:
-            log_callback("[*] Device Flow 成功：跳过 Grok Web 导入（仅 Grok Build）")
+            log_callback("[*] OAuth 成功：跳过 Grok Web 导入（仅 Grok Build）")
         return result
 
-    # No local Device Flow result → keep legacy Web import path.
+    # No local OAuth result → keep legacy Web import path.
     try:
         add_token_to_grok2api_pools(
             sso_token,
@@ -1211,7 +1335,7 @@ def add_token_to_grok2api_remote_pool_v3(
       POST {root}/api/admin/v1/accounts/web/import  (multipart files/file)
 
     Does not call remote Web→Build convert. Build credentials are only uploaded
-    via local Device Flow + add_build_credential_to_grok2api_remote.
+    via local OAuth (Auth Code + PKCE) + add_build_credential_to_grok2api_remote.
     skip_build_convert is accepted for call-site compatibility and ignored.
     """
     del skip_build_convert  # retained for API compatibility; convert path removed
@@ -2839,6 +2963,10 @@ def start_browser(log_callback=None):
 def stop_browser():
     # Quit only THIS thread's browser. Do not funnel through module globals —
     # concurrent workers race on those and can steal each other's objects.
+    try:
+        _tls_clear_oauth_session()
+    except Exception:
+        pass
     b = _tls_get_browser()
     p = _tls_get_page()
     _user_data_path = None
@@ -2887,6 +3015,10 @@ def prepare_browser_for_next_account(log_callback=None):
     When proxy pool rotates each account, restart browser so the new proxy
     (and auth extension) takes effect.
     """
+    try:
+        _tls_clear_oauth_session()
+    except Exception:
+        pass
     browser = _tls_get_browser()
     page = _tls_get_page()
     if config.get("proxy_pool_enabled") and config.get("proxy_pool_rotate_each_account", True):
@@ -3721,6 +3853,31 @@ def click_email_signup_button(timeout=28, log_callback=None, cancel_callback=Non
     raise Exception("未找到「使用邮箱注册」按钮")
 
 
+def _resolve_signup_entry_url(page=None, log_callback=None) -> str:
+    """Return OAuth authorize URL when Build OAuth is enabled, else plain sign-up."""
+    if not oauth_entry_enabled():
+        return SIGNUP_URL
+    try:
+        auth_url, _session = begin_oauth_register_session(
+            page=page, log_callback=log_callback
+        )
+        if log_callback:
+            log_callback(
+                "[*] 注册入口: Build OAuth authorize URL "
+                "(在该会话内完成注册 → consent → Build token)"
+            )
+            # Truncate for logs (full URL is long with PKCE params).
+            log_callback(f"[*] OAuth URL: {auth_url[:120]}…")
+        return auth_url
+    except Exception as exc:
+        if log_callback:
+            log_callback(
+                f"[!] 生成 OAuth 链接失败，回退 accounts.x.ai/sign-up: {exc}"
+            )
+        _tls_clear_oauth_session()
+        return SIGNUP_URL
+
+
 def open_signup_page(log_callback=None, cancel_callback=None):
     # thread-local page/browser (multi-thread safe)
     browser, page = _ensure_thread_browser(log_callback=log_callback)
@@ -3730,25 +3887,28 @@ def open_signup_page(log_callback=None, cancel_callback=None):
         if log_callback:
             log_callback("[*] 浏览器已启动")
 
-    def _navigate(b, p):
+    # Prefer OAuth authorize URL so registration happens inside grok login --oauth.
+    entry_url = _resolve_signup_entry_url(page=page, log_callback=log_callback)
+
+    def _navigate(b, p, url):
         tab = None
         try:
             tab = b.get_tab(0) if b is not None else None
         except Exception:
             tab = None
         if tab is None:
-            tab = b.new_tab(SIGNUP_URL) if b is not None else None
+            tab = b.new_tab(url) if b is not None else None
             if tab is not None:
                 _tls_set_page(tab)
                 _mirror_thread_browser_globals(b, tab)
             return tab
         _tls_set_page(tab)
-        tab.get(SIGNUP_URL)
+        tab.get(url)
         _mirror_thread_browser_globals(b, tab)
         return tab
 
     try:
-        page = _navigate(browser, page)
+        page = _navigate(browser, page, entry_url)
     except Exception as e:
         if log_callback:
             log_callback(f"[Debug] 打开URL异常: {e}")
@@ -3757,10 +3917,13 @@ def open_signup_page(log_callback=None, cancel_callback=None):
             _tls_set_browser(None)
             _tls_set_page(None)
             browser, page = restart_browser(log_callback=log_callback)
-            page = _navigate(browser, page)
+            # Re-mint OAuth URL after browser restart (loopback still valid if
+            # session survived; if not, create a new authorize session).
+            entry_url = _resolve_signup_entry_url(page=page, log_callback=log_callback)
+            page = _navigate(browser, page, entry_url)
         else:
             try:
-                page = browser.new_tab(SIGNUP_URL)
+                page = browser.new_tab(entry_url)
                 _tls_set_page(page)
                 _mirror_thread_browser_globals(browser, page)
             except Exception as e2:
@@ -3770,14 +3933,16 @@ def open_signup_page(log_callback=None, cancel_callback=None):
                     _tls_set_browser(None)
                     _tls_set_page(None)
                 browser, page = restart_browser(log_callback=log_callback)
+                entry_url = _resolve_signup_entry_url(page=None, log_callback=log_callback)
                 # Must use the NEW browser from restart — never the stale local.
-                page = browser.new_tab(SIGNUP_URL)
+                page = browser.new_tab(entry_url)
                 _tls_set_page(page)
                 _mirror_thread_browser_globals(browser, page)
 
     if page is None:
         browser, page = _ensure_thread_browser(log_callback=log_callback, force_restart=True)
-        page = browser.new_tab(SIGNUP_URL)
+        entry_url = _resolve_signup_entry_url(page=None, log_callback=log_callback)
+        page = browser.new_tab(entry_url)
         _tls_set_page(page)
         _mirror_thread_browser_globals(browser, page)
 
@@ -3818,6 +3983,7 @@ def open_signup_page(log_callback=None, cancel_callback=None):
             log_callback(f"[*] 当前URL: {page.url}")
         except Exception:
             log_callback("[*] 当前URL: <unknown>")
+    # From OAuth sign-in, switch to email sign-up and fill the form.
     click_email_signup_button(
         log_callback=log_callback, cancel_callback=cancel_callback
     )

@@ -841,7 +841,7 @@ def _analysis_hints(
     web_n = by_outcome.get("web_only", 0)
     build_n = bot_n + clean_n
     if build_n == 0:
-        hints.append("暂无 Build token 样本；检查 local_build_device_flow / Device Flow。")
+        hints.append("暂无 Build token 样本；检查 local_build_device_flow / OAuth。")
         return hints
     if bot_n == 0:
         hints.append(

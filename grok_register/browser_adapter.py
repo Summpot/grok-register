@@ -1674,7 +1674,7 @@ class PatchrightPage:
     def request(self):
         """Playwright APIRequestContext (same proxy/cookies as this browser).
 
-        Prefer ``context.request`` when available so Device Flow HTTP stays
+        Prefer ``context.request`` when available so OAuth token HTTP stays
         aligned with the registration egress even if the tab navigates.
         """
         if self._ctx is not None:

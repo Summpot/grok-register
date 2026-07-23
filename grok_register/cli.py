@@ -296,7 +296,15 @@ def _register_one_body(
     for mail_try in range(1, max_mail_retry + 1):
         try:
             log(worker_id, f"--- 第 {idx}/{total} 个账号, 邮箱尝试 {mail_try}/{max_mail_retry} ---")
-            log(worker_id, "1. 打开注册页")
+            log(
+                worker_id,
+                "1. 打开注册页"
+                + (
+                    " (OAuth authorize / grok login --oauth)"
+                    if reg.oauth_entry_enabled()
+                    else ""
+                ),
+            )
             reg.open_signup_page(log_callback=lambda m: log(worker_id, m), cancel_callback=cancel)
             log(worker_id, "2. 创建邮箱并提交")
             email, dev_token = reg.fill_email_and_submit(
@@ -669,7 +677,7 @@ def main() -> int:
     if g2a_remote or g2a_build or local_build:
         print(
             f"[*] grok2api: remote_web={g2a_remote} remote_build={g2a_build} "
-            f"local_device_flow={local_build} mode=browser "
+            f"oauth_entry={local_build} mode=browser "
             f"base={cfg0.get('grok2api_remote_base') or '(empty)'}",
             flush=True,
         )
