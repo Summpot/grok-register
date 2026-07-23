@@ -3,16 +3,17 @@
 Aligned with grok-build (`xai-grok-shell` `auth/device_code.rs` +
 `auth/config.rs` default OAuth2 client contract).
 
-Browser-only (HTTP auto verify/approve no longer works against the live IdP):
+Same sequence as grok-build device_code login (no HTTP pre-validate of Web SSO):
 
-  1. Validate SSO cookie against accounts.x.ai (page.request / context.request)
+  1. Seed registration-browser cookies with Web SSO (so Continue/Allow stays logged in)
   2. POST auth.x.ai/oauth2/device/code  (Grok CLI client_id + scopes + referrer)
   3. Open verification_uri_complete in the registration browser; Continue + Allow
-  4. Poll oauth2/token for access_token + refresh_token (page.request)
+  4. Poll oauth2/token for access_token + refresh_token
 
-Device/token HTTP always uses the registration browser's Playwright
-APIRequestContext (``page.request`` or ``context.request``) so TLS and
-proxy match the browser egress — no separate curl_cffi / socks tunnel.
+Device/token HTTP uses Playwright ``page.request`` / ``context.request`` (same
+proxy/TLS as the registration browser). Cookie is **not** sent on those API
+calls — grok-build's reqwest client also mints/polls without SSO cookies; SSO
+only powers the browser verify/approve pages.
 """
 
 from __future__ import annotations
@@ -39,7 +40,8 @@ SSO_BUILD_SCOPE = (
 )
 SSO_BUILD_REFERRER = "grok-build"
 # Identity headers sent by grok-build device_code.rs (metrics + provider routing).
-SSO_BUILD_CLIENT_VERSION = "0.2.109"
+# Keep in sync with crates/codegen/xai-grok-version (CARGO_PKG_VERSION).
+SSO_BUILD_CLIENT_VERSION = "0.2.110"
 SSO_BUILD_CLIENT_SURFACE = "cli"
 
 SSO_ISSUER = "https://auth.x.ai"
@@ -381,12 +383,16 @@ class SSOBuildFlow:
         name: str = "",
         log_callback: Callable[[str], None] | None = None,
     ) -> dict[str, Any]:
+        # grok-build never GETs accounts.x.ai before minting a device code.
+        # page.request against accounts.x.ai often returns HTTP 403 (WAF/bot),
+        # which is not a real SSO rejection. Seed the browser jar and proceed;
+        # a dead SSO still surfaces as sign-in bounce during verify/approve.
         self._ensure_browser_sso_cookies(page)
-        status, final_url, _body = self._do("GET", SSO_ACCOUNTS_URL, None)
-        if status == 401 or url_is_auth_bounce(final_url):
-            raise SSOBuildError("Grok Web SSO rejected", status=status, unauthorized=True)
-        if status < 200 or status >= 400:
-            raise SSOBuildError(f"validate SSO failed HTTP {status}", status=status)
+        if log_callback:
+            log_callback(
+                "[*] Device Flow: browser SSO cookies seeded "
+                "(skip accounts.x.ai HTTP pre-validate; match grok-build)"
+            )
 
         device = self._start_device(log_callback=log_callback)
         verify_url = device.get("verification_uri_complete") or ""
@@ -399,6 +405,14 @@ class SSOBuildFlow:
             page.get(verify_url, timeout=45)
         except Exception as exc:
             raise SSOBuildError(f"browser open verify failed: {exc}") from exc
+
+        # After landing on the verify page, reject explicit auth bounces early.
+        landing = self._page_url(page)
+        if url_is_auth_bounce(landing):
+            raise SSOBuildError(
+                "Grok Web SSO rejected (device verify bounced to sign-in)",
+                unauthorized=True,
+            )
 
         # Pull any new cookies set by the auth pages
         self._import_browser_cookies(page)
@@ -2161,7 +2175,9 @@ return {{ ok: true, via: 'form_submit' }};
         current_form = form
         for _redirect in range(9):
             if api_client:
-                # grok-build device_code.rs: Accept JSON + x-grok-client-* headers
+                # grok-build device_code.rs: Accept JSON + x-grok-client-* headers.
+                # No Cookie — mint/poll are unauthenticated API calls (SSO only
+                # matters for the browser Continue/Allow pages).
                 headers = {
                     "Accept": "application/json",
                     "User-Agent": self.user_agent,
@@ -2174,9 +2190,9 @@ return {{ ok: true, via: 'form_submit' }};
                     "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
                     "User-Agent": self.user_agent,
                 }
-            cookie = self.cookies.header()
-            if cookie:
-                headers["Cookie"] = cookie
+                cookie = self.cookies.header()
+                if cookie:
+                    headers["Cookie"] = cookie
             data = None
             if current_form is not None:
                 data = urlencode(current_form)

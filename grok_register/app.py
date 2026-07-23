@@ -903,8 +903,9 @@ def convert_sso_to_build_local(
             except Exception:
                 pl = "browser"
             log_callback(
-                f"[*] Device Flow HTTP: page.request/context.request "
-                f"(同注册浏览器出口, proxy={pl}); Continue/Allow 同页"
+                f"[*] Device Flow: mint/poll=page.request "
+                f"(同注册浏览器出口, proxy={pl}); "
+                f"SSO 仅写浏览器 cookie; Continue/Allow 同页"
             )
         seed = convert_sso_to_build(
             token,
