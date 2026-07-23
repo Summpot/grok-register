@@ -3338,6 +3338,40 @@ def refresh_active_page():
         return _tls_get_page()
 
 
+# OAuth authorize lands on sign-in; switch to sign-up first.
+# Prefer exact / short labels so we never hit "Sign in".
+SIGN_UP_SWITCH_LABELS = [
+    "Sign up",
+    "Sign Up",
+    "Create account",
+    "Create an account",
+    "Create Account",
+    "注册",
+    "创建账户",
+    "创建账号",
+    "免费注册",
+    "还没有账号？注册",
+    "没有账号？注册",
+]
+
+SIGN_UP_SWITCH_SELECTORS = [
+    'a:has-text("Sign up")',
+    'a:has-text("Sign Up")',
+    'button:has-text("Sign up")',
+    'button:has-text("Sign Up")',
+    '[role="button"]:has-text("Sign up")',
+    '[role="link"]:has-text("Sign up")',
+    'a:has-text("Create account")',
+    'button:has-text("Create account")',
+    'a:has-text("注册")',
+    'button:has-text("注册")',
+    'a:has-text("创建账户")',
+    'a:has-text("创建账号")',
+    'a[href*="sign-up"]',
+    'a[href*="signup"]',
+    'a[href*="register"]',
+]
+
 # Labels / selectors for the email signup entry on accounts.x.ai.
 # Provider UI copy drifts between locales and A/B variants.
 EMAIL_SIGNUP_LABELS = [
@@ -3659,10 +3693,263 @@ def _js_click_email_signup(page) -> dict | None:
         return {"ok": False, "reason": f"js_error:{exc}"}
 
 
+_CLICK_SIGN_UP_SWITCH_JS = r"""
+const normalize = (s) => (s || '').replace(/\s+/g, ' ').trim();
+const lower = (s) => normalize(s).toLowerCase();
+const isVisible = (el) => {
+  try {
+    const st = window.getComputedStyle(el);
+    const r = el.getBoundingClientRect();
+    return st.display !== 'none' && st.visibility !== 'hidden'
+      && Number(st.opacity || '1') > 0.05 && r.width > 2 && r.height > 2
+      && !el.disabled && el.getAttribute('aria-disabled') !== 'true';
+  } catch (e) {
+    return true;
+  }
+};
+// Match "Sign up" / "Create account" / 注册 — never "Sign in" / "Log in".
+const isSignUpSwitch = (text) => {
+  const t = lower(text);
+  if (!t) return false;
+  if (/\bsign\s*in\b|\blog\s*in\b|登录|登入|登陆/.test(t) && !/\bsign\s*up\b|注册/.test(t)) {
+    return false;
+  }
+  // Exact-ish short CTAs
+  if (t === 'sign up' || t === 'signup' || t === 'create account' || t === 'create an account') {
+    return true;
+  }
+  if (t === '注册' || t === '创建账户' || t === '创建账号' || t === '免费注册') {
+    return true;
+  }
+  // "Don't have an account? Sign up" / "没有账号？注册"
+  if (/\bsign\s*up\b/.test(t) && !/\bsign\s*in\b/.test(t)) return true;
+  if (/注册/.test(t) && !/登录|登入|登陆/.test(t)) return true;
+  if (/create\s+(an\s+)?account/.test(t)) return true;
+  return false;
+};
+const collect = (root, out, depth) => {
+  if (!root || depth > 6) return;
+  let nodes;
+  try {
+    nodes = root.querySelectorAll('a, button, [role="button"], [role="link"], input[type="button"], input[type="submit"], span, div');
+  } catch (e) {
+    return;
+  }
+  for (const el of nodes) {
+    out.push(el);
+  }
+  let all;
+  try { all = root.querySelectorAll('*'); } catch (e) { return; }
+  for (const el of all) {
+    try {
+      if (el.shadowRoot) collect(el.shadowRoot, out, depth + 1);
+    } catch (e) {}
+  }
+};
+// Prefer real links/buttons with href containing sign-up.
+const hrefCandidates = [];
+try {
+  for (const a of document.querySelectorAll('a[href*="sign-up"], a[href*="signup"], a[href*="register"]')) {
+    if (isVisible(a)) hrefCandidates.push(a);
+  }
+} catch (e) {}
+for (const el of hrefCandidates) {
+  let text = '';
+  try {
+    text = normalize(el.innerText || el.textContent || el.getAttribute('aria-label') || '');
+  } catch (e) {}
+  try {
+    el.scrollIntoView({ block: 'center', inline: 'center', behavior: 'auto' });
+  } catch (e) {}
+  try {
+    el.click();
+    return { ok: true, via: 'href_signup', text: text.slice(0, 60), href: String(el.href || '').slice(0, 120) };
+  } catch (e) {}
+}
+const candidates = [];
+collect(document, candidates, 0);
+// Prefer shorter exact matches first.
+const scored = [];
+for (const el of candidates) {
+  let text = '';
+  try {
+    text = normalize(el.innerText || el.textContent || el.value || el.getAttribute('aria-label') || '');
+  } catch (e) {
+    text = '';
+  }
+  if (!isSignUpSwitch(text) || !isVisible(el)) continue;
+  // Skip huge containers that merely contain "Sign up" nested text.
+  if (text.length > 64) continue;
+  const tag = (el.tagName || '').toLowerCase();
+  const prio = (tag === 'a' || tag === 'button' || el.getAttribute('role') === 'button' || el.getAttribute('role') === 'link') ? 0 : 1;
+  scored.push({ el, text, prio, len: text.length });
+}
+scored.sort((a, b) => (a.prio - b.prio) || (a.len - b.len));
+for (const item of scored) {
+  try {
+    item.el.scrollIntoView({ block: 'center', inline: 'center', behavior: 'auto' });
+  } catch (e) {}
+  try {
+    item.el.click();
+    return { ok: true, via: 'js_signup_switch', text: item.text.slice(0, 60) };
+  } catch (e) {
+    return { ok: false, reason: 'click_threw', text: item.text.slice(0, 60), error: String(e && e.message || e) };
+  }
+}
+return {
+  ok: false,
+  reason: 'no_signup_switch',
+  samples: candidates.slice(0, 16).map((el) => {
+    try {
+      return normalize(el.innerText || el.textContent || el.value || '').slice(0, 40);
+    } catch (e) {
+      return '';
+    }
+  }).filter(Boolean),
+};
+"""
+
+
+def _js_click_sign_up_switch(page) -> dict | None:
+    if page is None:
+        return None
+    try:
+        raw = page.run_js(_CLICK_SIGN_UP_SWITCH_JS)
+        return raw if isinstance(raw, dict) else None
+    except Exception as exc:
+        return {"ok": False, "reason": f"js_error:{exc}"}
+
+
+def _page_looks_like_sign_in(page) -> bool:
+    """True when current auth page is sign-in (needs Sign up switch first)."""
+    if page is None:
+        return False
+    try:
+        url = str(getattr(page, "url", "") or "").lower()
+    except Exception:
+        url = ""
+    if "sign-up" in url or "signup" in url or "register" in url:
+        return False
+    if "sign-in" in url or "signin" in url or "log-in" in url or "login" in url:
+        return True
+    try:
+        hit = page.run_js(
+            r"""
+const normalize = (s) => (s || '').replace(/\s+/g, ' ').trim().toLowerCase();
+const body = normalize(document.body && (document.body.innerText || document.body.textContent) || '');
+const hasSignIn = /\bsign\s*in\b|\blog\s*in\b|登录|登入/.test(body.slice(0, 800));
+const hasSignUpLink = !!Array.from(document.querySelectorAll('a, button, [role="button"], [role="link"]')).find((el) => {
+  const t = normalize(el.innerText || el.textContent || el.getAttribute('aria-label') || '');
+  if (!t || t.length > 48) return false;
+  if (/\bsign\s*in\b|\blog\s*in\b|登录/.test(t) && !/\bsign\s*up\b|注册/.test(t)) return false;
+  return t === 'sign up' || t === 'signup' || /\bsign\s*up\b/.test(t) || t === '注册' || t === '创建账户' || t === '创建账号' || /create\s+(an\s+)?account/.test(t);
+});
+// Sign-in page: body says sign in AND a Sign up switch is present.
+return !!(hasSignIn && hasSignUpLink);
+"""
+        )
+        return hit is True
+    except Exception:
+        return False
+
+
+def click_sign_up_switch(timeout=12, log_callback=None, cancel_callback=None) -> bool:
+    """On OAuth/login pages, click Sign up before the email-signup CTA.
+
+    Returns True if we clicked (or already appear to be on sign-up / email form).
+    """
+    browser, page = _ensure_thread_browser(log_callback=log_callback)
+    if _signup_email_form_ready(page):
+        return True
+    # Already on sign-up path with email CTA — no switch needed.
+    probe = _probe_signup_page(page)
+    if probe.get("hasEmailEntry") and not _page_looks_like_sign_in(page):
+        return True
+
+    deadline = time.time() + max(float(timeout or 12), 4.0)
+    attempt = 0
+    while time.time() < deadline:
+        raise_if_cancelled(cancel_callback)
+        attempt += 1
+        page = _tls_get_page() or page
+        if page is None:
+            browser, page = _ensure_thread_browser(log_callback=log_callback)
+        if page is None:
+            sleep_with_cancel(0.4, cancel_callback)
+            continue
+
+        if _signup_email_form_ready(page):
+            return True
+        if not _page_looks_like_sign_in(page):
+            # Not a clear sign-in page — try one click anyway if OAuth entry,
+            # else skip.
+            if attempt > 1:
+                return True
+
+        hit = None
+        try:
+            hit = page.click_by_text(
+                SIGN_UP_SWITCH_LABELS, role="link", timeout_ms=1500
+            )
+        except Exception:
+            hit = None
+        if not hit:
+            try:
+                hit = page.click_by_text(
+                    SIGN_UP_SWITCH_LABELS, role="button", timeout_ms=1200
+                )
+            except Exception:
+                hit = None
+        if not hit:
+            try:
+                if page.click_first(SIGN_UP_SWITCH_SELECTORS, timeout_ms=1500):
+                    hit = "selector"
+            except Exception:
+                pass
+        if not hit:
+            js_result = _js_click_sign_up_switch(page)
+            if isinstance(js_result, dict) and js_result.get("ok"):
+                hit = f"js:{js_result.get('via')}:{js_result.get('text') or ''}"
+            elif log_callback and attempt == 1 and isinstance(js_result, dict):
+                samples = js_result.get("samples") or []
+                if samples:
+                    log_callback(
+                        f"[Debug] 未找到 Sign up 切换: "
+                        f"{[str(s)[:28] for s in samples[:8]]}"
+                    )
+
+        if hit:
+            if log_callback:
+                log_callback(f"[*] 已点击「Sign up」切换到注册页 ({hit})")
+            sleep_with_cancel(0.9, cancel_callback)
+            # Wait briefly for sign-up methods to hydrate.
+            wait_deadline = min(time.time() + 5.0, deadline)
+            while time.time() < wait_deadline:
+                if _signup_email_form_ready(page):
+                    return True
+                probe2 = _probe_signup_page(page)
+                if probe2.get("hasEmailEntry"):
+                    return True
+                if not _page_looks_like_sign_in(page):
+                    return True
+                sleep_with_cancel(0.35, cancel_callback)
+            return True
+
+        sleep_with_cancel(0.5, cancel_callback)
+
+    if log_callback:
+        try:
+            log_callback(f"[Debug] Sign up 切换未命中，当前 URL: {page.url if page else '?'}")
+        except Exception:
+            log_callback("[Debug] Sign up 切换未命中")
+    return False
+
+
 def click_email_signup_button(timeout=28, log_callback=None, cancel_callback=None):
     """Find and click the email signup CTA on accounts.x.ai.
 
     Hardening vs flaky SPA / CF interstitial:
+      - if on sign-in (OAuth entry), click Sign up first
       - skip if email form already present
       - wait for hydrated auth buttons
       - Playwright role/text/selectors + shadow-DOM JS deep click
@@ -3680,6 +3967,18 @@ def click_email_signup_button(timeout=28, log_callback=None, cancel_callback=Non
         if log_callback:
             log_callback("[*] 已在邮箱注册表单，跳过入口按钮")
         return True
+
+    # OAuth authorize → sign-in: must switch to Sign up before email CTA.
+    try:
+        if _page_looks_like_sign_in(page) or oauth_entry_enabled():
+            click_sign_up_switch(
+                timeout=min(12.0, max(deadline - time.time(), 4.0)),
+                log_callback=log_callback,
+                cancel_callback=cancel_callback,
+            )
+    except Exception as exc:
+        if log_callback:
+            log_callback(f"[Debug] Sign up 切换异常: {exc}")
 
     while time.time() < deadline:
         raise_if_cancelled(cancel_callback)
@@ -3742,9 +4041,17 @@ def click_email_signup_button(timeout=28, log_callback=None, cancel_callback=Non
                         f"({reloaded}/{reload_budget})"
                     )
                 try:
-                    page.get(SIGNUP_URL)
+                    reload_url = _active_signup_reload_url()
+                    page.get(reload_url)
                     page.wait.doc_loaded()
                     sleep_with_cancel(1.5, cancel_callback)
+                    # After reload of OAuth authorize, land on sign-in again.
+                    if oauth_entry_enabled() or _page_looks_like_sign_in(page):
+                        click_sign_up_switch(
+                            timeout=8,
+                            log_callback=log_callback,
+                            cancel_callback=cancel_callback,
+                        )
                 except Exception as exc:
                     if log_callback:
                         log_callback(f"[Debug] 注册页刷新失败: {exc}")
@@ -3752,6 +4059,17 @@ def click_email_signup_button(timeout=28, log_callback=None, cancel_callback=Non
 
         _human_pause_cancel(0.15, 0.4, cancel_callback)
         hit = None
+
+        # 0) Still on sign-in? try Sign up switch again before email CTA.
+        if _page_looks_like_sign_in(page):
+            try:
+                click_sign_up_switch(
+                    timeout=4,
+                    log_callback=log_callback,
+                    cancel_callback=cancel_callback,
+                )
+            except Exception:
+                pass
 
         # 1) Playwright role / text (short timeouts to avoid blowing the budget)
         try:
@@ -3820,9 +4138,16 @@ def click_email_signup_button(timeout=28, log_callback=None, cancel_callback=Non
                     f"(visible={probe.get('visibleButtons')!r}, reload={reloaded})"
                 )
             try:
-                page.get(SIGNUP_URL)
+                reload_url = _active_signup_reload_url()
+                page.get(reload_url)
                 page.wait.doc_loaded()
                 sleep_with_cancel(1.5, cancel_callback)
+                if oauth_entry_enabled() or _page_looks_like_sign_in(page):
+                    click_sign_up_switch(
+                        timeout=8,
+                        log_callback=log_callback,
+                        cancel_callback=cancel_callback,
+                    )
             except Exception as exc:
                 if log_callback:
                     log_callback(f"[Debug] 注册页刷新失败: {exc}")
@@ -3876,6 +4201,16 @@ def _resolve_signup_entry_url(page=None, log_callback=None) -> str:
             )
         _tls_clear_oauth_session()
         return SIGNUP_URL
+
+
+def _active_signup_reload_url() -> str:
+    """Prefer live OAuth authorize URL so reloads keep the same auth session."""
+    session = _tls_get_oauth_session()
+    if session is not None:
+        url = str(getattr(session, "authorize_url", "") or "").strip()
+        if url:
+            return url
+    return SIGNUP_URL
 
 
 def open_signup_page(log_callback=None, cancel_callback=None):
