@@ -349,6 +349,64 @@ class SSOBuildFlowTests(unittest.TestCase):
             self.assertEqual(SSOBuildFlow._device_start_backoff_secs(5), 60.0)
             self.assertEqual(SSOBuildFlow._device_start_backoff_secs(8), 60.0)
 
+    def test_request_uses_page_request_api(self):
+        """Device/token HTTP must go through page.request (not curl)."""
+        device_body = json.dumps(
+            {
+                "device_code": "dev-pw",
+                "user_code": "PAGE-0001",
+                "verification_uri": "https://accounts.x.ai/oauth2/device",
+                "interval": 5,
+                "expires_in": 600,
+            }
+        ).encode()
+
+        class FakeApiResponse:
+            def __init__(self, status, body, url=""):
+                self.status = status
+                self._body = body
+                self.url = url
+                self.headers = {"content-type": "application/json"}
+
+            def body(self):
+                return self._body
+
+            def headers_array(self):
+                return [{"name": "content-type", "value": "application/json"}]
+
+        calls = []
+
+        class FakeApi:
+            def get(self, url, **kwargs):
+                calls.append(("GET", url, kwargs))
+                return FakeApiResponse(200, b"ok", url)
+
+            def post(self, url, **kwargs):
+                calls.append(("POST", url, kwargs.get("data"), kwargs))
+                return FakeApiResponse(200, device_body, url)
+
+        page = MagicMock()
+        page.request = FakeApi()
+
+        flow = SSOBuildFlow("sso-token-value")
+        flow._request_page = page
+        import grok_register.sso_build as sso_mod
+
+        sso_mod._device_start_next_ok_at = 0.0
+        with patch("grok_register.sso_build.time.sleep", return_value=None):
+            device = flow._start_device()
+        self.assertEqual(device["device_code"], "dev-pw")
+        self.assertTrue(any(c[0] == "POST" and c[1].endswith("/oauth2/device/code") for c in calls))
+        # max_redirects=0 so _do keeps manual redirect control
+        post_kwargs = next(c[3] for c in calls if c[0] == "POST")
+        self.assertEqual(post_kwargs.get("max_redirects"), 0)
+
+    def test_request_requires_page_api(self):
+        flow = SSOBuildFlow("sso-token-value")
+        with self.assertRaises(SSOBuildError) as ctx:
+            flow._request("GET", "https://accounts.x.ai/", headers={}, data=None)
+        self.assertIn("page.request", str(ctx.exception))
+
     def test_empty_sso_raises(self):
         with self.assertRaises(SSOBuildError):
             SSOBuildFlow("")

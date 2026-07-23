@@ -5,10 +5,14 @@ Aligned with grok-build (`xai-grok-shell` `auth/device_code.rs` +
 
 Browser-only (HTTP auto verify/approve no longer works against the live IdP):
 
-  1. Validate SSO cookie against accounts.x.ai (HTTP)
+  1. Validate SSO cookie against accounts.x.ai (page.request / context.request)
   2. POST auth.x.ai/oauth2/device/code  (Grok CLI client_id + scopes + referrer)
   3. Open verification_uri_complete in the registration browser; Continue + Allow
-  4. Poll oauth2/token for access_token + refresh_token (HTTP)
+  4. Poll oauth2/token for access_token + refresh_token (page.request)
+
+Device/token HTTP always uses the registration browser's Playwright
+APIRequestContext (``page.request`` or ``context.request``) so TLS and
+proxy match the browser egress — no separate curl_cffi / socks tunnel.
 """
 
 from __future__ import annotations
@@ -23,9 +27,6 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import parse_qsl, urlencode, urljoin, urlparse, urlunparse
-
-from curl_cffi import requests as curl_requests
-import requests as std_requests
 
 # Frozen OAuth2 client contract — keep in sync with grok-build
 # crates/codegen/xai-grok-shell/src/auth/config.rs (default_oauth2_scopes).
@@ -51,7 +52,6 @@ DEFAULT_USER_AGENT = (
     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36"
 )
 MAX_BODY = 2 << 20
-DEFAULT_IMPERSONATE = "chrome136"
 # device_code.rs: DEFAULT_DEVICE_POLL_INTERVAL_SECS / DEVICE_SLOW_DOWN_INCREMENT
 DEFAULT_DEVICE_POLL_INTERVAL_SECS = 5
 DEVICE_SLOW_DOWN_INCREMENT_SECS = 5
@@ -221,25 +221,47 @@ class _CookieJar:
     def capture_from_response(self, response) -> None:
         try:
             jar = getattr(response, "cookies", None)
-            if jar is None:
-                return
-            # curl_cffi / requests cookie jar
-            if hasattr(jar, "items"):
-                for name, value in jar.items():
-                    self.set(name, value)
-            for cookie in getattr(jar, "jar", []) or []:
-                try:
-                    self.set(cookie.name, cookie.value)
-                except Exception:
-                    pass
+            if jar is not None:
+                # curl_cffi / requests cookie jar (tests / legacy adapters)
+                if hasattr(jar, "items"):
+                    for name, value in jar.items():
+                        self.set(name, value)
+                for cookie in getattr(jar, "jar", []) or []:
+                    try:
+                        self.set(cookie.name, cookie.value)
+                    except Exception:
+                        pass
         except Exception:
             pass
-        # Also parse Set-Cookie headers (some backends expose only headers)
+        # Parse Set-Cookie headers (Playwright headers_array + dict backends)
         try:
+            raw_list: list[str] = []
+            arr = getattr(response, "headers_array", None)
+            if callable(arr):
+                try:
+                    arr = arr()
+                except Exception:
+                    arr = None
+            if not arr:
+                arr = getattr(response, "_headers_array", None) or []
+            for item in arr or []:
+                try:
+                    if isinstance(item, dict):
+                        name = str(item.get("name") or "")
+                        value = str(item.get("value") or "")
+                    elif isinstance(item, (list, tuple)) and len(item) >= 2:
+                        name, value = str(item[0]), str(item[1])
+                    else:
+                        continue
+                    if name.lower() == "set-cookie" and value:
+                        raw_list.append(value)
+                except Exception:
+                    continue
             headers = getattr(response, "headers", None) or {}
-            raw_list = []
             if hasattr(headers, "getlist"):
-                raw_list = headers.getlist("Set-Cookie") or headers.getlist("set-cookie") or []
+                raw_list.extend(
+                    headers.getlist("Set-Cookie") or headers.getlist("set-cookie") or []
+                )
             if not raw_list:
                 single = headers.get("Set-Cookie") or headers.get("set-cookie")
                 if single:
@@ -249,7 +271,8 @@ class _CookieJar:
                 if "=" not in part:
                     continue
                 name, value = part.split("=", 1)
-                if "max-age=0" in str(raw).lower() or "expires=thu, 01 jan 1970" in str(raw).lower():
+                low = str(raw).lower()
+                if "max-age=0" in low or "expires=thu, 01 jan 1970" in low:
                     self.delete(name)
                 else:
                     self.set(name, value)
@@ -257,11 +280,55 @@ class _CookieJar:
             pass
 
 
+class _PlaywrightHttpResponse:
+    """Normalize Playwright APIResponse to the shape expected by ``_do`` / cookie jar."""
+
+    def __init__(self, api_response: Any):
+        self._raw = api_response
+        self.status_code = int(getattr(api_response, "status", 0) or 0)
+        try:
+            body = api_response.body()
+        except Exception:
+            body = b""
+        if isinstance(body, str):
+            body = body.encode("utf-8", errors="replace")
+        elif not isinstance(body, (bytes, bytearray)):
+            body = bytes(body or b"")
+        self.content = bytes(body)
+        try:
+            self.text = self.content.decode("utf-8", errors="replace")
+        except Exception:
+            self.text = ""
+        try:
+            self.url = str(getattr(api_response, "url", "") or "")
+        except Exception:
+            self.url = ""
+        try:
+            self.headers = dict(getattr(api_response, "headers", None) or {})
+        except Exception:
+            self.headers = {}
+        # Preserve multi Set-Cookie entries (dict headers collapse duplicates).
+        arr: list[Any] = []
+        try:
+            fn = getattr(api_response, "headers_array", None)
+            if callable(fn):
+                arr = list(fn() or [])
+        except Exception:
+            arr = []
+        self._headers_array = arr
+        self.cookies: dict[str, str] = {}
+
+    def headers_array(self) -> list[Any]:
+        return list(self._headers_array or [])
+
+
 class SSOBuildFlow:
     """Browser Device Flow converter aligned with grok-build device_code.rs.
 
-    Device code mint + token poll are HTTP; verify/approve require a live page
-    (pure HTTP SSO auto-approve is no longer accepted by the IdP).
+    Device code mint + token poll use Playwright ``page.request`` /
+    ``context.request`` (same proxy/TLS as the registration browser);
+    verify/approve require a live page (pure HTTP SSO auto-approve is no
+    longer accepted by the IdP).
     """
 
     def __init__(
@@ -270,7 +337,7 @@ class SSOBuildFlow:
         *,
         user_agent: str = DEFAULT_USER_AGENT,
         proxies: dict | None = None,
-        impersonate: str = DEFAULT_IMPERSONATE,
+        impersonate: str | None = None,
         timeout: float = 30.0,
         client_surface: str = SSO_BUILD_CLIENT_SURFACE,
     ):
@@ -278,11 +345,13 @@ class SSOBuildFlow:
         if not token:
             raise SSOBuildError("SSO token empty", unauthorized=True)
         self.user_agent = user_agent or DEFAULT_USER_AGENT
+        # Kept for call-site / logging compatibility; HTTP no longer tunnels via this.
         self.proxies = proxies or {}
-        self.impersonate = impersonate
+        _ = impersonate  # deprecated: was curl_cffi chrome profile
         self.timeout = timeout
         self.client_surface = (client_surface or SSO_BUILD_CLIENT_SURFACE).strip() or "cli"
         self.cookies = _CookieJar({"sso": token, "sso-rw": token})
+        self._request_page: Any = None
 
     def convert_with_browser(
         self,
@@ -292,10 +361,26 @@ class SSOBuildFlow:
         name: str = "",
         log_callback: Callable[[str], None] | None = None,
     ) -> dict[str, Any]:
-        """Browser for verify/approve; HTTP for device start + token poll."""
+        """Browser for verify/approve; device/token via page.request."""
         if page is None:
             raise SSOBuildError("browser Device Flow requires an active page")
 
+        self._request_page = page
+        try:
+            return self._convert_with_browser_bound(
+                page, email=email, name=name, log_callback=log_callback
+            )
+        finally:
+            self._request_page = None
+
+    def _convert_with_browser_bound(
+        self,
+        page,
+        *,
+        email: str = "",
+        name: str = "",
+        log_callback: Callable[[str], None] | None = None,
+    ) -> dict[str, Any]:
         self._ensure_browser_sso_cookies(page)
         status, final_url, _body = self._do("GET", SSO_ACCOUNTS_URL, None)
         if status == 401 or url_is_auth_bounce(final_url):
@@ -352,7 +437,7 @@ class SSOBuildFlow:
                 )
 
         if log_callback:
-            log_callback("[*] Device Flow: polling OAuth token")
+            log_callback("[*] Device Flow: polling OAuth token (page.request)")
         token = self._poll_token(
             device["device_code"],
             interval=float(device.get("interval") or DEFAULT_DEVICE_POLL_INTERVAL_SECS),
@@ -2125,145 +2210,98 @@ return {{ ok: true, via: 'form_submit' }};
         raise SSOBuildError("xAI OAuth too many redirects")
 
     @staticmethod
-    def _proxy_url_from_dict(proxies: dict | None) -> str:
-        """Extract a single proxy URL; prefer socks5h for HTTPS through SOCKS."""
-        if not proxies:
-            return ""
-        raw = (
-            str(proxies.get("https") or proxies.get("http") or proxies.get("all") or "")
-            .strip()
-        )
-        if not raw:
-            return ""
+    def _as_api_request(req: Any) -> Any | None:
+        if req is None:
+            return None
+        if hasattr(req, "get") and hasattr(req, "post"):
+            return req
+        return None
+
+    @classmethod
+    def _resolve_api_request(cls, page: Any) -> Any | None:
+        """Return Playwright APIRequestContext from page / browser context.
+
+        Preference order:
+          1. ``page.request`` (PatchrightPage / raw Playwright Page)
+          2. underlying ``page._p.request`` (adapter wrapper)
+          3. ``context.request`` via ``page._ctx`` / ``page.context``
+        """
+        if page is None:
+            return None
         try:
-            from grok_register.proxyutil import normalize_proxy_url
-
-            return normalize_proxy_url(raw, remote_dns=True)
+            found = cls._as_api_request(getattr(page, "request", None))
+            if found is not None:
+                return found
         except Exception:
-            if raw.startswith("socks5://"):
-                return "socks5h://" + raw[len("socks5://") :]
-            return raw
-
-    @staticmethod
-    def _is_tls_or_proxy_error(exc: BaseException) -> bool:
-        err = str(exc or "").lower()
-        needles = (
-            "socks",
-            "proxy",
-            "curl: (35)",
-            "curl: (97)",
-            "curl: (56)",
-            "ssl",
-            "tls",
-            "unexpected_eof",
-            "invalid library",
-            "failed to perform",
-            "max retries exceeded",
-        )
-        return any(n in err for n in needles)
+            pass
+        try:
+            pw = getattr(page, "_p", None)
+            if pw is not None:
+                found = cls._as_api_request(getattr(pw, "request", None))
+                if found is not None:
+                    return found
+                ctx = getattr(pw, "context", None)
+                found = cls._as_api_request(
+                    getattr(ctx, "request", None) if ctx is not None else None
+                )
+                if found is not None:
+                    return found
+        except Exception:
+            pass
+        for attr in ("_ctx", "context"):
+            try:
+                ctx = getattr(page, attr, None)
+                found = cls._as_api_request(
+                    getattr(ctx, "request", None) if ctx is not None else None
+                )
+                if found is not None:
+                    return found
+            except Exception:
+                continue
+        return None
 
     def _request(self, method: str, url: str, *, headers: dict, data: str | None):
-        """HTTP for device/token **always via register proxy when configured**.
+        """Device/token HTTP via Playwright page.request / context.request.
 
-        Fixes TLS-over-SOCKS for Device Flow (no silent direct fallback):
-          - normalize socks5 → socks5h (DNS on egress)
-          - curl_cffi uses singular ``proxy=`` + HTTP/1.1 over SOCKS
-          - retry without impersonate if impersonate+SOCKS TLS breaks
-          - std requests last with socks5h (requires PySocks)
+        Shares the registration browser's cookie jar, proxy, and TLS stack.
+        Manual redirects stay in ``_do`` (max_redirects=0).
         """
-        proxy_url = self._proxy_url_from_dict(self.proxies)
-        proxies_map = (
-            {"http": proxy_url, "https": proxy_url} if proxy_url else {}
-        )
-        # Slow tunnel: allow longer handshake
-        timeout = max(float(self.timeout or 30), 45.0 if proxy_url else 30.0)
+        page = self._request_page
+        api = self._resolve_api_request(page)
+        if api is None:
+            raise SSOBuildError(
+                "Device Flow HTTP requires page.request / context.request "
+                "(bind an active registration browser page)"
+            )
+        timeout_ms = int(max(float(self.timeout or 30), 45.0) * 1000)
         method_u = (method or "GET").upper()
-        last_exc: BaseException | None = None
+        hdrs = dict(headers or {})
 
-        # Ordered curl_cffi strategies (all stay on the same proxy)
-        curl_attempts: list[dict] = []
-        if proxy_url:
-            # 1) SOCKS + Chrome impersonate + HTTP/1.1 (most compatible over CONNECT)
-            curl_attempts.append(
-                {
-                    "proxy": proxy_url,
-                    "impersonate": self.impersonate,
-                    "http_version": "v1",
-                }
-            )
-            # 2) SOCKS without impersonate (avoids some BoringSSL+proxy bugs)
-            curl_attempts.append(
-                {
-                    "proxy": proxy_url,
-                    "http_version": "v1",
-                }
-            )
-            # 3) SOCKS + impersonate default HTTP version
-            curl_attempts.append(
-                {
-                    "proxy": proxy_url,
-                    "impersonate": self.impersonate,
-                }
-            )
-        else:
-            curl_attempts.append({"impersonate": self.impersonate})
-
-        for extra in curl_attempts:
+        def _dispatch(**extra: Any):
             kwargs: dict[str, Any] = {
-                "headers": headers,
-                "data": data,
-                "timeout": timeout,
-                "allow_redirects": False,
-                "verify": True,
+                "headers": hdrs,
+                "timeout": timeout_ms,
             }
             kwargs.update(extra)
-            # Prefer singular proxy= for curl_cffi; also pass proxies= for compatibility
-            if proxy_url:
-                kwargs["proxies"] = proxies_map
+            if method_u == "GET":
+                return api.get(url, **kwargs)
+            if method_u == "POST":
+                return api.post(url, data=data, **kwargs)
+            return api.fetch(url, method=method_u, data=data, **kwargs)
+
+        try:
             try:
-                if method_u == "GET":
-                    return curl_requests.get(url, **kwargs)
-                return curl_requests.post(url, **kwargs)
+                resp = _dispatch(max_redirects=0, fail_on_status_code=False)
             except TypeError:
-                # Older curl_cffi: drop http_version / proxy key variants
-                kwargs.pop("http_version", None)
                 try:
-                    if method_u == "GET":
-                        return curl_requests.get(url, **kwargs)
-                    return curl_requests.post(url, **kwargs)
-                except Exception as exc:
-                    last_exc = exc
-                    if not self._is_tls_or_proxy_error(exc):
-                        raise
-                    continue
-            except Exception as exc:
-                last_exc = exc
-                if not self._is_tls_or_proxy_error(exc):
-                    raise
-                continue
-
-        # std requests via socks5h (same proxy — no direct fallback)
-        if proxy_url or not self.proxies:
-            std_kwargs = {
-                "headers": headers,
-                "data": data,
-                "timeout": timeout,
-                "proxies": proxies_map if proxy_url else {"http": "", "https": ""},
-                "allow_redirects": False,
-                "verify": True,
-            }
-            try:
-                if method_u == "GET":
-                    return std_requests.get(url, **std_kwargs)
-                return std_requests.post(url, **std_kwargs)
-            except Exception as exc:
-                last_exc = exc
-
-        if last_exc:
+                    resp = _dispatch(max_redirects=0)
+                except TypeError:
+                    resp = _dispatch()
+        except Exception as exc:
             raise SSOBuildError(
-                f"xAI OAuth TLS via proxy failed ({method_u} {url}): {last_exc}"
-            ) from last_exc
-        raise SSOBuildError(f"xAI OAuth request failed: {method_u} {url}")
+                f"xAI OAuth via page.request failed ({method_u} {url}): {exc}"
+            ) from exc
+        return _PlaywrightHttpResponse(resp)
 
 
 def convert_sso_to_build(

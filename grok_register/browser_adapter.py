@@ -1670,6 +1670,27 @@ class PatchrightPage:
     def html(self) -> str:
         return self._p.content()
 
+    @property
+    def request(self):
+        """Playwright APIRequestContext (same proxy/cookies as this browser).
+
+        Prefer ``context.request`` when available so Device Flow HTTP stays
+        aligned with the registration egress even if the tab navigates.
+        """
+        if self._ctx is not None:
+            try:
+                return self._ctx.request
+            except Exception:
+                pass
+        return self._p.request
+
+    @property
+    def context(self):
+        """Underlying Playwright BrowserContext when available."""
+        if self._ctx is not None:
+            return self._ctx
+        return getattr(self._p, "context", None)
+
     def get(self, url: str, timeout: float | None = None, **kwargs):
         ms = int(timeout * 1000) if timeout else 30000
         try:

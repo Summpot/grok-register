@@ -893,7 +893,7 @@ def convert_sso_to_build_local(
     except Exception:
         pass
     try:
-        if log_callback and proxies:
+        if log_callback:
             try:
                 from grok_register.proxyutil import proxy_log_label
 
@@ -901,10 +901,10 @@ def convert_sso_to_build_local(
                     str((proxies or {}).get("https") or (proxies or {}).get("http") or "")
                 )
             except Exception:
-                pl = "proxy"
+                pl = "browser"
             log_callback(
-                f"[*] Device Flow HTTP: 经代理 TLS ({pl}, socks5h+HTTP/1.1); "
-                f"浏览器 Continue/Allow 同注册出口"
+                f"[*] Device Flow HTTP: page.request/context.request "
+                f"(同注册浏览器出口, proxy={pl}); Continue/Allow 同页"
             )
         seed = convert_sso_to_build(
             token,
