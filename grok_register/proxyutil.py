@@ -196,14 +196,27 @@ def is_proxy_failure(err: object) -> bool:
 def disable_proxy(proxy: str, reason: str = "", *, pool_file: str | None = None) -> bool:
     """Disable a proxy: memory filter + append disabled file + remove from active pool list/file.
 
-    Returns True if newly disabled (or already disabled).
+    When the pool is DO egress-backed, "disable" means recreate the Droplet behind
+    the same local SOCKS port (remote IP changes; local URL stays usable).
+
+    Returns True if newly disabled (or already disabled / rotated).
     """
     global _pool_list
     p = _normalize_proxy_line(proxy) or (proxy or "").strip()
     if not p:
         return False
-    hk = proxy_host_key(p)
     reason = (reason or "bad").replace("\n", " ")[:200]
+
+    # DO egress: rotate remote node, keep local SOCKS endpoint in the pool
+    try:
+        from grok_register.do_egress import is_enabled as _do_on, rotate_for_proxy
+
+        if _do_on() and rotate_for_proxy(p, reason=reason):
+            return True
+    except Exception:
+        pass
+
+    hk = proxy_host_key(p)
     ts = time.strftime("%Y-%m-%d %H:%M:%S")
 
     with _pool_lock:
@@ -410,8 +423,32 @@ def next_pool_proxy(mode: str = "random") -> str:
     return proxy
 
 
+def _install_pool_urls(urls: list[str]) -> int:
+    """Replace in-memory pool with explicit SOCKS/HTTP URLs (no file required)."""
+    global _pool_list, _pool_file, _pool_mtime, _pool_index, _pool_exhausted
+    items: list[str] = []
+    seen: set[str] = set()
+    for raw in urls:
+        p = _normalize_proxy_line(raw) or (raw or "").strip()
+        if not p or p in seen:
+            continue
+        seen.add(p)
+        items.append(p)
+    with _pool_lock:
+        _pool_list = items
+        _pool_file = None
+        _pool_mtime = None
+        _pool_index = 0
+        _pool_exhausted = not bool(items)
+    return len(items)
+
+
 def ensure_pool_from_config(cfg: dict | None) -> int:
     """Load pool if enabled in config. Returns pool size.
+
+    Sources:
+      - proxy_pool_source=do  → DigitalOcean egress (local SOCKS per node)
+      - default file          → proxy_pool_file lines
 
     If pool was auto-exhausted and file still empty, keep disabled.
     If file has proxies again (manual refill + process restart, or force), size>0.
@@ -420,6 +457,18 @@ def ensure_pool_from_config(cfg: dict | None) -> int:
     cfg = cfg or {}
     if not cfg.get("proxy_pool_enabled", False):
         return 0
+
+    # DigitalOcean egress pool (register-integrated; workers only see SOCKS URLs)
+    from grok_register.do_egress import ensure_pool as do_ensure, is_do_pool_source
+
+    if is_do_pool_source(cfg):
+        urls = do_ensure(cfg, log=lambda m: print(m, flush=True))
+        n = _install_pool_urls(urls)
+        if n > 0:
+            with _pool_lock:
+                _pool_exhausted = False
+        return n
+
     if _pool_exhausted:
         # allow recovery if file was refilled this process
         f = str(cfg.get("proxy_pool_file") or "all_proxies.txt").strip()

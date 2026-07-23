@@ -110,18 +110,42 @@ _next_idx = [1]
 _cancel_event = threading.Event()
 
 
+def _cleanup_do_egress(reason: str = "exit") -> None:
+    """Destroy DO egress Droplets + stop local tunnel (idempotent)."""
+    try:
+        from grok_register.do_egress import destroy_all, is_do_pool_source
+
+        cfg = getattr(reg, "config", {}) or {}
+        if not is_do_pool_source(cfg):
+            # Still try destroy if pool was started this process
+            from grok_register.do_egress import is_enabled as do_on
+
+            if not do_on():
+                return
+        print(f"[*] do_egress: cleaning droplets ({reason})…", flush=True)
+        n = destroy_all(cfg, log=lambda m: print(m, flush=True))
+        print(f"[*] do_egress: cleanup finished (ops≈{n})", flush=True)
+    except Exception as exc:
+        print(f"[!] do_egress cleanup failed: {exc}", flush=True)
+
+
 def _setup_signal_handler():
     """注册 SIGINT 处理器，使 Ctrl+C 可靠地停止所有线程。"""
     def _handler(sig_num, frame):
         _cancel_event.set()
         # 用 os.write 避免 print 在信号处理器中可能的死锁
         try:
-            sys.stderr.write("\n[!] 正在停止...（再次按 Ctrl+C 强制结束）\n")
+            sys.stderr.write("\n[!] 正在停止...（将清理 DO Droplet；再次按 Ctrl+C 强制结束）\n")
             sys.stderr.flush()
         except Exception:
             pass
     try:
         signal.signal(signal.SIGINT, _handler)
+    except Exception:
+        pass
+    # Windows / POSIX terminate
+    try:
+        signal.signal(signal.SIGTERM, _handler)
     except Exception:
         pass
 
@@ -654,12 +678,20 @@ def main() -> int:
 
         cfg0 = getattr(reg, "config", {}) or {}
         if cfg0.get("proxy_pool_enabled"):
+            src = str(cfg0.get("proxy_pool_source") or "file").strip().lower()
             n = ensure_pool_from_config(cfg0)
-            print(
-                f"[*] proxy_pool enabled file={cfg0.get('proxy_pool_file')} "
-                f"size={n} mode={cfg0.get('proxy_pool_mode', 'round_robin')}",
-                flush=True,
-            )
+            if src in ("do", "digitalocean", "do_egress", "egress"):
+                print(
+                    f"[*] proxy_pool source=do (local SOCKS egress) size={n} "
+                    f"mode={cfg0.get('proxy_pool_mode', 'random')}",
+                    flush=True,
+                )
+            else:
+                print(
+                    f"[*] proxy_pool enabled file={cfg0.get('proxy_pool_file')} "
+                    f"size={n} mode={cfg0.get('proxy_pool_mode', 'round_robin')}",
+                    flush=True,
+                )
         elif (cfg0.get("proxy") or "").strip():
             print(f"[*] proxy={proxy_log_label(str(cfg0.get('proxy')))}", flush=True)
     except Exception as exc:
@@ -725,6 +757,8 @@ def main() -> int:
         reg.shutdown_browser()
     except Exception:
         pass
+    # Always destroy DO egress Droplets on normal / Ctrl+C exit
+    _cleanup_do_egress("shutdown")
     # Last resort: kill leftover DrissionPage/automation Chrome orphans.
     try:
         reg.kill_orphaned_automation_browsers(log_callback=lambda m: log(0, m))

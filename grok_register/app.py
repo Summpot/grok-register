@@ -176,9 +176,23 @@ DEFAULT_CONFIG = {
     "register_browser_window_position": "-2400,100",
     "register_browser_window_size": "1000,800",
     "proxy_pool_enabled": True,
+    "proxy_pool_source": "file",  # file | do
     "proxy_pool_file": "all_proxies.txt",
     "proxy_pool_mode": "random",
     "proxy_pool_rotate_each_account": True,
+    # DigitalOcean egress (when proxy_pool_source=do). Workers still use local SOCKS only.
+    "do_egress": {
+        "token": "",
+        "region": "sfo3",
+        "size": "s-1vcpu-512mb-10gb",
+        "image": "ubuntu-24-04-x64",
+        "ssh_key_ids": [],
+        "pool_size": 3,
+        "socks_base_port": 17891,
+        "singbox_exe": "sing-box",
+        "ready_wait_s": 90,
+        "rotate_on_disable": True,
+    },
 }
 
 config = DEFAULT_CONFIG.copy()
