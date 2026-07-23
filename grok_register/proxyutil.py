@@ -32,6 +32,9 @@ _disabled: set[str] = set()  # normalized full URLs
 _disabled_hosts: set[str] = set()  # host:port keys for fuzzy match
 _pool_exhausted: bool = False  # auto-disable pool when empty mid-run
 _pool_exhausted_logged: bool = False
+# Progressive DO egress: more SOCKS may appear; do not treat empty as permanent.
+_do_pool_building: bool = False
+_pool_changed = threading.Event()
 
 
 def set_runtime_proxy(proxy: str | None) -> None:
@@ -439,7 +442,9 @@ def next_pool_proxy(mode: str = "random") -> str:
         active = [p for p in _pool_list if not _is_disabled_locked(p)]
         _pool_list = active
         if not _pool_list:
-            _pool_exhausted = True
+            # While DO progressive create is running, empty is temporary.
+            if not _do_pool_building:
+                _pool_exhausted = True
             set_runtime_proxy(None)
             return ""
         if mode == "round_robin":
@@ -467,8 +472,60 @@ def _install_pool_urls(urls: list[str]) -> int:
         _pool_file = None
         _pool_mtime = None
         _pool_index = 0
-        _pool_exhausted = not bool(items)
+        # Empty is not permanent while DO is still building more droplets.
+        if items:
+            _pool_exhausted = False
+        elif not _do_pool_building:
+            _pool_exhausted = True
+    _pool_changed.set()
     return len(items)
+
+
+def set_do_pool_building(building: bool) -> None:
+    """Mark progressive DO egress create in progress (empty pool ≠ exhausted)."""
+    global _do_pool_building, _pool_exhausted
+    with _pool_lock:
+        _do_pool_building = bool(building)
+        if _do_pool_building:
+            _pool_exhausted = False
+    _pool_changed.set()
+
+
+def is_do_pool_building() -> bool:
+    return bool(_do_pool_building)
+
+
+def install_do_pool_urls(urls: list[str], *, building: bool | None = None) -> int:
+    """Publish ready DO SOCKS URLs; used as droplets become ready progressively."""
+    if building is not None:
+        set_do_pool_building(bool(building))
+    return _install_pool_urls(urls)
+
+
+def wait_for_pool_proxy(
+    mode: str = "random",
+    *,
+    timeout_s: float = 120.0,
+    poll_s: float = 0.4,
+) -> str:
+    """Take a pool proxy, waiting while DO progressive create is still running."""
+    deadline = time.time() + max(0.0, float(timeout_s))
+    mode = (mode or "random").strip().lower()
+    while True:
+        p = next_pool_proxy(mode)
+        if p:
+            return p
+        building = is_do_pool_building()
+        try:
+            from grok_register.do_egress.pool import is_building as do_building
+
+            building = building or bool(do_building())
+        except Exception:
+            pass
+        if not building or time.time() >= deadline:
+            return ""
+        _pool_changed.clear()
+        _pool_changed.wait(timeout=min(poll_s, max(0.05, deadline - time.time())))
 
 
 def ensure_pool_from_config(cfg: dict | None) -> int:
@@ -477,6 +534,9 @@ def ensure_pool_from_config(cfg: dict | None) -> int:
     Sources:
       - proxy_pool_source=do  → DigitalOcean egress (local SOCKS per node)
       - default file          → proxy_pool_file lines
+
+    For DO: returns as soon as the **first** droplet is ready; more nodes may
+    join the in-memory pool later (progressive).
 
     If pool was auto-exhausted and file still empty, keep disabled.
     If file has proxies again (manual refill + process restart, or force), size>0.
@@ -490,22 +550,25 @@ def ensure_pool_from_config(cfg: dict | None) -> int:
     from grok_register.do_egress import ensure_pool as do_ensure, is_do_pool_source
 
     if is_do_pool_source(cfg):
-        # Optional: cfg["_egress_slots"] or register_threads caps droplet count
+        # Optional hard override for droplet count (else ceil(threads/tpd))
         size_override = None
         if cfg.get("_egress_slots") is not None:
             try:
                 size_override = int(cfg["_egress_slots"])
             except Exception:
                 size_override = None
+        set_do_pool_building(True)
         urls = do_ensure(
             cfg,
             log=lambda m: print(m, flush=True),
             size=size_override,
+            wait_first=True,
         )
         n = _install_pool_urls(urls)
         if n > 0:
             with _pool_lock:
                 _pool_exhausted = False
+        # building flag cleared by do_egress finalize when all slots settle
         return n
 
     if _pool_exhausted:

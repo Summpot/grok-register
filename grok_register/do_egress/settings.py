@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -43,6 +44,8 @@ class DoEgressSettings:
     droplet_tag: str = "grok-reg-egress"
     name_prefix: str = "reg-egress"
     pool_size: int = 3
+    # How many register threads share one droplet (ceil(threads / this) = droplet count).
+    threads_per_droplet: int = 3
     remote_port: int = 8443  # Hysteria2 UDP
     tuic_port: int = 8444  # TUIC UDP
     # 443 looks like HTTPS — often works when high ports are filtered (CN→DO)
@@ -143,6 +146,17 @@ def settings_from_config(cfg: dict[str, Any] | None) -> DoEgressSettings:
         droplet_tag=str(_get(cfg, "droplet_tag", nest.get("droplet_tag") or "grok-reg-egress")),
         name_prefix=str(_get(cfg, "name_prefix", nest.get("name_prefix") or "reg-egress")),
         pool_size=int(_get(cfg, "pool_size", nest.get("pool_size") or 3) or 3),
+        threads_per_droplet=max(
+            1,
+            int(
+                _get(
+                    cfg,
+                    "threads_per_droplet",
+                    nest.get("threads_per_droplet") or 3,
+                )
+                or 3
+            ),
+        ),
         remote_port=int(_get(cfg, "remote_port", nest.get("remote_port") or 8443) or 8443),
         tuic_port=int(_get(cfg, "tuic_port", nest.get("tuic_port") or 8444) or 8444),
         trojan_port=int(
@@ -212,12 +226,15 @@ def resolve_egress_slot_count(
     size: int | None = None,
     threads: int | None = None,
 ) -> int:
-    """How many Droplets to create: min(pool_size, threads).
+    """How many Droplets to create.
 
-    When register threads < pool_size, only create that many nodes.
+    Default: ``ceil(register_threads / threads_per_droplet)``, capped by
+    ``pool_size``. Example: 6 threads + 3/droplet → 2 droplets.
+    Explicit ``size=`` (or cfg ``_egress_slots``) still wins as a hard cap target.
     """
     settings = settings_from_config(cfg)
     max_n = max(1, int(settings.pool_size or 1))
+    tpd = max(1, int(settings.threads_per_droplet or 3))
     if size is not None:
         return max(1, min(int(size), max_n))
     thr = threads
@@ -227,7 +244,8 @@ def resolve_egress_slot_count(
         except Exception:
             thr = None
     if thr is not None and thr > 0:
-        return max(1, min(int(thr), max_n))
+        needed = int(math.ceil(int(thr) / float(tpd)))
+        return max(1, min(needed, max_n))
     return max_n
 
 

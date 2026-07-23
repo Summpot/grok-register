@@ -204,6 +204,7 @@ DEFAULT_CONFIG = {
         "ssh_key_name": "grok-reg-egress",
         "ssh_identity_file": "",
         "pool_size": 3,
+        "threads_per_droplet": 3,
         "remote_port": 8443,
         "tuic_port": 8444,
         "trojan_port": 443,
@@ -373,13 +374,22 @@ def assign_thread_proxy(log_callback=None, *, force_new: bool = False) -> str:
 
     if config.get("proxy_pool_enabled", False):
         from grok_register.proxyutil import (
+            is_do_pool_building,
             is_pool_exhausted,
             note_pool_exhausted_message,
             pool_size,
+            wait_for_pool_proxy,
         )
 
         n = ensure_pool_from_config(config)
-        if n <= 0 or is_pool_exhausted():
+        building = is_do_pool_building()
+        try:
+            from grok_register.do_egress.pool import is_building as do_building
+
+            building = building or bool(do_building())
+        except Exception:
+            pass
+        if (n <= 0 or is_pool_exhausted()) and not building:
             log(note_pool_exhausted_message("empty or exhausted"))
             # auto stop using pool for rest of run
             try:
@@ -396,13 +406,24 @@ def assign_thread_proxy(log_callback=None, *, force_new: bool = False) -> str:
         cur = (get_runtime_proxy() or "").strip()
         if cur and not force_new and not config.get("proxy_pool_rotate_each_account", True):
             return cur
-        p = next_pool_proxy(str(config.get("proxy_pool_mode") or "random"))
+        mode = str(config.get("proxy_pool_mode") or "random")
+        if building and pool_size() <= 0:
+            log("[proxy] waiting for first DO egress SOCKS…")
+            p = wait_for_pool_proxy(mode, timeout_s=300.0)
+        else:
+            p = next_pool_proxy(mode)
+            if not p and building:
+                log("[proxy] pool temporarily empty; waiting for more egress…")
+                p = wait_for_pool_proxy(mode, timeout_s=180.0)
         if not p:
-            log(note_pool_exhausted_message("next_pool empty"))
-            try:
-                config["proxy_pool_enabled"] = False
-            except Exception:
-                pass
+            if building:
+                log("[proxy] still no SOCKS after wait; keep pool enabled")
+            else:
+                log(note_pool_exhausted_message("next_pool empty"))
+                try:
+                    config["proxy_pool_enabled"] = False
+                except Exception:
+                    pass
             fb = str(config.get("proxy", "") or "").strip()
             set_runtime_proxy(fb or None)
             if fb:

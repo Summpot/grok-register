@@ -158,18 +158,23 @@ class TestLocalConfig(unittest.TestCase):
         urltest = next(o for o in doc["outbounds"] if o.get("type") == "urltest")
         self.assertEqual(urltest["outbounds"], ["tuic-0", "hy2-0"])
 
-    def test_slot_count_follows_threads(self):
+    def test_slot_count_follows_threads_per_droplet(self):
         from grok_register.do_egress.settings import resolve_egress_slot_count
 
         cfg = {
             "proxy_pool_enabled": True,
             "proxy_pool_source": "do",
-            "do_egress": {"pool_size": 3},
+            "do_egress": {"pool_size": 3, "threads_per_droplet": 3},
             "register_threads": 1,
         }
+        # ceil(threads / 3), capped by pool_size
         self.assertEqual(resolve_egress_slot_count(cfg), 1)
-        self.assertEqual(resolve_egress_slot_count(cfg, threads=2), 2)
-        self.assertEqual(resolve_egress_slot_count(cfg, threads=5), 3)
+        self.assertEqual(resolve_egress_slot_count(cfg, threads=2), 1)
+        self.assertEqual(resolve_egress_slot_count(cfg, threads=3), 1)
+        self.assertEqual(resolve_egress_slot_count(cfg, threads=4), 2)
+        self.assertEqual(resolve_egress_slot_count(cfg, threads=9), 3)
+        self.assertEqual(resolve_egress_slot_count(cfg, threads=12), 3)  # pool_size cap
+        self.assertEqual(resolve_egress_slot_count(cfg, size=2, threads=12), 2)
 
 
 class TestState(unittest.TestCase):

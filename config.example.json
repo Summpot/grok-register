@@ -23,6 +23,7 @@
         "ssh_key_name": "grok-reg-egress",
         "ssh_identity_file": "",
         "pool_size": 3,
+        "threads_per_droplet": 3,
         "remote_port": 8443,
         "tuic_port": 8444,
         "trojan_port": 443,

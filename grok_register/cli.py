@@ -679,20 +679,37 @@ def main() -> int:
         cfg0 = getattr(reg, "config", {}) or {}
         if cfg0.get("proxy_pool_enabled"):
             src = str(cfg0.get("proxy_pool_source") or "file").strip().lower()
-            # DO: droplet count = min(pool_size, register threads)
+            # DO: droplets = ceil(threads / threads_per_droplet), progressive hand-off
             if src in ("do", "digitalocean", "do_egress", "egress"):
                 cfg0 = dict(cfg0)
                 cfg0["register_threads"] = threads
-                cfg0["_egress_slots"] = threads
+                # Do NOT force 1 droplet per thread; leave _egress_slots unset
                 try:
                     reg.config["register_threads"] = threads
+                except Exception:
+                    pass
+                try:
+                    from grok_register.do_egress.settings import (
+                        resolve_egress_slot_count,
+                        settings_from_config,
+                    )
+
+                    s_do = settings_from_config(cfg0)
+                    slots = resolve_egress_slot_count(cfg0, threads=threads)
+                    tpd = max(1, int(getattr(s_do, "threads_per_droplet", 3) or 3))
+                    print(
+                        f"[*] do_egress plan: threads={threads} "
+                        f"threads_per_droplet={tpd} → droplets={slots} "
+                        f"(start register after first ready)",
+                        flush=True,
+                    )
                 except Exception:
                     pass
             n = ensure_pool_from_config(cfg0)
             if src in ("do", "digitalocean", "do_egress", "egress"):
                 print(
-                    f"[*] proxy_pool source=do (local SOCKS, hy2+tuic fallback) "
-                    f"size={n} threads={threads} "
+                    f"[*] proxy_pool source=do ready_socks={n} threads={threads} "
+                    f"(more may join as droplets finish) "
                     f"mode={cfg0.get('proxy_pool_mode', 'random')}",
                     flush=True,
                 )

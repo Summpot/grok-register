@@ -9,17 +9,20 @@ from __future__ import annotations
 from grok_register.do_egress.pool import (
     destroy_all,
     ensure_pool,
+    is_building,
     is_enabled,
     rotate_for_proxy,
     settings_from_config,
     shutdown_local,
     socks_urls,
+    wait_until_first_ready,
 )
 from grok_register.do_egress.settings import is_do_pool_source, resolve_egress_slot_count
 
 __all__ = [
     "destroy_all",
     "ensure_pool",
+    "is_building",
     "is_do_pool_source",
     "is_enabled",
     "resolve_egress_slot_count",
@@ -27,4 +30,5 @@ __all__ = [
     "settings_from_config",
     "shutdown_local",
     "socks_urls",
+    "wait_until_first_ready",
 ]

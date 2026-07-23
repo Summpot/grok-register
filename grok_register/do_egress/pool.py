@@ -48,6 +48,13 @@ _enabled = False
 _pool_ready = False
 _atexit_registered = False
 _cleaned_up = False
+# Progressive create: registration may start after the first ready droplet.
+_building = False
+_first_ready = threading.Event()
+_all_done = threading.Event()
+_create_executor: ThreadPoolExecutor | None = None
+_create_futures: dict[Any, int] = {}
+_reload_lock = threading.Lock()
 
 
 def _log(msg: str, log: LogFn | None) -> None:
@@ -68,6 +75,19 @@ def _secret(n: int = 28) -> str:
 
 def is_enabled() -> bool:
     return bool(_enabled and _active_settings is not None)
+
+
+def is_building() -> bool:
+    """True while background droplet creates are still running."""
+    return bool(_building)
+
+
+def wait_until_first_ready(timeout_s: float = 300.0) -> bool:
+    """Block until at least one droplet is ready (or timeout / all done empty)."""
+    if _pool_ready and _enabled:
+        return True
+    ok = _first_ready.wait(timeout=max(0.1, float(timeout_s)))
+    return bool(ok and _pool_ready and _enabled)
 
 
 def socks_urls(cfg: dict[str, Any] | None = None) -> list[str]:
@@ -136,6 +156,7 @@ def destroy_all(
     Idempotent. Returns number of destroy attempts (state + tag orphans).
     """
     global _active_settings, _enabled, _pool_ready, _cleaned_up, _active_cfg
+    global _building, _create_executor, _create_futures
 
     settings = _active_settings
     if settings is None:
@@ -157,10 +178,19 @@ def destroy_all(
                 pass
         _enabled = False
         _pool_ready = False
+        _building = False
+        _first_ready.set()
+        _all_done.set()
         return 0
 
     destroyed = 0
     with _lock:
+        _building = False
+        _first_ready.set()
+        _all_done.set()
+        # Best-effort: do not wait on in-flight creates (destroy will reclaim by tag)
+        _create_futures = {}
+        _create_executor = None
         try:
             stop_local(settings)
         except Exception as exc:
@@ -218,10 +248,40 @@ def destroy_all(
 
         _enabled = False
         _pool_ready = False
+        _building = False
         _cleaned_up = True
         _log(f"[egress] cleanup done (destroy_ops≈{destroyed})", log)
 
     return destroyed
+
+
+def _sync_proxy_pool_urls(settings: DoEgressSettings, log: LogFn | None = None) -> list[str]:
+    """Reload local tunnel from current ready nodes and publish SOCKS URLs to proxyutil."""
+    state = load_state(settings.state_path)
+    with _reload_lock:
+        urls = apply_local(settings, state)
+    try:
+        from grok_register.proxyutil import install_do_pool_urls
+
+        install_do_pool_urls(urls, building=_building)
+    except Exception as exc:
+        _log(f"[egress] install proxy pool urls failed: {exc}", log)
+    return urls
+
+
+def _on_slot_ready(settings: DoEgressSettings, slot: int, log: LogFn | None) -> None:
+    """Called when one droplet finishes bootstrap; refresh tunnel + proxy pool."""
+    global _enabled, _pool_ready
+    urls = _sync_proxy_pool_urls(settings, log=log)
+    _enabled = bool(urls)
+    _pool_ready = bool(urls)
+    if urls:
+        _first_ready.set()
+        _log(
+            f"[egress] progressive ready slots={len(urls)} "
+            f"(latest slot={slot}); register may use these SOCKS now",
+            log,
+        )
 
 
 def _persist_node(settings: DoEgressSettings, node: EgressNode) -> None:
@@ -483,105 +543,237 @@ def ensure_pool(
     log: LogFn | None = None,
     size: int | None = None,
     force: bool = False,
+    wait_first: bool = True,
+    first_ready_timeout_s: float | None = None,
 ) -> list[str]:
-    """Ensure egress nodes exist, start local tunnel, return SOCKS5 URLs.
+    """Ensure egress nodes; return SOCKS URLs as soon as the first droplet is ready.
 
-    On first (or force) ensure: destroy leftover Droplets from previous runs,
-    then create a fresh pool in the configured region (default San Francisco).
+    Creates ``ceil(threads / threads_per_droplet)`` droplets (capped by pool_size)
+    in parallel. Registration can start after **one** node is ready; remaining
+    nodes keep bootstrapping in the background and are published dynamically.
     """
     global _active_settings, _active_cfg, _enabled, _pool_ready, _cleaned_up
+    global _building, _create_executor, _create_futures
 
     if not is_do_pool_source(cfg or {}):
         _enabled = False
         _pool_ready = False
+        _building = False
         return []
 
     settings = settings_from_config(cfg)
     _require_token(settings)
-    # Droplet count = min(pool_size, register threads) unless explicit size=
     target = resolve_egress_slot_count(cfg, size=size)
     if target < 1:
         raise ValueError("pool size must be >= 1")
+    tpd = max(1, int(getattr(settings, "threads_per_droplet", 3) or 3))
+    thr = 0
+    try:
+        thr = int((cfg or {}).get("register_threads") or 0)
+    except Exception:
+        thr = 0
+
+    # Re-entry: progressive create already started — never wipe & recreate.
+    session_active = False
+    with _lock:
+        if not force and _active_settings is not None and (_building or _pool_ready or _enabled):
+            session_active = True
+            settings = _active_settings
+
+    if session_active:
+        if wait_first and not _pool_ready:
+            timeout = first_ready_timeout_s
+            if timeout is None:
+                timeout = float(
+                    max(
+                        60,
+                        int(settings.create_timeout_s or 180)
+                        + int(settings.ready_wait_s or 240),
+                    )
+                )
+            _first_ready.wait(timeout=timeout)
+        state = load_state(settings.state_path)
+        return [socks_url(settings, n) for n in state.ready_nodes()]
+
+    errors: list[tuple[int, Exception]] = []
+    errors_lock = threading.Lock()
 
     with _lock:
-        if _pool_ready and _enabled and not force and _active_settings is not None:
-            state = load_state(_active_settings.state_path)
-            urls = [socks_url(_active_settings, n) for n in state.ready_nodes()]
-            if len(urls) >= target:
+        # Double-check under lock (another thread may have started create)
+        if not force and _active_settings is not None and (_building or _pool_ready or _enabled):
+            settings = _active_settings
+            state = load_state(settings.state_path)
+            urls = [socks_url(settings, n) for n in state.ready_nodes()]
+            if urls or not wait_first:
                 return urls
+            # fall through to wait outside without starting a second create
+            session_active = True
+        else:
+            session_active = False
 
-        # Auto-download sing-box for do_egress.singbox_version if missing
-        ensure_singbox_for_settings(settings, log=log)
+        if not session_active:
+            # Auto-download sing-box for do_egress.singbox_version if missing
+            ensure_singbox_for_settings(settings, log=log)
 
-        _active_settings = settings
-        _active_cfg = dict(cfg or {})
-        _cleaned_up = False
-        _register_atexit_once()
+            _active_settings = settings
+            _active_cfg = dict(cfg or {})
+            _cleaned_up = False
+            _register_atexit_once()
+            _first_ready.clear()
+            _all_done.clear()
+            _building = True
+            _enabled = False
+            _pool_ready = False
 
-        client = DigitalOceanClient(settings.token)
-
-        # Startup cleanup: never reuse stale Droplets from a prior crash/exit
-        protos = []
-        if settings.enable_hy2:
-            protos.append(f"hy2:{settings.remote_port}/udp")
-        if settings.enable_tuic:
-            protos.append(f"tuic:{settings.tuic_port}/udp")
-        if settings.enable_trojan:
-            protos.append(f"trojan:{settings.trojan_port}/tcp")
-        _log(
-            f"[egress] startup cleanup (region={settings.region}) then create "
-            f"slots={target} (pool_size max={settings.pool_size}) "
-            f"protocols=[{', '.join(protos) or 'none'}] (probe all, random pick working)",
-            log,
-        )
-        # destroy_all takes lock — call internal cleanup without re-enter
-        _cleanup_droplets_unlocked(settings, client, log=log)
-
-        with _state_io_lock:
-            save_state(settings.state_path, EgressState(nodes=[]))
-
-        # Create all slots in parallel (create+bootstrap+probe overlap)
-        ssh_keys = _ssh_keys(client, settings, log)
-        slots = list(range(target))
-        _log(
-            f"[egress] creating {target} droplet(s) in parallel…",
-            log,
-        )
-        errors: list[tuple[int, Exception]] = []
-        workers = min(target, 8)
-        with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="do-egress") as ex:
-            futs = {
-                ex.submit(_create_slot_worker, settings, slot, log, ssh_keys): slot
-                for slot in slots
-            }
-            for fut in as_completed(futs):
-                slot = futs[fut]
-                try:
-                    fut.result()
-                except Exception as exc:
-                    errors.append((slot, exc))
-                    node = EgressNode(slot=slot, status="error", last_error=str(exc)[:300])
-                    _persist_node(settings, node)
-                    _log(f"[egress] slot {slot}: error {exc}", log)
-
-        if errors:
-            # Tear down partial pool so we don't leave orphans billing
             try:
-                _cleanup_droplets_unlocked(settings, client, log=log)
+                from grok_register.proxyutil import set_do_pool_building
+
+                set_do_pool_building(True)
             except Exception:
                 pass
-            slot0, exc0 = errors[0]
-            raise RuntimeError(
-                f"parallel create failed for {len(errors)} slot(s); "
-                f"first slot {slot0}: {exc0}"
-            ) from exc0
 
-        state = load_state(settings.state_path)
-        urls = apply_local(settings, state)
-        _enabled = bool(urls)
-        _pool_ready = bool(urls)
-        _log(f"[egress] pool ready size={len(urls)} region={settings.region}", log)
-        return urls
+            client = DigitalOceanClient(settings.token)
+
+            protos = []
+            if settings.enable_hy2:
+                protos.append(f"hy2:{settings.remote_port}/udp")
+            if settings.enable_tuic:
+                protos.append(f"tuic:{settings.tuic_port}/udp")
+            if settings.enable_trojan:
+                protos.append(f"trojan:{settings.trojan_port}/tcp")
+            _log(
+                f"[egress] startup cleanup (region={settings.region}) then create "
+                f"slots={target} (pool_size max={settings.pool_size}, "
+                f"threads_per_droplet={tpd}, register_threads={thr or '-'}) "
+                f"protocols=[{', '.join(protos) or 'none'}] "
+                f"— progressive: start register after first ready",
+                log,
+            )
+            _cleanup_droplets_unlocked(settings, client, log=log)
+
+            with _state_io_lock:
+                save_state(settings.state_path, EgressState(nodes=[]))
+
+            ssh_keys = _ssh_keys(client, settings, log)
+            slots = list(range(target))
+            _log(
+                f"[egress] creating {target} droplet(s) in parallel "
+                f"(~{tpd} register thread(s) per droplet)…",
+                log,
+            )
+
+            workers = min(target, 8)
+            ex = ThreadPoolExecutor(max_workers=workers, thread_name_prefix="do-egress")
+            _create_executor = ex
+
+            def _slot_job(slot: int) -> None:
+                if _cleaned_up:
+                    return
+                try:
+                    _create_slot_worker(settings, slot, log, ssh_keys)
+                    if _cleaned_up:
+                        return
+                    _on_slot_ready(settings, slot, log)
+                except Exception as exc:
+                    with errors_lock:
+                        errors.append((slot, exc))
+                    node = EgressNode(slot=slot, status="error", last_error=str(exc)[:300])
+                    try:
+                        _persist_node(settings, node)
+                    except Exception:
+                        pass
+                    _log(f"[egress] slot {slot}: error {exc}", log)
+
+            futs = {ex.submit(_slot_job, slot): slot for slot in slots}
+            _create_futures = futs
+
+            def _finalize() -> None:
+                global _building, _enabled, _pool_ready
+                try:
+                    for fut in as_completed(futs):
+                        try:
+                            fut.result()
+                        except Exception:
+                            pass
+                finally:
+                    try:
+                        ex.shutdown(wait=False, cancel_futures=True)
+                    except TypeError:
+                        ex.shutdown(wait=False)
+                    except Exception:
+                        pass
+                    with _lock:
+                        _building = False
+                        state = load_state(settings.state_path)
+                        ready_n = len(state.ready_nodes())
+                        if ready_n <= 0 and errors:
+                            _log(
+                                f"[egress] all {len(errors)} create(s) failed; "
+                                f"first={errors[0][1]}",
+                                log,
+                            )
+                        elif errors:
+                            _log(
+                                f"[egress] progressive done: ready={ready_n}/{target}, "
+                                f"failed={len(errors)} (keeping ready nodes)",
+                                log,
+                            )
+                        else:
+                            _log(
+                                f"[egress] progressive done: ready={ready_n}/{target}",
+                                log,
+                            )
+                        try:
+                            from grok_register.proxyutil import set_do_pool_building
+
+                            set_do_pool_building(False)
+                        except Exception:
+                            pass
+                        try:
+                            if ready_n > 0 and not _cleaned_up:
+                                _sync_proxy_pool_urls(settings, log=log)
+                                _enabled = True
+                                _pool_ready = True
+                                _first_ready.set()
+                        except Exception as exc:
+                            _log(f"[egress] final sync failed: {exc}", log)
+                        _all_done.set()
+
+            threading.Thread(
+                target=_finalize, name="do-egress-finalize", daemon=True
+            ).start()
+
+    # Outside lock: wait only for first ready (not full pool)
+    if wait_first:
+        timeout = first_ready_timeout_s
+        if timeout is None:
+            timeout = float(
+                max(
+                    60,
+                    int(settings.create_timeout_s or 180)
+                    + int(settings.ready_wait_s or 240),
+                )
+            )
+        ok = _first_ready.wait(timeout=timeout)
+        if not ok and not _pool_ready:
+            if _building:
+                _all_done.wait(timeout=min(30.0, timeout))
+            if not _pool_ready:
+                with errors_lock:
+                    err_s = f"; first={errors[0][1]}" if errors else ""
+                raise TimeoutError(
+                    f"no egress droplet ready within {timeout:.0f}s "
+                    f"(target slots={target}){err_s}"
+                )
+
+    state = load_state(settings.state_path)
+    urls = [socks_url(settings, n) for n in state.ready_nodes()]
+    _log(
+        f"[egress] hand-off to register: ready={len(urls)}/{target} "
+        f"building={_building} region={settings.region}",
+        log,
+    )
+    return urls
 
 
 def _cleanup_droplets_unlocked(
