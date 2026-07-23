@@ -77,9 +77,12 @@ class TestBootstrap(unittest.TestCase):
         self.assertIn("TuicPass", cfg)
         self.assertIn("TrPass", cfg)
         self.assertIn('"listen_port": 443', cfg)
-        self.assertIn("ufw allow 443/tcp", setup)
-        self.assertIn("ufw allow 8443/udp", setup)
-        self.assertNotIn("\nufw allow", yml)
+        # Must not run host firewall tools
+        self.assertNotIn("ufw ", setup.lower())
+        self.assertNotIn("ufw\n", setup.lower())
+        self.assertNotIn("iptables", setup.lower())
+        self.assertNotIn("ufw", yml.lower())
+        self.assertIn("systemctl restart sing-box", setup)
 
 
 class TestLocalConfig(unittest.TestCase):

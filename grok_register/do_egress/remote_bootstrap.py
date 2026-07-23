@@ -3,11 +3,10 @@
 Protocols (all optional via flags):
   - Hysteria2  UDP  (remote_port)
   - TUIC       UDP  (tuic_port)
-  - Trojan     TCP  (trojan_port)  — fallback when UDP is blocked
+  - Trojan     TCP  (trojan_port)
 
-Scripts are embedded as base64 so multi-line shell never breaks YAML
-(previous bug: f-string multi-line ufw rules lost indentation → cloud-init
-parse failure → setup never ran → no sing-box).
+Does **not** touch UFW/firewall — DO droplets default open; leave host firewall alone.
+Scripts embedded as base64 so multi-line shell never breaks YAML.
 """
 
 from __future__ import annotations
@@ -31,13 +30,13 @@ def render_user_data(
     tuic_password: str = "",
     trojan_port: int | None = None,
     trojan_password: str = "",
-    allow_from_cidrs: list[str] | None = None,
+    allow_from_cidrs: list[str] | None = None,  # kept for API compat; unused (no host fw)
     server_name: str = "egress",
     enable_hy2: bool = True,
     enable_tuic: bool = True,
     enable_trojan: bool = True,
 ) -> str:
-    allow_from_cidrs = list(allow_from_cidrs or [])
+    _ = allow_from_cidrs  # intentionally ignored — do not configure UFW
     hy2_port = int(remote_port)
     t_port = int(tuic_port if tuic_port is not None else (hy2_port + 1))
     tr_port = int(trojan_port if trojan_port is not None else (hy2_port + 2))
@@ -107,30 +106,6 @@ def render_user_data(
     }
     server_json = json.dumps(server_cfg, indent=2, ensure_ascii=False)
 
-    udp_ports: list[int] = []
-    tcp_ports: list[int] = []
-    if enable_hy2:
-        udp_ports.append(hy2_port)
-    if enable_tuic:
-        udp_ports.append(t_port)
-    if enable_trojan:
-        tcp_ports.append(tr_port)
-
-    ufw_cmds: list[str] = []
-    if allow_from_cidrs:
-        for c in allow_from_cidrs:
-            ufw_cmds.append(f"ufw allow from {c} to any port 22 proto tcp")
-            for p in tcp_ports:
-                ufw_cmds.append(f"ufw allow from {c} to any port {int(p)} proto tcp")
-            for p in udp_ports:
-                ufw_cmds.append(f"ufw allow from {c} to any port {int(p)} proto udp")
-    else:
-        ufw_cmds.append("ufw allow 22/tcp")
-        for p in tcp_ports:
-            ufw_cmds.append(f"ufw allow {int(p)}/tcp")
-        for p in udp_ports:
-            ufw_cmds.append(f"ufw allow {int(p)}/udp")
-
     setup_lines = [
         "#!/bin/bash",
         "set -euo pipefail",
@@ -176,12 +151,7 @@ def render_user_data(
         "WantedBy=multi-user.target",
         "UNIT",
         "",
-        "ufw --force reset || true",
-        "ufw default deny incoming",
-        "ufw default allow outgoing",
-        *ufw_cmds,
-        "ufw --force enable || true",
-        "",
+        "# Do not configure host firewall (leave DigitalOcean defaults)",
         "systemctl daemon-reload",
         "systemctl enable sing-box",
         "systemctl restart sing-box",
@@ -203,7 +173,6 @@ def render_user_data(
           - curl
           - ca-certificates
           - openssl
-          - ufw
 
         write_files:
           - path: /etc/sing-box/config.json

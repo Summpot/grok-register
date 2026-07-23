@@ -6,7 +6,8 @@ requires-python = ">=3.13,<3.14"
 dependencies = [
     "camoufox[geoip]>=0.5.4",  # 反检测 Firefox + Playwright API（替代 patchright + turnstilePatch）
     "curl_cffi>=0.7",          # HTTP client（带 TLS 指纹），邮箱 API + grok2api 调用
-    "requests>=2.34.2",
+    "requests[socks]>=2.34.2", # HTTPS via SOCKS (Device Flow / optional)
+    "PySocks>=1.7.1",
 ]
 
 # application 模式：不构建 wheel，uv 只管依赖

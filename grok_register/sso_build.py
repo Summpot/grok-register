@@ -2124,34 +2124,146 @@ return {{ ok: true, via: 'form_submit' }};
             current_url = next_url
         raise SSOBuildError("xAI OAuth too many redirects")
 
-    def _request(self, method: str, url: str, *, headers: dict, data: str | None):
-        kwargs = {
-            "headers": headers,
-            "data": data,
-            "timeout": self.timeout,
-            "proxies": self.proxies or {},
-            "allow_redirects": False,
-            "verify": True,
-        }
+    @staticmethod
+    def _proxy_url_from_dict(proxies: dict | None) -> str:
+        """Extract a single proxy URL; prefer socks5h for HTTPS through SOCKS."""
+        if not proxies:
+            return ""
+        raw = (
+            str(proxies.get("https") or proxies.get("http") or proxies.get("all") or "")
+            .strip()
+        )
+        if not raw:
+            return ""
         try:
-            kwargs_curl = dict(kwargs)
-            kwargs_curl["impersonate"] = self.impersonate
-            if method == "GET":
-                return curl_requests.get(url, **kwargs_curl)
-            return curl_requests.post(url, **kwargs_curl)
+            from grok_register.proxyutil import normalize_proxy_url
+
+            return normalize_proxy_url(raw, remote_dns=True)
         except Exception:
-            # Fallback: std requests (no impersonate)
-            std_kwargs = {
+            if raw.startswith("socks5://"):
+                return "socks5h://" + raw[len("socks5://") :]
+            return raw
+
+    @staticmethod
+    def _is_tls_or_proxy_error(exc: BaseException) -> bool:
+        err = str(exc or "").lower()
+        needles = (
+            "socks",
+            "proxy",
+            "curl: (35)",
+            "curl: (97)",
+            "curl: (56)",
+            "ssl",
+            "tls",
+            "unexpected_eof",
+            "invalid library",
+            "failed to perform",
+            "max retries exceeded",
+        )
+        return any(n in err for n in needles)
+
+    def _request(self, method: str, url: str, *, headers: dict, data: str | None):
+        """HTTP for device/token **always via register proxy when configured**.
+
+        Fixes TLS-over-SOCKS for Device Flow (no silent direct fallback):
+          - normalize socks5 → socks5h (DNS on egress)
+          - curl_cffi uses singular ``proxy=`` + HTTP/1.1 over SOCKS
+          - retry without impersonate if impersonate+SOCKS TLS breaks
+          - std requests last with socks5h (requires PySocks)
+        """
+        proxy_url = self._proxy_url_from_dict(self.proxies)
+        proxies_map = (
+            {"http": proxy_url, "https": proxy_url} if proxy_url else {}
+        )
+        # Slow tunnel: allow longer handshake
+        timeout = max(float(self.timeout or 30), 45.0 if proxy_url else 30.0)
+        method_u = (method or "GET").upper()
+        last_exc: BaseException | None = None
+
+        # Ordered curl_cffi strategies (all stay on the same proxy)
+        curl_attempts: list[dict] = []
+        if proxy_url:
+            # 1) SOCKS + Chrome impersonate + HTTP/1.1 (most compatible over CONNECT)
+            curl_attempts.append(
+                {
+                    "proxy": proxy_url,
+                    "impersonate": self.impersonate,
+                    "http_version": "v1",
+                }
+            )
+            # 2) SOCKS without impersonate (avoids some BoringSSL+proxy bugs)
+            curl_attempts.append(
+                {
+                    "proxy": proxy_url,
+                    "http_version": "v1",
+                }
+            )
+            # 3) SOCKS + impersonate default HTTP version
+            curl_attempts.append(
+                {
+                    "proxy": proxy_url,
+                    "impersonate": self.impersonate,
+                }
+            )
+        else:
+            curl_attempts.append({"impersonate": self.impersonate})
+
+        for extra in curl_attempts:
+            kwargs: dict[str, Any] = {
                 "headers": headers,
                 "data": data,
-                "timeout": self.timeout,
-                "proxies": self.proxies or {},
+                "timeout": timeout,
                 "allow_redirects": False,
                 "verify": True,
             }
-            if method == "GET":
-                return std_requests.get(url, **std_kwargs)
-            return std_requests.post(url, **std_kwargs)
+            kwargs.update(extra)
+            # Prefer singular proxy= for curl_cffi; also pass proxies= for compatibility
+            if proxy_url:
+                kwargs["proxies"] = proxies_map
+            try:
+                if method_u == "GET":
+                    return curl_requests.get(url, **kwargs)
+                return curl_requests.post(url, **kwargs)
+            except TypeError:
+                # Older curl_cffi: drop http_version / proxy key variants
+                kwargs.pop("http_version", None)
+                try:
+                    if method_u == "GET":
+                        return curl_requests.get(url, **kwargs)
+                    return curl_requests.post(url, **kwargs)
+                except Exception as exc:
+                    last_exc = exc
+                    if not self._is_tls_or_proxy_error(exc):
+                        raise
+                    continue
+            except Exception as exc:
+                last_exc = exc
+                if not self._is_tls_or_proxy_error(exc):
+                    raise
+                continue
+
+        # std requests via socks5h (same proxy — no direct fallback)
+        if proxy_url or not self.proxies:
+            std_kwargs = {
+                "headers": headers,
+                "data": data,
+                "timeout": timeout,
+                "proxies": proxies_map if proxy_url else {"http": "", "https": ""},
+                "allow_redirects": False,
+                "verify": True,
+            }
+            try:
+                if method_u == "GET":
+                    return std_requests.get(url, **std_kwargs)
+                return std_requests.post(url, **std_kwargs)
+            except Exception as exc:
+                last_exc = exc
+
+        if last_exc:
+            raise SSOBuildError(
+                f"xAI OAuth TLS via proxy failed ({method_u} {url}): {last_exc}"
+            ) from last_exc
+        raise SSOBuildError(f"xAI OAuth request failed: {method_u} {url}")
 
 
 def convert_sso_to_build(

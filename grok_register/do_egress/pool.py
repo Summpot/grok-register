@@ -8,6 +8,7 @@ import string
 import threading
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Callable
 from urllib.parse import urlparse
 
@@ -38,6 +39,7 @@ from grok_register.do_egress.state import EgressNode, EgressState, load_state, s
 LogFn = Callable[[str], None]
 
 _lock = threading.RLock()
+_state_io_lock = threading.Lock()  # serialize load/upsert/save across create workers
 _active_settings: DoEgressSettings | None = None
 _active_cfg: dict[str, Any] | None = None
 _enabled = False
@@ -220,13 +222,23 @@ def destroy_all(
     return destroyed
 
 
+def _persist_node(settings: DoEgressSettings, node: EgressNode) -> None:
+    """Thread-safe upsert of one node into nodes.json."""
+    with _state_io_lock:
+        st = load_state(settings.state_path)
+        st.upsert(node)
+        save_state(settings.state_path, st)
+
+
 def _create_slot(
     settings: DoEgressSettings,
     client: DigitalOceanClient,
-    state: EgressState,
     slot: int,
     log: LogFn | None,
+    *,
+    ssh_keys: list | None = None,
 ) -> EgressNode:
+    """Create one droplet + wait ready. Safe to run in parallel (own DO client)."""
     secret = _secret()
     tuic_uuid = str(uuid.uuid4())
     tuic_password = _secret(24)
@@ -241,7 +253,6 @@ def _create_slot(
         tuic_password=tuic_password,
         trojan_port=settings.trojan_port,
         trojan_password=trojan_password,
-        allow_from_cidrs=settings.allow_from_cidrs,
         enable_hy2=settings.enable_hy2,
         enable_tuic=settings.enable_tuic,
         enable_trojan=settings.enable_trojan,
@@ -261,28 +272,26 @@ def _create_slot(
         status="creating",
         created_at=time.time(),
     )
-    state.upsert(node)
-    save_state(settings.state_path, state)
+    _persist_node(settings, node)
 
     _log(
         f"[egress] slot {slot}: creating droplet {name} "
         f"region={settings.region} size={settings.size}",
         log,
     )
-    ssh_keys = _ssh_keys(client, settings, log)
+    keys = ssh_keys if ssh_keys is not None else _ssh_keys(client, settings, log)
     droplet = client.create_droplet(
         name=name,
         region=settings.region,
         size=settings.size,
         image=settings.image,
-        ssh_keys=ssh_keys,
+        ssh_keys=keys,
         user_data=user_data,
         tags=[settings.droplet_tag, f"{settings.droplet_tag}-slot-{slot}"],
     )
     droplet_id = int(droplet["id"])
     node.droplet_id = droplet_id
-    state.upsert(node)
-    save_state(settings.state_path, state)
+    _persist_node(settings, node)
 
     droplet = wait_droplet_active(
         client,
@@ -292,8 +301,7 @@ def _create_slot(
     )
     ip = public_ipv4(droplet)
     node.ip = ip
-    state.upsert(node)
-    save_state(settings.state_path, state)
+    _persist_node(settings, node)
     _log(
         f"[egress] slot {slot}: active ip={ip}; probing remote sing-box "
         f"(max {settings.ready_wait_s}s, poll {settings.ready_poll_s}s)",
@@ -303,14 +311,24 @@ def _create_slot(
     node.working_protocols = working
     node.status = "ready"
     node.last_error = ""
-    state.upsert(node)
-    save_state(settings.state_path, state)
+    _persist_node(settings, node)
     _log(
         f"[egress] slot {slot}: ready socks={settings.socks_listen}:{node.socks_port} "
         f"via={working}",
         log,
     )
     return node
+
+
+def _create_slot_worker(
+    settings: DoEgressSettings,
+    slot: int,
+    log: LogFn | None,
+    ssh_keys: list,
+) -> EgressNode:
+    """Worker entry: one DigitalOceanClient per thread (requests.Session not shared)."""
+    client = DigitalOceanClient(settings.token)
+    return _create_slot(settings, client, slot, log, ssh_keys=ssh_keys)
 
 
 def _wait_remote_singbox(
@@ -356,10 +374,15 @@ def _wait_remote_singbox(
                 continue
             if not saw_tcp:
                 saw_tcp = True
+                # ufw --force reset + systemctl restart 刚结束时端口会抖；
+                # 实测 Trojan 配置正确，但过早探测会 dial timeout / refused
+                settle = min(15, max(5, poll_s * 2))
                 _log(
-                    f"[egress] slot {node.slot}: tcp:{trojan_port} open, probing tunnels…",
+                    f"[egress] slot {node.slot}: tcp:{trojan_port} open, "
+                    f"settle {settle}s then probe…",
                     log,
                 )
+                time.sleep(settle)
 
         if settings.ssh_probe:
             ssh_ok, ssh_detail = ssh_remote_service_ready(node.ip, timeout_s=6)
@@ -367,7 +390,7 @@ def _wait_remote_singbox(
                 _log(f"[egress] slot {node.slot}: {ssh_detail}", log)
 
         ok, detail, working = probe_remote_ready(
-            settings, node, probe_timeout_s=12.0
+            settings, node, probe_timeout_s=20.0
         )
         last_detail = detail
         if ok and working:
@@ -488,27 +511,46 @@ def ensure_pool(
         # destroy_all takes lock — call internal cleanup without re-enter
         _cleanup_droplets_unlocked(settings, client, log=log)
 
-        state = EgressState(nodes=[])
-        save_state(settings.state_path, state)
+        with _state_io_lock:
+            save_state(settings.state_path, EgressState(nodes=[]))
 
-        for slot in range(target):
-            try:
-                _create_slot(settings, client, state, slot, log)
-            except Exception as exc:
-                node = state.get_slot(slot) or EgressNode(slot=slot)
-                node.status = "error"
-                node.last_error = str(exc)[:300]
-                state.upsert(node)
-                save_state(settings.state_path, state)
-                _log(f"[egress] slot {slot}: error {exc}", log)
-                # Best-effort cleanup partial pool on failure
+        # Create all slots in parallel (create+bootstrap+probe overlap)
+        ssh_keys = _ssh_keys(client, settings, log)
+        slots = list(range(target))
+        _log(
+            f"[egress] creating {target} droplet(s) in parallel…",
+            log,
+        )
+        errors: list[tuple[int, Exception]] = []
+        workers = min(target, 8)
+        with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="do-egress") as ex:
+            futs = {
+                ex.submit(_create_slot_worker, settings, slot, log, ssh_keys): slot
+                for slot in slots
+            }
+            for fut in as_completed(futs):
+                slot = futs[fut]
                 try:
-                    _cleanup_droplets_unlocked(settings, client, log=log)
-                except Exception:
-                    pass
-                raise
-            state = load_state(settings.state_path)
+                    fut.result()
+                except Exception as exc:
+                    errors.append((slot, exc))
+                    node = EgressNode(slot=slot, status="error", last_error=str(exc)[:300])
+                    _persist_node(settings, node)
+                    _log(f"[egress] slot {slot}: error {exc}", log)
 
+        if errors:
+            # Tear down partial pool so we don't leave orphans billing
+            try:
+                _cleanup_droplets_unlocked(settings, client, log=log)
+            except Exception:
+                pass
+            slot0, exc0 = errors[0]
+            raise RuntimeError(
+                f"parallel create failed for {len(errors)} slot(s); "
+                f"first slot {slot0}: {exc0}"
+            ) from exc0
+
+        state = load_state(settings.state_path)
         urls = apply_local(settings, state)
         _enabled = bool(urls)
         _pool_ready = bool(urls)
@@ -626,9 +668,8 @@ def rotate_for_proxy(
         state = load_state(settings.state_path)
         _log(f"[egress] rotate slot {slot}: {reason[:120]}", log)
         _destroy_slot(settings, client, state, slot, log)
-        state = load_state(settings.state_path)
         try:
-            _create_slot(settings, client, state, slot, log)
+            _create_slot(settings, client, slot, log)
         except Exception as exc:
             _log(f"[egress] rotate slot {slot} failed: {exc}", log)
             apply_local(settings, load_state(settings.state_path))

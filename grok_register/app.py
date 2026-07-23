@@ -319,18 +319,22 @@ DUCKMAIL_API_BASE = "https://api.duckmail.sbs"
 def get_proxies():
     """HTTP(S) proxies for requests/curl.
 
-    Priority: thread-local pool pin > config.proxy
+    Priority: thread-local pool pin > config.proxy.
+    SOCKS URLs are normalized to socks5h (remote DNS) for stable HTTPS/TLS.
     """
     try:
-        from grok_register.proxyutil import get_runtime_proxy
+        from grok_register.proxyutil import get_runtime_proxy, proxies_dict_for_requests
 
         runtime = (get_runtime_proxy() or "").strip()
     except Exception:
         runtime = ""
+        proxies_dict_for_requests = None  # type: ignore
     proxy = runtime or str(config.get("proxy", "") or "").strip()
-    if proxy:
-        return {"http": proxy, "https": proxy}
-    return {}
+    if not proxy:
+        return {}
+    if proxies_dict_for_requests:
+        return proxies_dict_for_requests(proxy)
+    return {"http": proxy, "https": proxy}
 
 
 def assign_thread_proxy(log_callback=None, *, force_new: bool = False) -> str:
@@ -543,7 +547,7 @@ def cloudflare_create_temp_address(api_base):
         if use_random_subdomain:
             payload["enableRandomSubdomain"] = True
         headers = {"Content-Type": "application/json"}
-    resp = http_post(url, json=payload, headers=headers)
+    resp = http_post(url, json=payload, headers=headers, proxies={})
     resp.raise_for_status()
     try:
         data = resp.json()
@@ -853,6 +857,19 @@ def convert_sso_to_build_local(
     except Exception:
         pass
     try:
+        if log_callback and proxies:
+            try:
+                from grok_register.proxyutil import proxy_log_label
+
+                pl = proxy_log_label(
+                    str((proxies or {}).get("https") or (proxies or {}).get("http") or "")
+                )
+            except Exception:
+                pl = "proxy"
+            log_callback(
+                f"[*] Device Flow HTTP: 经代理 TLS ({pl}, socks5h+HTTP/1.1); "
+                f"浏览器 Continue/Allow 同注册出口"
+            )
         seed = convert_sso_to_build(
             token,
             email=email,
@@ -1591,12 +1608,22 @@ def pace_stage(
     return _human_pause_cancel(lo, hi, cancel_callback, name=label)
 
 
+# Force direct for mail APIs — register browser still uses pool proxy.
+# Empty string disables proxy for both requests and curl_cffi (None can fall through to env).
+NO_PROXIES = {"http": "", "https": ""}
+
+
 def _build_request_kwargs(**kwargs):
     request_kwargs = dict(kwargs)
     proxies = request_kwargs.pop("proxies", None)
     if proxies is None:
         proxies = get_proxies()
-    if proxies:
+        if proxies:
+            request_kwargs["proxies"] = proxies
+    elif not proxies:
+        # Explicit empty → force direct (ignore runtime pin + env HTTP_PROXY)
+        request_kwargs["proxies"] = dict(NO_PROXIES)
+    else:
         request_kwargs["proxies"] = proxies
     request_kwargs.setdefault("timeout", 15)
     return request_kwargs
@@ -1679,7 +1706,7 @@ def get_domains(api_key=None):
     key = api_key or get_duckmail_api_key()
     if key:
         headers["Authorization"] = f"Bearer {key}"
-    resp = http_get(f"{DUCKMAIL_API_BASE}/domains", headers=headers)
+    resp = http_get(f"{DUCKMAIL_API_BASE}/domains", headers=headers, proxies={})
     resp.raise_for_status()
     return resp.json().get("hydra:member", [])
 
@@ -1690,28 +1717,32 @@ def create_account(address, password, api_key=None, expires_in=0):
     if key:
         headers["Authorization"] = f"Bearer {key}"
     data = {"address": address, "password": password, "expiresIn": expires_in}
-    resp = http_post(f"{DUCKMAIL_API_BASE}/accounts", json=data, headers=headers)
+    resp = http_post(
+        f"{DUCKMAIL_API_BASE}/accounts", json=data, headers=headers, proxies={}
+    )
     resp.raise_for_status()
     return resp.json()
 
 
 def get_token(address, password):
     data = {"address": address, "password": password}
-    resp = http_post(f"{DUCKMAIL_API_BASE}/token", json=data)
+    resp = http_post(f"{DUCKMAIL_API_BASE}/token", json=data, proxies={})
     resp.raise_for_status()
     return resp.json().get("token")
 
 
 def get_messages(token):
     headers = {"Authorization": f"Bearer {token}"}
-    resp = http_get(f"{DUCKMAIL_API_BASE}/messages", headers=headers)
+    resp = http_get(f"{DUCKMAIL_API_BASE}/messages", headers=headers, proxies={})
     resp.raise_for_status()
     return resp.json().get("hydra:member", [])
 
 
 def get_message_detail(token, message_id):
     headers = {"Authorization": f"Bearer {token}"}
-    resp = http_get(f"{DUCKMAIL_API_BASE}/messages/{message_id}", headers=headers)
+    resp = http_get(
+        f"{DUCKMAIL_API_BASE}/messages/{message_id}", headers=headers, proxies={}
+    )
     resp.raise_for_status()
     return resp.json()
 
@@ -1724,7 +1755,9 @@ def cloudflare_get_domains(api_base, api_key=None):
         headers["X-API-Key"] = api_key
     path = get_cloudflare_path("cloudflare_path_domains", "/domains")
     params = cloudflare_apply_auth_params()
-    resp = http_get(f"{api_base}{path}", headers=headers, params=params)
+    resp = http_get(
+        f"{api_base}{path}", headers=headers, params=params, proxies={}
+    )
     resp.raise_for_status()
     return _pick_list_payload(resp.json())
 
@@ -1738,7 +1771,13 @@ def cloudflare_create_account(api_base, address, password, api_key=None, expires
     payload = {"address": address, "password": password, "expiresIn": expires_in}
     path = get_cloudflare_path("cloudflare_path_accounts", "/accounts")
     params = cloudflare_apply_auth_params()
-    resp = http_post(f"{api_base}{path}", json=payload, headers=headers, params=params)
+    resp = http_post(
+        f"{api_base}{path}",
+        json=payload,
+        headers=headers,
+        params=params,
+        proxies={},
+    )
     resp.raise_for_status()
     return resp.json()
 
@@ -1755,6 +1794,7 @@ def cloudflare_get_token(api_base, address, password, api_key=None):
         json={"address": address, "password": password},
         headers=headers,
         params=cloudflare_apply_auth_params(),
+        proxies={},
     )
     resp.raise_for_status()
     data = resp.json()
@@ -1771,7 +1811,9 @@ def cloudflare_get_messages(api_base, token):
     path = get_cloudflare_path("cloudflare_path_messages", "/messages")
     params = {"limit": 20, "offset": 0}
     params = cloudflare_apply_auth_params(params)
-    resp = http_get(f"{api_base}{path}", headers=headers, params=params)
+    resp = http_get(
+        f"{api_base}{path}", headers=headers, params=params, proxies={}
+    )
     resp.raise_for_status()
     try:
         data = resp.json()
@@ -1793,6 +1835,7 @@ def cloudflare_get_message_detail(api_base, token, message_id):
                 url,
                 headers=headers,
                 params=cloudflare_apply_auth_params(),
+                proxies={},
             )
             resp.raise_for_status()
             data = resp.json()
@@ -1824,7 +1867,7 @@ def yyds_get_domains(api_key=None, jwt=None):
         headers["Authorization"] = f"Bearer {token}"
     elif key:
         headers["X-API-Key"] = key
-    resp = http_get(f"{YYDS_API_BASE}/domains", headers=headers)
+    resp = http_get(f"{YYDS_API_BASE}/domains", headers=headers, proxies={})
     resp.raise_for_status()
     data = resp.json()
     return data.get("data", []) if data.get("success") else []
@@ -1845,7 +1888,9 @@ def yyds_create_account(address=None, domain=None, api_key=None, jwt=None):
         payload["domain"] = domain
     elif key or token:
         payload["autoDomainStrategy"] = "prefer_owned"
-    resp = http_post(f"{YYDS_API_BASE}/accounts", json=payload, headers=headers)
+    resp = http_post(
+        f"{YYDS_API_BASE}/accounts", json=payload, headers=headers, proxies={}
+    )
     resp.raise_for_status()
     data = resp.json()
     if data.get("success"):
@@ -1862,7 +1907,10 @@ def yyds_get_token(address, api_key=None, jwt=None):
     elif key:
         headers["X-API-Key"] = key
     resp = http_post(
-        f"{YYDS_API_BASE}/token", json={"address": address}, headers=headers
+        f"{YYDS_API_BASE}/token",
+        json={"address": address},
+        headers=headers,
+        proxies={},
     )
     resp.raise_for_status()
     data = resp.json()
@@ -1883,6 +1931,7 @@ def yyds_get_messages(address, token=None, api_key=None, jwt=None):
         f"{YYDS_API_BASE}/messages",
         params={"address": address},
         headers=headers,
+        proxies={},
     )
     resp.raise_for_status()
     data = resp.json()
@@ -1899,7 +1948,9 @@ def yyds_get_message_detail(message_id, token=None, api_key=None, jwt=None):
         headers["Authorization"] = f"Bearer {temp_token}"
     elif key:
         headers["X-API-Key"] = key
-    resp = http_get(f"{YYDS_API_BASE}/messages/{message_id}", headers=headers)
+    resp = http_get(
+        f"{YYDS_API_BASE}/messages/{message_id}", headers=headers, proxies={}
+    )
     resp.raise_for_status()
     data = resp.json()
     if data.get("success"):

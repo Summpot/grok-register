@@ -58,6 +58,34 @@ def resolve_proxy(explicit: str | None = None) -> str:
     return ""
 
 
+def normalize_proxy_url(proxy: str, *, remote_dns: bool = True) -> str:
+    """Normalize proxy URL for HTTPS clients (curl_cffi / requests).
+
+    SOCKS5 + HTTPS sites: use socks5h so DNS runs on the proxy/egress side,
+    which avoids broken local DNS and some TLS middlebox failures.
+    """
+    p = (proxy or "").strip()
+    if not p:
+        return ""
+    # dict-style slip-through
+    if "://" not in p:
+        p = "http://" + p
+    if remote_dns:
+        if p.startswith("socks5://"):
+            p = "socks5h://" + p[len("socks5://") :]
+        elif p.startswith("socks4://"):
+            p = "socks4a://" + p[len("socks4://") :]
+    return p
+
+
+def proxies_dict_for_requests(proxy: str | None) -> dict[str, str]:
+    """Build {http, https} dict for requests/curl_cffi with socks5h normalized."""
+    p = normalize_proxy_url(proxy or "")
+    if not p:
+        return {}
+    return {"http": p, "https": p}
+
+
 def proxy_for_chromium(proxy: str) -> str:
     """Chromium --proxy-server cannot embed user:pass; host:port only."""
     p = (proxy or "").strip()

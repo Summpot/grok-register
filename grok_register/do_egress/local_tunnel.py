@@ -629,21 +629,35 @@ def probe_remote_ready(
 
     working: list[str] = []
     details: list[str] = []
-    for proto in candidates:
+    # Up to 3 tries on the preferred/TCP protocol before trying others
+    primary = candidates[0]
+    for attempt in range(1, 4):
         ok, detail = _run_one_probe(
             settings,
             node,
-            protocol=proto,
+            protocol=primary,
             health_url=health_url,
             probe_timeout_s=probe_timeout_s,
         )
-        details.append(detail)
+        details.append(f"{primary}#{attempt}:{detail}")
         if ok:
-            working.append(proto)
-            # One success is enough for readiness; keep probing rest quickly? 
-            # Probe all so urltest has full working set — but costs time.
-            # Stop early after first success for faster ready; still record one.
+            working.append(primary)
             break
+        time.sleep(2.0)
+
+    if not working:
+        for proto in candidates[1:]:
+            ok, detail = _run_one_probe(
+                settings,
+                node,
+                protocol=proto,
+                health_url=health_url,
+                probe_timeout_s=probe_timeout_s,
+            )
+            details.append(detail)
+            if ok:
+                working.append(proto)
+                break
 
     if working:
         return True, "; ".join(details), working
