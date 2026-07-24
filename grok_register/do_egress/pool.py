@@ -83,10 +83,17 @@ def is_building() -> bool:
 
 
 def wait_until_first_ready(timeout_s: float = 300.0) -> bool:
-    """Block until at least one droplet is ready (or timeout / all done empty)."""
+    """Block until at least one droplet is ready (or timeout / cancel / empty)."""
     if _pool_ready and _enabled:
         return True
-    ok = _first_ready.wait(timeout=max(0.1, float(timeout_s)))
+    try:
+        from grok_register.lifecycle import is_cancelled, wait_event
+
+        ok = wait_event(_first_ready, timeout=max(0.1, float(timeout_s)))
+        if is_cancelled():
+            return False
+    except Exception:
+        ok = _first_ready.wait(timeout=max(0.1, float(timeout_s)))
     return bool(ok and _pool_ready and _enabled)
 
 
@@ -179,15 +186,21 @@ def destroy_all(
         _enabled = False
         _pool_ready = False
         _building = False
-        _first_ready.set()
+        # Unblock waiters, but do NOT pretend the pool is ready — callers must
+        # check is_cancelled() / _cleaned_up / ready node list after wait.
+        _cleaned_up = True
         _all_done.set()
+        _first_ready.set()
         return 0
 
     destroyed = 0
     with _lock:
         _building = False
-        _first_ready.set()
+        _cleaned_up = True
+        # Wake waiters so ensure_pool can return promptly on shutdown.
+        # Hand-off must treat empty ready_nodes + cleaned_up as "not usable".
         _all_done.set()
+        _first_ready.set()
         # Best-effort: do not wait on in-flight creates (destroy will reclaim by tag)
         _create_futures = {}
         _create_executor = None
@@ -591,7 +604,10 @@ def ensure_pool(
                         + int(settings.ready_wait_s or 240),
                     )
                 )
-            _first_ready.wait(timeout=timeout)
+            _wait_first_ready_interruptible(timeout)
+        if _is_shutdown_requested():
+            _log("[egress] cancelled while waiting (re-entry); not handing off", log)
+            return []
         state = load_state(settings.state_path)
         return [socks_url(settings, n) for n in state.ready_nodes()]
 
@@ -667,11 +683,16 @@ def ensure_pool(
             _create_executor = ex
 
             def _slot_job(slot: int) -> None:
-                if _cleaned_up:
+                if _cleaned_up or _is_shutdown_requested():
                     return
                 try:
                     _create_slot_worker(settings, slot, log, ssh_keys)
-                    if _cleaned_up:
+                    if _cleaned_up or _is_shutdown_requested():
+                        _log(
+                            f"[egress] slot {slot}: finished bootstrap but "
+                            f"shutdown in progress — skip ready hand-off",
+                            log,
+                        )
                         return
                     _on_slot_ready(settings, slot, log)
                 except Exception as exc:
@@ -754,10 +775,20 @@ def ensure_pool(
                     + int(settings.ready_wait_s or 240),
                 )
             )
-        ok = _first_ready.wait(timeout=timeout)
+        ok = _wait_first_ready_interruptible(timeout)
+        if _is_shutdown_requested():
+            _log(
+                "[egress] cancelled while waiting for first ready; "
+                "hand-off aborted (cleanup via CLI lifecycle)",
+                log,
+            )
+            return []
         if not ok and not _pool_ready:
-            if _building:
-                _all_done.wait(timeout=min(30.0, timeout))
+            if _building and not _is_shutdown_requested():
+                _wait_all_done_interruptible(min(30.0, timeout))
+            if _is_shutdown_requested():
+                _log("[egress] cancelled during extended wait; hand-off aborted", log)
+                return []
             if not _pool_ready:
                 with errors_lock:
                     err_s = f"; first={errors[0][1]}" if errors else ""
@@ -765,6 +796,14 @@ def ensure_pool(
                     f"no egress droplet ready within {timeout:.0f}s "
                     f"(target slots={target}){err_s}"
                 )
+
+    if _is_shutdown_requested() or _cleaned_up:
+        _log(
+            "[egress] hand-off skipped: "
+            f"cancelled={_is_shutdown_requested()} cleaned_up={_cleaned_up}",
+            log,
+        )
+        return []
 
     state = load_state(settings.state_path)
     urls = [socks_url(settings, n) for n in state.ready_nodes()]
@@ -774,6 +813,40 @@ def ensure_pool(
         log,
     )
     return urls
+
+
+def _is_shutdown_requested() -> bool:
+    if _cleaned_up:
+        return True
+    try:
+        from grok_register.lifecycle import is_cancelled
+
+        return bool(is_cancelled())
+    except Exception:
+        return False
+
+
+def _wait_first_ready_interruptible(timeout: float) -> bool:
+    """Wait for first ready; returns True if event fired. Respects cancel."""
+    try:
+        from grok_register.lifecycle import is_cancelled, wait_event
+
+        if is_cancelled():
+            return False
+        return bool(wait_event(_first_ready, timeout=timeout))
+    except Exception:
+        return bool(_first_ready.wait(timeout=timeout))
+
+
+def _wait_all_done_interruptible(timeout: float) -> bool:
+    try:
+        from grok_register.lifecycle import is_cancelled, wait_event
+
+        if is_cancelled():
+            return False
+        return bool(wait_event(_all_done, timeout=timeout))
+    except Exception:
+        return bool(_all_done.wait(timeout=timeout))
 
 
 def _cleanup_droplets_unlocked(

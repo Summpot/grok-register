@@ -60,7 +60,7 @@
     "grok2api_remote_username": "admin",
     "grok2api_remote_password": "",
     "grok2api_v3_web_tier": "auto",
-    "local_build_device_flow": false,
+    "local_build_device_flow": true,
     "_comment_local_build_device_flow": "When true: Web SSO → Build via Auth Code + PKCE (same as grok login --oauth)",
     "local_build_auth_dir": "./output/build_auths",
     "allow_bot_flagged": false,

@@ -12,12 +12,20 @@ from __future__ import annotations
 import argparse
 import os
 import queue
-import signal
 import sys
 import threading
 import time
 import traceback
 from grok_register import app as reg  # noqa: E402
+from grok_register.lifecycle import (
+    cancel_event,
+    dump_cancel_context,
+    install_signal_handlers,
+    is_cancelled,
+    register_cleanup_hook,
+    request_cancel,
+    should_stop,
+)
 from grok_register.paths import OUTPUT_DIR, ensure_output_dir
 
 
@@ -69,14 +77,18 @@ _log_queue: queue.Queue = queue.Queue()
 
 
 def _log_writer():
-    while not _cancel_event.is_set():
+    """Drain log queue until sentinel. Cancel must not drop pending lines."""
+    while True:
         try:
             msg = _log_queue.get(timeout=0.3)
-            if msg is None:
-                break
-            print(msg, flush=True)
         except queue.Empty:
             continue
+        if msg is None:
+            break
+        try:
+            print(msg, flush=True)
+        except Exception:
+            pass
 
 
 def log(worker_id: int | str, msg: str) -> None:
@@ -106,8 +118,8 @@ def _inc(key: str, n: int = 1) -> None:
 _next_idx_lock = threading.Lock()
 _next_idx = [1]
 
-# Ctrl+C 取消事件 — 任何阻塞循环都应检查此事件
-_cancel_event = threading.Event()
+# Back-compat alias — prefer lifecycle.is_cancelled / should_stop
+_cancel_event = cancel_event()
 
 
 def _cleanup_do_egress(reason: str = "exit") -> None:
@@ -130,29 +142,9 @@ def _cleanup_do_egress(reason: str = "exit") -> None:
 
 
 def _setup_signal_handler():
-    """注册 SIGINT 处理器，使 Ctrl+C 可靠地停止所有线程。"""
-    def _handler(sig_num, frame):
-        _cancel_event.set()
-        # 用 os.write 避免 print 在信号处理器中可能的死锁
-        try:
-            sys.stderr.write("\n[!] 正在停止...（将清理 DO Droplet；再次按 Ctrl+C 强制结束）\n")
-            sys.stderr.flush()
-        except Exception:
-            pass
-    try:
-        signal.signal(signal.SIGINT, _handler)
-    except Exception:
-        pass
-    # Windows / POSIX terminate
-    try:
-        signal.signal(signal.SIGTERM, _handler)
-    except Exception:
-        pass
-
-
-class DummyStop:
-    def __call__(self) -> bool:
-        return False
+    """Install lifecycle interrupt handlers + force-exit cleanup hook."""
+    register_cleanup_hook(lambda: _cleanup_do_egress("force_exit"))
+    install_signal_handlers()
 
 
 def _ensure_browser(worker_id: int, force_recycle: bool = False):
@@ -191,7 +183,9 @@ def register_one(
     email = ""
     dev_token = ""
     max_mail_retry = 3
-    cancel = DummyStop()
+    # Cooperative cancel: previously DummyStop() never fired, so Ctrl+C only
+    # took effect between accounts (looked like "delay" or "not working").
+    cancel = should_stop
     attempt_finished = False
 
     try:
@@ -511,7 +505,7 @@ def _register_worker(
     accounts_file: str,
     forever: bool,
 ):
-    while not _cancel_event.is_set():
+    while not is_cancelled():
         try:
             idx = task_queue.get_nowait()
         except queue.Empty:
@@ -524,8 +518,11 @@ def _register_worker(
                 task_queue.put(i)
             continue
 
+        if is_cancelled():
+            break
+
         retry = 0
-        while retry < 2:
+        while retry < 2 and not is_cancelled():
             try:
                 result = register_one(
                     worker_id,
@@ -536,7 +533,7 @@ def _register_worker(
                 if result:
                     break
                 retry += 1
-                if retry < 2:
+                if retry < 2 and not is_cancelled():
                     log(worker_id, f"[retry] 账号 {idx} 失败，重试 {retry}/1")
                     try:
                         reg.restart_browser(log_callback=lambda m: log(worker_id, m))
@@ -544,7 +541,7 @@ def _register_worker(
                         pass
             except Exception:
                 retry += 1
-                if retry < 2:
+                if retry < 2 and not is_cancelled():
                     log(worker_id, f"[retry] 账号 {idx} 异常，重试 {retry}/1")
                     traceback.print_exc()
                     try:
@@ -557,14 +554,14 @@ def _register_worker(
             pass
 
         # Between-account dwell (pace) — reduces bursty same-IP patterns
-        if not _cancel_event.is_set():
+        if not is_cancelled():
             try:
                 if reg.register_pace_enabled():
                     reg.pace_stage(
                         "register_pace_between_accounts_s",
                         12.0,
                         28.0,
-                        lambda: _cancel_event.is_set(),
+                        should_stop,
                         name="between_accounts",
                         log_callback=lambda m: log(worker_id, m),
                     )
@@ -714,6 +711,13 @@ def main() -> int:
                 except Exception:
                     pass
             n = ensure_pool_from_config(cfg0)
+            if is_cancelled():
+                print(
+                    f"[!] 已取消，跳过注册启动 ({dump_cancel_context()})",
+                    flush=True,
+                )
+                _cleanup_do_egress("cancel_during_pool")
+                return 1
             if src in ("do", "digitalocean", "do_egress", "egress"):
                 print(
                     f"[*] proxy_pool source=do ready_socks={n} threads={threads} "
@@ -721,6 +725,14 @@ def main() -> int:
                     f"mode={cfg0.get('proxy_pool_mode', 'random')}",
                     flush=True,
                 )
+                if n <= 0:
+                    print(
+                        "[!] do_egress: no ready SOCKS after wait "
+                        f"({dump_cancel_context()})",
+                        flush=True,
+                    )
+                    _cleanup_do_egress("no_ready_socks")
+                    return 1
             else:
                 print(
                     f"[*] proxy_pool enabled file={cfg0.get('proxy_pool_file')} "
@@ -731,11 +743,19 @@ def main() -> int:
             print(f"[*] proxy={proxy_log_label(str(cfg0.get('proxy')))}", flush=True)
     except Exception as exc:
         print(f"[*] proxy pool init: {exc}", flush=True)
+        if is_cancelled():
+            _cleanup_do_egress("cancel_after_pool_error")
+            return 1
     if done_count > 0:
         print(f"[*] 断点续跑：已完成 {done_count}", flush=True)
     if remaining is not None and remaining <= 0:
         print("[*] 所有账号已完成，无需继续（可用 --extra N 再注册）", flush=True)
         return 0
+
+    if is_cancelled():
+        print(f"[!] 已取消，不启动注册 ({dump_cancel_context()})", flush=True)
+        _cleanup_do_egress("cancel_before_register")
+        return 1
 
     log_thread = threading.Thread(target=_log_writer, daemon=True)
     log_thread.start()
@@ -744,6 +764,7 @@ def main() -> int:
         reg.TabPool.init(reg.create_browser_options, log_callback=lambda m: log(0, m))
     except Exception as exc:
         print(f"[!] 浏览器初始化失败: {exc}", flush=True)
+        _cleanup_do_egress("browser_init_failed")
         return 1
 
     task_queue: queue.Queue = queue.Queue()
@@ -761,6 +782,8 @@ def main() -> int:
 
     reg_threads: list[threading.Thread] = []
     for wid in range(1, threads + 1):
+        if is_cancelled():
+            break
         t = threading.Thread(
             target=_register_worker,
             args=(wid, task_queue, args.count, args.accounts_file, forever),
@@ -770,29 +793,40 @@ def main() -> int:
         t.start()
         reg_threads.append(t)
         # Stagger first Camoufox launches across workers (Windows process races).
-        if threads > 1 and wid < threads:
-            time.sleep(0.8)
+        if threads > 1 and wid < threads and not is_cancelled():
+            from grok_register.lifecycle import sleep as lifecycle_sleep
 
-    # 轮询等待注册线程完成，同时响应 Ctrl+C 取消
+            lifecycle_sleep(0.8)
+
+    # Poll until workers finish; respond to cancel within ~0.3s.
     try:
-        while not _cancel_event.is_set():
+        while not is_cancelled():
             alive = [t for t in reg_threads if t.is_alive()]
             if not alive:
                 break
             for t in alive:
                 t.join(timeout=0.3)
     except KeyboardInterrupt:
-        _cancel_event.set()
-        print("\n[!] 用户中断", flush=True)
+        # Fallback if a handler was replaced by a library
+        request_cancel(reason="KeyboardInterrupt", source="main", debounce=False)
+        print("\n[!] 用户中断 (KeyboardInterrupt)", flush=True)
 
-    if _cancel_event.is_set():
-        print("[!] 取消中...", flush=True)
+    if is_cancelled():
+        print(f"[!] 取消中… ({dump_cancel_context()})", flush=True)
+        # Give workers a short window to notice should_stop() and exit cleanly
+        deadline = time.time() + 15.0
+        while time.time() < deadline:
+            alive = [t for t in reg_threads if t.is_alive()]
+            if not alive:
+                break
+            for t in alive:
+                t.join(timeout=0.3)
 
     try:
         reg.shutdown_browser()
     except Exception:
         pass
-    # Always destroy DO egress Droplets on normal / Ctrl+C exit
+    # Always destroy DO egress Droplets on normal / cancel / Ctrl+C exit
     _cleanup_do_egress("shutdown")
     # Last resort: kill leftover DrissionPage/automation Chrome orphans.
     try:
@@ -821,6 +855,8 @@ def main() -> int:
         f"(reg_success=build_clean={s.get('reg_success', 0)}) ===",
         flush=True,
     )
+    if is_cancelled():
+        return 130
     return 0 if s.get("build_clean", 0) > 0 or s.get("reg_success", 0) > 0 else 1
 
 
